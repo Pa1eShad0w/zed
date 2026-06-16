@@ -2653,10 +2653,52 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Option<TrashedEntry>>>> {
         let worktree = self.worktree_for_entry(entry_id, cx)?;
-        cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id));
-        worktree.update(cx, |worktree, cx| {
+        let worktree_id = worktree.read(cx).id();
+        cx.emit(Event::DeletedEntry(worktree_id, entry_id));
+
+        // Perforce auto-checkout: open the file for delete in the depot (mirrors
+        // vscode-perforce's `deleteOnFileDelete`). We run this AFTER the local deletion so
+        // Zed's worktree/trash flow is untouched; `p4 delete` then reconciles the depot.
+        // It is a no-op for git and non-VCS paths.
+        let perforce_delete = self.perforce_delete_task(worktree_id, entry_id, &worktree, cx);
+
+        let delete = worktree.update(cx, |worktree, cx| {
             worktree.delete_entry(entry_id, trash, cx)
-        })
+        })?;
+        Some(cx.spawn(async move |_, _| {
+            let result = delete.await?;
+            if let Some(perforce_delete) = perforce_delete {
+                // A failed `p4 delete` should not undo the local deletion the user asked for;
+                // log and move on.
+                perforce_delete.await.log_err();
+            }
+            Ok(result)
+        }))
+    }
+
+    /// Build the Perforce open-for-delete task for `entry_id`, or `None` when the path is not
+    /// a file in a Perforce workspace or `delete_on_file_delete` is disabled.
+    fn perforce_delete_task(
+        &self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        worktree: &Entity<Worktree>,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        if !ProjectSettings::get_global(cx).perforce.delete_on_file_delete {
+            return None;
+        }
+        let entry = worktree.read(cx).entry_for_id(entry_id)?;
+        if !entry.is_file() {
+            return None;
+        }
+        let project_path = ProjectPath {
+            worktree_id,
+            path: entry.path.clone(),
+        };
+        Some(self.git_store.update(cx, |git_store, cx| {
+            git_store.perforce_open_for(&project_path, git::perforce::P4OpenAction::Delete, cx)
+        }))
     }
 
     #[inline]

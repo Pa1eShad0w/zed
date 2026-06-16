@@ -71,6 +71,9 @@ pub struct ProjectSettings {
     /// Configuration for Git-related features
     pub git: GitSettings,
 
+    /// Configuration for Perforce auto-checkout.
+    pub perforce: PerforceSettings,
+
     /// Configuration for Node-related features
     pub node: NodeBinarySettings,
 
@@ -496,6 +499,30 @@ pub struct GitSettings {
     pub worktree_directory: String,
 }
 
+/// Resolved Perforce auto-checkout switches. All default to `true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PerforceSettings {
+    /// Run `p4 edit` before saving a tracked, read-only file.
+    pub edit_on_file_save: bool,
+    /// Run `p4 edit` the first time an open buffer is modified.
+    pub edit_on_file_modified: bool,
+    /// Run `p4 add` when a new file is created.
+    pub add_on_file_create: bool,
+    /// Run `p4 delete` when a file is deleted.
+    pub delete_on_file_delete: bool,
+}
+
+impl Default for PerforceSettings {
+    fn default() -> Self {
+        Self {
+            edit_on_file_save: true,
+            edit_on_file_modified: true,
+            add_on_file_create: true,
+            delete_on_file_delete: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GitEnabledSettings {
     /// Whether git integration is enabled for showing git status.
@@ -689,6 +716,24 @@ impl Settings for ProjectSettings {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_WORKTREE_DIRECTORY.to_string()),
         };
+        let perforce_settings = {
+            let p4 = content.perforce.as_ref();
+            let default = PerforceSettings::default();
+            PerforceSettings {
+                edit_on_file_save: p4
+                    .and_then(|p| p.edit_on_file_save)
+                    .unwrap_or(default.edit_on_file_save),
+                edit_on_file_modified: p4
+                    .and_then(|p| p.edit_on_file_modified)
+                    .unwrap_or(default.edit_on_file_modified),
+                add_on_file_create: p4
+                    .and_then(|p| p.add_on_file_create)
+                    .unwrap_or(default.add_on_file_create),
+                delete_on_file_delete: p4
+                    .and_then(|p| p.delete_on_file_delete)
+                    .unwrap_or(default.delete_on_file_delete),
+            }
+        };
         Self {
             context_servers: project
                 .context_servers
@@ -757,6 +802,7 @@ impl Settings for ProjectSettings {
                 },
             },
             git: git_settings,
+            perforce: perforce_settings,
             node: content.node.clone().unwrap().into(),
             load_direnv: project.load_direnv.clone().unwrap(),
             session: SessionSettings {

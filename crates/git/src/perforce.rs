@@ -318,6 +318,47 @@ fn can_skip_opened_query(candidates: &[OpenCandidate]) -> bool {
             .all(|c| *c == OpenCandidate::DefinitelyNotOpen)
 }
 
+/// Which Perforce "open" action a save/create/delete should perform.
+///
+/// Mirrors vscode-perforce's `FileSystemActions`: a save/modify of an existing tracked file
+/// opens it for `edit`, a newly-created file opens for `add`, and a deletion opens for
+/// `delete`. The verb maps 1:1 onto the `p4` subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P4OpenAction {
+    /// `p4 edit` — make a synced, read-only file writable and open it for edit.
+    Edit,
+    /// `p4 add` — open a new, not-yet-tracked file for add.
+    Add,
+    /// `p4 delete` — open a tracked file for delete (also removes it from the workspace).
+    Delete,
+}
+
+impl P4OpenAction {
+    /// The `p4` subcommand verb for this action.
+    fn verb(self) -> &'static str {
+        match self {
+            P4OpenAction::Edit => "edit",
+            P4OpenAction::Add => "add",
+            P4OpenAction::Delete => "delete",
+        }
+    }
+}
+
+/// Build the argument vector for a `p4 <verb> //client/path...` mutation.
+///
+/// Pure and side-effect free so the command construction can be unit-tested without
+/// shelling out. Verified against vscode-perforce `src/api/commands/basicOps.ts`
+/// (`p4 edit/add/delete [-c chnum] files`); we pass no `-c` so files land in the
+/// default changelist, and no `-ztag` because the output is not parsed.
+fn p4_open_args(action: P4OpenAction, client_name: &str, paths: &[RepoPath]) -> Vec<String> {
+    let mut args = Vec::with_capacity(paths.len() + 1);
+    args.push(action.verb().to_string());
+    for path in paths {
+        args.push(format!("//{}/{}", client_name, path.as_unix_str()));
+    }
+    args
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -501,6 +542,11 @@ impl GitRepository for PerforceRepository {
 
     fn is_trusted(&self) -> bool {
         self.is_trusted.load(Ordering::SeqCst)
+    }
+
+    /// Phase 2 auto-checkout: open files for edit/add/delete (see [`Self::open_for`]).
+    fn perforce_open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
+        self.open_for(action, paths)
     }
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
@@ -872,6 +918,35 @@ impl GitRepository for PerforceRepository {
     }
 }
 
+/// Phase 2: auto-checkout (open-for-edit/add/delete) operations.
+///
+/// These are the mutating counterparts to the read-only [`GitRepository::status`] MVP. They
+/// mirror vscode-perforce's `FileSystemActions` switches (`editOnFileSave`, `addOnFileCreate`,
+/// `deleteOnFileDelete`): as the user edits a Perforce workspace, the affected files are
+/// transparently opened in the depot so the local read-only bit is cleared and the change is
+/// tracked. Every command runs on the background executor; nothing blocks the main thread.
+impl PerforceRepository {
+    /// Open the given files for `action` (`p4 edit`/`add`/`delete`).
+    ///
+    /// Runs `p4 <verb> //client/path...` on the background executor. Files land in the
+    /// default changelist (no `-c`), matching vscode-perforce's default behavior. An empty
+    /// `paths` is a no-op. Errors surface to the caller (e.g. a save can report that the
+    /// `p4 edit` failed) rather than panicking.
+    pub fn open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
+        if paths.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        let cli = self.cli.clone();
+        let args = p4_open_args(action, &self.client_name, &paths);
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
+            anyhow::ensure!(ok, "p4 {} failed: {stderr}", action.verb());
+            log::debug!("perforce: p4 {} -> {}", action.verb(), stdout.trim_end());
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,6 +1130,52 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory prefix's children are not inspected here: must query.
         assert_eq!(classify_open_candidate(dir.path()), OpenCandidate::MaybeOpen);
+    }
+
+    // ---- Phase 2: auto-checkout p4 command construction ----
+
+    fn repo_path(unix: &str) -> RepoPath {
+        RepoPath::from_rel_path(RelPath::unix(unix).unwrap())
+    }
+
+    #[test]
+    fn open_action_verbs() {
+        assert_eq!(P4OpenAction::Edit.verb(), "edit");
+        assert_eq!(P4OpenAction::Add.verb(), "add");
+        assert_eq!(P4OpenAction::Delete.verb(), "delete");
+    }
+
+    #[test]
+    fn open_args_build_client_syntax_paths() {
+        let args = p4_open_args(
+            P4OpenAction::Edit,
+            "some_client_name",
+            &[repo_path("a/added.md"), repo_path("b/edited.cpp")],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "edit".to_string(),
+                "//some_client_name/a/added.md".to_string(),
+                "//some_client_name/b/edited.cpp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_args_add_and_delete_use_correct_verb() {
+        let add = p4_open_args(P4OpenAction::Add, "c", &[repo_path("new.txt")]);
+        assert_eq!(add, vec!["add".to_string(), "//c/new.txt".to_string()]);
+        let del = p4_open_args(P4OpenAction::Delete, "c", &[repo_path("gone.txt")]);
+        assert_eq!(del, vec!["delete".to_string(), "//c/gone.txt".to_string()]);
+    }
+
+    #[test]
+    fn open_args_no_ztag_flag_present() {
+        // Mutations must NOT pass -ztag: only the verb and paths.
+        let args = p4_open_args(P4OpenAction::Edit, "c", &[repo_path("f.rs")]);
+        assert!(!args.iter().any(|a| a == "-ztag"));
+        assert_eq!(args[0], "edit");
     }
 
     #[test]
