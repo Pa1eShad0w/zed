@@ -463,10 +463,6 @@ impl LocalBufferStore {
             cx,
         );
 
-        let save = worktree.update(cx, |worktree, cx| {
-            worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
-        });
-
         cx.spawn(async move |this, cx| {
             if let Some(pre_save) = perforce_pre_save {
                 // Best-effort, mirroring vscode-perforce: a failed `p4 edit`/`add` must NOT
@@ -477,6 +473,14 @@ impl LocalBufferStore {
                 // same outcome as without this feature, never a silent corruption.
                 pre_save.await.log_err();
             }
+            // Start the disk write only AFTER the pre-save checkout completes: gpui `Task`s
+            // are eager (they run on creation), so creating the write task before awaiting
+            // the `p4 edit` would race the write against the checkout and fail on the
+            // still-read-only file. For git / non-VCS paths the pre-save resolves instantly,
+            // so this ordering is free.
+            let save = worktree.update(cx, |worktree, cx| {
+                worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
+            });
             let new_file = save.await?;
             let mtime = new_file.disk_state().mtime();
             this.update(cx, |this, cx| {
