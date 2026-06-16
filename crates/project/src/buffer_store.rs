@@ -1,6 +1,8 @@
 use crate::{
     ProjectPath,
+    git_store::GitStore,
     lsp_store::OpenLspBufferHandle,
+    project_settings::ProjectSettings,
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -79,6 +81,10 @@ struct LocalBufferStore {
     local_buffer_ids_by_entry_id: HashMap<ProjectEntryId, BufferId>,
     worktree_store: Entity<WorktreeStore>,
     _subscription: Subscription,
+    /// Back-reference to the `GitStore`, set once it is constructed (the `GitStore` owns the
+    /// `BufferStore`, so this is the symmetric weak link). Used only by the Perforce
+    /// auto-checkout pre-save hook; `None` until set.
+    git_store: Option<WeakEntity<GitStore>>,
 }
 
 enum OpenBuffer {
@@ -382,6 +388,44 @@ impl RemoteBufferStore {
 }
 
 impl LocalBufferStore {
+    /// Build the Perforce auto-checkout pre-save task for a save of `path` in `worktree`.
+    ///
+    /// Returns `None` when there is nothing to do — no `GitStore` back-reference, the
+    /// relevant switch is disabled, or (resolved later, cheaply) the path is not in a
+    /// Perforce workspace. A new file maps to `p4 add`, an existing one to `p4 edit`. The
+    /// returned task resolves to `Ok(())` instantly for git/non-VCS paths, so awaiting it
+    /// before the disk write never penalizes normal saves.
+    fn perforce_pre_save_task(
+        &self,
+        worktree: &Entity<Worktree>,
+        path: &Arc<RelPath>,
+        is_new_file: bool,
+        cx: &mut Context<BufferStore>,
+    ) -> Option<Task<Result<()>>> {
+        let git_store = self.git_store.as_ref()?.upgrade()?;
+
+        let settings = ProjectSettings::get_global(cx).perforce;
+        let action = if is_new_file {
+            if !settings.add_on_file_create {
+                return None;
+            }
+            git::perforce::P4OpenAction::Add
+        } else {
+            if !settings.edit_on_file_save {
+                return None;
+            }
+            git::perforce::P4OpenAction::Edit
+        };
+
+        let project_path = ProjectPath {
+            worktree_id: worktree.read(cx).id(),
+            path: path.clone(),
+        };
+        Some(git_store.update(cx, |git_store, cx| {
+            git_store.perforce_open_for(&project_path, action, cx)
+        }))
+    }
+
     fn save_local_buffer(
         &self,
         buffer_handle: Entity<Buffer>,
@@ -399,18 +443,40 @@ impl LocalBufferStore {
         let version = buffer.version();
         let buffer_id = buffer.remote_id();
         let file = buffer.file().cloned();
-        if file
+        let is_new_file = file
             .as_ref()
-            .is_some_and(|file| file.disk_state() == DiskState::New)
-        {
+            .is_some_and(|file| file.disk_state() == DiskState::New);
+        if is_new_file {
             has_changed_file = true;
         }
+
+        // Perforce auto-checkout pre-save hook: before writing to disk, open the file in the
+        // depot so a synced (read-only) file becomes writable, or a new file is added. This
+        // mirrors vscode-perforce's `onWillSaveTextDocument`. It is a no-op for git and
+        // non-VCS paths (the GitStore resolves no Perforce repo and returns immediately), so
+        // normal file saving is unaffected. We compute the action and project path here while
+        // `path` is still available, then await it inside the spawned task before the write.
+        let perforce_pre_save = self.perforce_pre_save_task(
+            &worktree,
+            &path,
+            is_new_file,
+            cx,
+        );
 
         let save = worktree.update(cx, |worktree, cx| {
             worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
         });
 
         cx.spawn(async move |this, cx| {
+            if let Some(pre_save) = perforce_pre_save {
+                // Best-effort, mirroring vscode-perforce: a failed `p4 edit`/`add` must NOT
+                // abort the save. For a synced read-only file the edit succeeds and the write
+                // then works; for an untracked file the edit fails harmlessly and the write
+                // proceeds (the file isn't read-only). Only a genuinely read-only file whose
+                // checkout failed will then fail at `write_file`, with a clear OS error — the
+                // same outcome as without this feature, never a silent corruption.
+                pre_save.await.log_err();
+            }
             let new_file = save.await?;
             let mtime = new_file.disk_state().mtime();
             this.update(cx, |this, cx| {
@@ -791,6 +857,7 @@ impl BufferStore {
                         this.subscribe_to_worktree(worktree, cx);
                     }
                 }),
+                git_store: None,
             }),
             downstream_client: None,
             opened_buffers: Default::default(),
@@ -826,6 +893,17 @@ impl BufferStore {
             non_searchable_buffers: Default::default(),
             worktree_store,
             project_search: Default::default(),
+        }
+    }
+
+    /// Record the `GitStore` back-reference once it has been constructed.
+    ///
+    /// The `GitStore` owns the `BufferStore`, so this weak link is set after the fact (not in
+    /// the constructor). It is used only by the Perforce auto-checkout pre-save hook, which
+    /// only runs for local buffer stores; on a remote store this is a no-op.
+    pub fn set_git_store_weak(&mut self, git_store: WeakEntity<GitStore>) {
+        if let Some(local) = self.as_local_mut() {
+            local.git_store = Some(git_store);
         }
     }
 

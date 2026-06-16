@@ -172,6 +172,9 @@ pub struct SettingsContent {
     /// Configuration for Git-related features
     pub git: Option<GitSettings>,
 
+    /// Configuration for Perforce auto-checkout.
+    pub perforce: Option<PerforceSettings>,
+
     /// Common language server settings.
     pub global_lsp_settings: Option<GlobalLspSettingsContent>,
 

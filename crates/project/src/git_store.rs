@@ -52,7 +52,7 @@ use gpui::{
     Subscription, Task, TaskExt, WeakEntity,
 };
 use language::{
-    Buffer, BufferEvent, Capability, Language, LanguageRegistry,
+    Buffer, BufferEvent, Capability, DiskState, Language, LanguageRegistry,
     proto::{deserialize_version, serialize_version},
 };
 use parking_lot::Mutex;
@@ -108,6 +108,10 @@ pub struct GitStore {
         HashMap<(BufferId, DiffKind), Shared<Task<Result<Entity<BufferDiff>, Arc<anyhow::Error>>>>>,
     diffs: HashMap<BufferId, Entity<BufferGitState>>,
     shared_diffs: HashMap<proto::PeerId, HashMap<BufferId, SharedDiffs>>,
+    /// Buffers already opened for edit in the depot during their current dirty cycle, so the
+    /// `editOnFileModified` hook fires `p4 edit` at most once per edit session per buffer
+    /// (cleared when the buffer becomes clean again). Only used for Perforce workspaces.
+    perforce_edited_buffers: HashSet<BufferId>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -694,6 +698,14 @@ impl GitStore {
             _subscriptions.push(cx.subscribe(&trusted_worktrees, Self::on_trusted_worktrees_event));
         }
 
+        // Give the buffer store a weak link back to us so its save flow can invoke the
+        // Perforce auto-checkout pre-save hook. The git store owns the buffer store, so this
+        // back-reference is set here rather than passed into the buffer store's constructor.
+        let weak_self = cx.weak_entity();
+        buffer_store.update(cx, |buffer_store, _| {
+            buffer_store.set_git_store_weak(weak_self);
+        });
+
         GitStore {
             state,
             buffer_store,
@@ -705,6 +717,7 @@ impl GitStore {
             loading_diffs: HashMap::default(),
             shared_diffs: HashMap::default(),
             diffs: HashMap::default(),
+            perforce_edited_buffers: HashSet::default(),
         }
     }
 
@@ -2046,8 +2059,8 @@ impl GitStore {
     ) {
         match event {
             BufferStoreEvent::BufferAdded(buffer) => {
-                cx.subscribe(buffer, |this, buffer, event, cx| {
-                    if let BufferEvent::LanguageChanged(_) = event {
+                cx.subscribe(buffer, |this, buffer, event, cx| match event {
+                    BufferEvent::LanguageChanged(_) => {
                         let buffer_id = buffer.read(cx).remote_id();
                         if let Some(diff_state) = this.diffs.get(&buffer_id) {
                             diff_state.update(cx, |diff_state, cx| {
@@ -2055,6 +2068,18 @@ impl GitStore {
                             });
                         }
                     }
+                    BufferEvent::Edited { source } => {
+                        this.perforce_on_buffer_edited(&buffer, *source, cx);
+                    }
+                    BufferEvent::DirtyChanged => {
+                        // When the buffer returns to a clean state (e.g. after a save), allow
+                        // the next edit to re-open it for edit.
+                        if !buffer.read(cx).is_dirty() {
+                            this.perforce_edited_buffers
+                                .remove(&buffer.read(cx).remote_id());
+                        }
+                    }
+                    _ => {}
                 })
                 .detach();
             }
@@ -2266,6 +2291,96 @@ impl GitStore {
                 Some((repo.clone(), repo_path))
             })
             .max_by_key(|(repo, _)| repo.read(cx).work_directory_abs_path.clone())
+    }
+
+    /// Perforce auto-checkout hook: open `path` for `action` (edit/add/delete) if it lives in
+    /// a Perforce workspace.
+    ///
+    /// Returns a task that resolves to `Ok(())` immediately when `path` is **not** in a
+    /// Perforce repository — including every git or non-VCS path — so this is safe to call
+    /// unconditionally from the save flow without affecting normal file saving. For a
+    /// Perforce path it awaits the corresponding `p4 edit`/`add`/`delete`, surfacing any
+    /// error to the caller (e.g. so a save can report that `p4 edit` failed).
+    ///
+    /// The `GitRepository::perforce_open_for` trait method is a no-op for the git backend, so
+    /// the action dispatch is uniform and the git path never shells out to `p4`.
+    pub fn perforce_open_for(
+        &self,
+        path: &ProjectPath,
+        action: git::perforce::P4OpenAction,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some((repo, repo_path)) = self.repository_and_path_for_project_path(path, cx) else {
+            return Task::ready(Ok(()));
+        };
+        let repo = repo.downgrade();
+        cx.spawn(async move |cx| {
+            let repository_state = repo
+                .update(cx, |repo, _| repo.repository_state.clone())?
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match repository_state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_open_for(action, vec![repo_path]).await
+                }
+                // Remote projects proxy edits through the host; auto-checkout is a
+                // host-local concern, so this is a no-op on the guest.
+                RepositoryState::Remote(_) => Ok(()),
+            }
+        })
+    }
+
+    /// `editOnFileModified` hook: open a Perforce-tracked buffer for edit the first time it
+    /// is modified in its current dirty cycle.
+    ///
+    /// Fire-and-forget — correctness is guaranteed by the pre-save hook regardless; this just
+    /// opens the file eagerly so the depot reflects the in-progress edit (and matches
+    /// vscode-perforce's behavior). Ignores remote edits and does nothing outside a Perforce
+    /// workspace. Dedup via [`Self::perforce_edited_buffers`] keeps it to one `p4 edit` per
+    /// edit session per buffer.
+    fn perforce_on_buffer_edited(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        source: language::BufferEditSource,
+        cx: &mut Context<Self>,
+    ) {
+        if !source.is_local() {
+            return;
+        }
+        if !ProjectSettings::get_global(cx).perforce.edit_on_file_modified {
+            return;
+        }
+        let buffer_id = buffer.read(cx).remote_id();
+        if self.perforce_edited_buffers.contains(&buffer_id) {
+            return;
+        }
+        let Some(project_path) = buffer.read(cx).project_path(cx) else {
+            return;
+        };
+        // A newly-created (not-yet-on-disk) buffer is handled by the add-on-save hook; here we
+        // only open already-tracked files for edit.
+        let is_new = buffer
+            .read(cx)
+            .file()
+            .is_none_or(|file| file.disk_state() == DiskState::New);
+        if is_new {
+            return;
+        }
+        // Mark first so a burst of edits doesn't queue duplicate `p4 edit` calls; the entry is
+        // cleared when the buffer next becomes clean.
+        self.perforce_edited_buffers.insert(buffer_id);
+        let task =
+            self.perforce_open_for(&project_path, git::perforce::P4OpenAction::Edit, cx);
+        cx.spawn(async move |this, cx| {
+            if task.await.log_err().is_none() {
+                // The edit failed (e.g. file not in depot); allow a later retry.
+                this.update(cx, |this, _| {
+                    this.perforce_edited_buffers.remove(&buffer_id);
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     pub fn git_init(
@@ -9507,6 +9622,70 @@ mod tests {
                 "regular file should have a git diff base"
             );
         });
+    }
+
+    // Phase 2 regression guard: the Perforce auto-checkout pre-save hook must be a complete
+    // no-op for non-Perforce projects, so normal (git / non-VCS) file saving is unaffected.
+    #[gpui::test]
+    async fn test_perforce_pre_save_is_noop_for_non_perforce_project(cx: &mut TestAppContext) {
+        use util::rel_path::rel_path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "before\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        // Directly: opening a path that is in no Perforce repo resolves to Ok immediately.
+        let noop = project
+            .update(cx, |project, cx| {
+                project.git_store().update(cx, |git_store, cx| {
+                    git_store.perforce_open_for(
+                        &ProjectPath {
+                            worktree_id,
+                            path: rel_path("a.txt").into(),
+                        },
+                        git::perforce::P4OpenAction::Edit,
+                        cx,
+                    )
+                })
+            })
+            .await;
+        assert!(noop.is_ok(), "perforce hook must be a no-op off a P4 workspace");
+
+        // End to end: an ordinary edit + save still writes to disk (the pre-save hook runs but
+        // does nothing for this git-backed file).
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("a.txt")), cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), "after\n")], None, cx);
+        });
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+
+        let on_disk = fs.load(Path::new("/project/a.txt")).await.unwrap();
+        assert_eq!(on_disk, "after\n", "normal save must still reach disk");
     }
 
     #[gpui::test]

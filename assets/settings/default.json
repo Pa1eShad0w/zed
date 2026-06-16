@@ -1666,6 +1666,20 @@
     // Trailing slashes are ignored.
     "worktree_directory": "../worktrees",
   },
+  // Perforce auto-checkout. When a project is a Perforce workspace, these control whether
+  // files are transparently opened in the depot as you work (Perforce keeps un-opened files
+  // read-only on disk, which would otherwise block saving). All default to true and have no
+  // effect outside a Perforce workspace.
+  "perforce": {
+    // Run `p4 edit` before saving a tracked, read-only file so the save succeeds.
+    "edit_on_file_save": true,
+    // Run `p4 edit` the first time an open buffer in the workspace is modified.
+    "edit_on_file_modified": true,
+    // Run `p4 add` when a new file is created inside the workspace.
+    "add_on_file_create": true,
+    // Run `p4 delete` when a file in the workspace is deleted.
+    "delete_on_file_delete": true,
+  },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [
     // {

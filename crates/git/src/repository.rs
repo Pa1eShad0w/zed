@@ -1077,6 +1077,21 @@ pub trait GitRepository: Send + Sync {
 
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
+
+    /// Perforce auto-checkout: open the given files for edit/add/delete in the depot.
+    ///
+    /// This is the hook the project's save/create/delete flow calls so a Perforce workspace
+    /// transparently opens files as the user edits (mirroring vscode-perforce's
+    /// `editOnFileSave`/`addOnFileCreate`/`deleteOnFileDelete`). For non-Perforce backends
+    /// (git) this is a **no-op** that resolves immediately, so normal version-control and
+    /// non-VCS file saving is completely unaffected. Only the Perforce backend overrides it.
+    fn perforce_open_for(
+        &self,
+        _action: crate::perforce::P4OpenAction,
+        _paths: Vec<RepoPath>,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
 }
 
 pub enum DiffType {

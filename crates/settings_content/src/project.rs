@@ -574,6 +574,34 @@ pub struct GitSettings {
     pub worktree_directory: Option<String>,
 }
 
+/// Configuration for Perforce auto-checkout.
+///
+/// Mirrors the vscode-perforce extension's file-system action switches. When a project is a
+/// Perforce workspace, these control whether files are transparently opened in the depot as
+/// the user works (the local read-only bit is what otherwise blocks saving). All default to
+/// `true`. They have no effect outside a Perforce workspace.
+#[with_fallible_options]
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub struct PerforceSettings {
+    /// Run `p4 edit` before saving a tracked, read-only file so the save succeeds.
+    ///
+    /// Default: true
+    pub edit_on_file_save: Option<bool>,
+    /// Run `p4 edit` the first time an open buffer in the workspace is modified.
+    ///
+    /// Default: true
+    pub edit_on_file_modified: Option<bool>,
+    /// Run `p4 add` when a new file is created inside the workspace.
+    ///
+    /// Default: true
+    pub add_on_file_create: Option<bool>,
+    /// Run `p4 delete` when a file in the workspace is deleted.
+    ///
+    /// Default: true
+    pub delete_on_file_delete: Option<bool>,
+}
+
 #[with_fallible_options]
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
