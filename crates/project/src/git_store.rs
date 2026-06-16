@@ -33,6 +33,7 @@ use git::{
     BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
     blame::Blame,
     parse_git_remote_url,
+    perforce::PerforceRepository,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
         CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, FileHistoryChangedFileSets,
@@ -433,9 +434,43 @@ impl LocalRepositoryState {
                     log::error!("failed to get working directory environment for repository {work_directory_abs_path:?}");
                     HashMap::default()
                 });
+        let environment = Arc::new(environment);
         let search_paths = environment.get("PATH").map(|val| val.to_owned());
-        let backend = cx
-            .background_spawn({
+        let executor = cx.background_executor().clone();
+
+        // A `.p4config` marker (rather than a `.git` directory) means this work
+        // directory is a Perforce workspace; build the Perforce backend instead of git.
+        let is_perforce = dot_git_abs_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(git::perforce::is_p4_config_name);
+
+        let backend: Arc<dyn GitRepository> = if is_perforce {
+            let p4_binary_path = search_paths
+                .clone()
+                .and_then(|search_paths| {
+                    which::which_in("p4", Some(search_paths), &work_directory_abs_path).ok()
+                })
+                .or_else(|| which::which("p4").ok())
+                .context("no p4 binary available")?;
+            // Validate via `p4 info` — this also rejects a stray `.p4config` that is not
+            // actually inside a usable Perforce workspace.
+            let workspace = PerforceRepository::detect(
+                p4_binary_path.clone(),
+                &work_directory_abs_path,
+                environment.clone(),
+                executor.clone(),
+            )
+            .await
+            .with_context(|| format!("not a Perforce workspace at {work_directory_abs_path:?}"))?;
+            Arc::new(PerforceRepository::new(
+                p4_binary_path,
+                workspace,
+                environment.clone(),
+                executor,
+            ))
+        } else {
+            cx.background_spawn({
                 let fs = fs.clone();
                 async move {
                     let system_git_binary_path = search_paths
@@ -448,11 +483,12 @@ impl LocalRepositoryState {
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }
             })
-            .await?;
+            .await?
+        };
         backend.set_trusted(is_trusted);
         Ok(LocalRepositoryState {
             backend,
-            environment: Arc::new(environment),
+            environment,
             fs,
         })
     }
@@ -530,6 +566,27 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Resolve the configured P4CONFIG marker filename once (machine/platform-scoped,
+        // e.g. `.p4config` or `p4config.txt`) so worktree discovery recognizes the right
+        // Perforce config file. Until resolved, discovery falls back to the default.
+        // Skipped under the fake fs (tests don't shell out to p4).
+        if !fs.is_fake() {
+            let executor = cx.background_executor().clone();
+            cx.background_spawn(async move {
+                let Ok(p4) = which::which("p4") else { return };
+                let names = git::perforce::resolve_p4_config_marker_names(
+                    p4,
+                    Arc::new(HashMap::default()),
+                    home_dir().to_path_buf(),
+                    executor,
+                )
+                .await;
+                log::info!("perforce: resolved P4CONFIG marker names = {names:?}");
+                git::perforce::set_p4_config_marker_names(names);
+            })
+            .detach();
+        }
+
         let _fs_watches = if fs.is_fake() {
             Box::new([])
         } else {

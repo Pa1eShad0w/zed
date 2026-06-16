@@ -1,6 +1,7 @@
 pub mod blame;
 pub mod commit;
 mod hosting_provider;
+pub mod perforce;
 mod remote;
 pub mod repository;
 pub mod stash;
@@ -18,6 +19,9 @@ use std::str::FromStr;
 
 pub const DOT_GIT: &str = ".git";
 pub const GITIGNORE: &str = ".gitignore";
+/// Default `P4CONFIG` filename; its presence in a directory marks a Perforce
+/// workspace root, analogous to `.git` for git. See [`perforce`].
+pub const P4CONFIG: &str = ".p4config";
 pub const FSMONITOR_DAEMON: &str = "fsmonitor--daemon";
 pub const LFS_DIR: &str = "lfs";
 pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";

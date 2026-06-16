@@ -3405,6 +3405,50 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_perforce_workspace_registers_repository(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    // A Perforce workspace is marked by a `.p4config` file at its root (the
+    // P4CONFIG convention), with no `.git`.
+    fs.insert_tree(
+        path!("/ws"),
+        json!({
+            ".p4config": "P4CLIENT=demo\n",
+            "src": {
+                "a.cpp": "int main() {}"
+            }
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        path!("/ws").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    let repos = worktree.update(cx, |worktree, _| {
+        worktree.as_local().unwrap().repositories()
+    });
+    pretty_assertions::assert_eq!(repos, [Path::new(path!("/ws")).into()]);
+}
+
+#[gpui::test]
 async fn test_global_gitignore(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 

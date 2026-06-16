@@ -3063,6 +3063,12 @@ impl BackgroundScannerState {
         if entry.path.file_name() == Some(&DOT_GIT) {
             self.insert_git_repository(entry.path.clone(), fs, watcher)
                 .await;
+        } else if entry
+            .path
+            .file_name()
+            .is_some_and(git::perforce::is_p4_config_name)
+        {
+            self.insert_perforce_repository(entry.path.clone()).await;
         }
 
         #[cfg(feature = "test-support")]
@@ -3337,6 +3343,60 @@ impl BackgroundScannerState {
 
         log::trace!("inserting new local git repository");
         Ok(local_repository)
+    }
+
+    /// Register a Perforce workspace root, marked by a `.p4config` file.
+    ///
+    /// Parallel to [`Self::insert_git_repository`], but Perforce has no on-disk
+    /// repository-metadata directory: the work directory, repository dir, and common
+    /// dir all coincide with the directory containing `.p4config`. The marker's absolute
+    /// path is stored in `dot_git_abs_path` so the GitStore can select the Perforce
+    /// backend at construction time (by inspecting the marker filename). This does NOT
+    /// hit the Perforce server — discovery stays cheap and synchronous; the actual `p4`
+    /// connection is validated later, when the backend is constructed.
+    async fn insert_perforce_repository(&mut self, dot_p4_path: Arc<RelPath>) {
+        let Some(work_dir_path) = dot_p4_path.parent() else {
+            // `.p4config` is the worktree root itself; nothing above it to track.
+            return;
+        };
+        let work_dir_path: Arc<RelPath> = work_dir_path.into();
+
+        let Some(work_dir_entry) = self.snapshot.entry_for_path(&work_dir_path) else {
+            return;
+        };
+        let work_directory_id = work_dir_entry.id;
+
+        // Git takes precedence if a repository is already registered for this directory.
+        if self.snapshot.git_repositories.get(&work_directory_id).is_some() {
+            return;
+        }
+
+        let work_directory = WorkDirectory::InProject {
+            relative_path: work_dir_path.clone(),
+        };
+        let work_directory_abs_path: Arc<Path> = self
+            .snapshot
+            .work_directory_abs_path(&work_directory)
+            .as_path()
+            .into();
+        let dot_p4_abs_path: Arc<Path> = Arc::from(self.snapshot.absolutize(&dot_p4_path).as_ref());
+
+        let local_repository = LocalRepositoryEntry {
+            work_directory_id,
+            work_directory,
+            work_directory_abs_path: work_directory_abs_path.clone(),
+            git_dir_scan_id: 0,
+            // The marker path identifies the backend; the other dirs coincide with the
+            // workspace root since Perforce keeps no per-workspace metadata directory.
+            dot_git_abs_path: dot_p4_abs_path,
+            common_dir_abs_path: work_directory_abs_path.clone(),
+            repository_dir_abs_path: work_directory_abs_path,
+        };
+
+        self.snapshot
+            .git_repositories
+            .insert(work_directory_id, local_repository);
+        log::trace!("inserting new local perforce repository");
     }
 }
 
@@ -4911,6 +4971,12 @@ impl BackgroundScanner {
                             self.watcher.as_ref(),
                         )
                         .await;
+                } else if child_name
+                    .to_str()
+                    .is_some_and(git::perforce::is_p4_config_name)
+                {
+                    let mut state = self.state.lock().await;
+                    state.insert_perforce_repository(child_path.clone()).await;
                 } else if child_name == GITIGNORE {
                     match build_gitignore(&child_abs_path, self.fs.as_ref()).await {
                         Ok(ignore) => {
