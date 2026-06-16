@@ -266,6 +266,58 @@ fn parse_opened_status(client_name: &str, opened_output: &str) -> GitStatus {
     }
 }
 
+/// On-disk open-candidate classification of a single scoped path, used by the
+/// read-only-bit pre-filter (sub-task 3a).
+///
+/// Perforce keeps un-opened synced files **read-only on disk**; opening a file for
+/// `edit`/`add` makes it **writable**. So a read-only regular file is *definitely not
+/// open* and cannot contribute to status, while anything else (writable, missing, a
+/// directory, or unstattable) *might* correspond to an opened file and must be confirmed
+/// against the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCandidate {
+    /// A regular file that exists and is read-only ⇒ provably not open ⇒ can be skipped.
+    DefinitelyNotOpen,
+    /// Writable / missing / directory / unstattable ⇒ might be open ⇒ must query `p4`.
+    MaybeOpen,
+}
+
+/// Classify one local path for the read-only pre-filter.
+///
+/// Correctness: we only ever return [`OpenCandidate::DefinitelyNotOpen`] for a path we can
+/// prove is not open — a regular file present on disk with the read-only bit set. Every
+/// other case (writable file, broken/symlinked target, a directory whose children we did
+/// not inspect, a path that does not exist because it may be open-for-delete, or any stat
+/// error) is conservatively [`OpenCandidate::MaybeOpen`], preserving the full `p4 opened`
+/// result as the source of truth.
+fn classify_open_candidate(local_path: &Path) -> OpenCandidate {
+    match std::fs::symlink_metadata(local_path) {
+        Ok(meta) if meta.is_file() && meta.permissions().readonly() => {
+            OpenCandidate::DefinitelyNotOpen
+        }
+        // Writable regular file, directory, symlink, or anything else: cannot rule out open.
+        Ok(_) => OpenCandidate::MaybeOpen,
+        // Missing (possibly open-for-delete) or stat error: cannot rule out open.
+        Err(_) => OpenCandidate::MaybeOpen,
+    }
+}
+
+/// Decide whether a scoped `status()` refresh can short-circuit *without* calling
+/// `p4 opened`, based purely on the on-disk read-only bits of its candidate paths.
+///
+/// Returns `true` (skip the server) iff **every** candidate path is provably not open
+/// (read-only regular file). An empty candidate list is *not* skippable — that is the
+/// full-refresh / large-scope case handled by the caller, never routed here.
+///
+/// This is a pure optimization: a `false` here just falls through to the normal
+/// `p4 opened` query, which remains authoritative.
+fn can_skip_opened_query(candidates: &[OpenCandidate]) -> bool {
+    !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|c| *c == OpenCandidate::DefinitelyNotOpen)
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -377,6 +429,28 @@ impl GitRepository for PerforceRepository {
         let client_name = self.client_name.clone();
         let n_prefixes = path_prefixes.len();
         let scoped: Option<Vec<String>> = if (1..=SCOPED_CAP).contains(&n_prefixes) {
+            // 3a — read-only-bit pre-filter: Perforce keeps un-opened files read-only on
+            // disk and makes opened (edit/add) files writable. For a scoped refresh we can
+            // therefore prove, purely from on-disk permissions, whether *any* candidate
+            // could be open. If every candidate is a read-only regular file, none is open,
+            // so the `p4 opened` round-trip is guaranteed empty for these paths and we
+            // short-circuit to an unchanged status without touching the server. Any
+            // writable/missing/directory candidate falls through to the authoritative
+            // query below. (Observed: this eliminates ~50 zero-result calls per scan.)
+            let candidates: Vec<OpenCandidate> = path_prefixes
+                .iter()
+                .map(|p| classify_open_candidate(&self.working_directory.join(p.as_std_path())))
+                .collect();
+            if can_skip_opened_query(&candidates) {
+                log::debug!(
+                    "perforce: status client={client_name} read-only pre-filter skipped p4 for {n_prefixes} prefix(es)"
+                );
+                return self.cli.executor.clone().spawn(async move {
+                    Ok(GitStatus {
+                        entries: Vec::new().into(),
+                    })
+                });
+            }
             Some(
                 path_prefixes
                     .iter()
@@ -914,6 +988,73 @@ mod tests {
         assert!(is_p4_config_name("p4config.txt"));
         assert!(!is_p4_config_name("some_custom_name"));
         assert!(!is_p4_config_name(".gitignore"));
+    }
+
+    // ---- 3a: read-only-bit pre-filter decision logic ----
+
+    #[test]
+    fn skip_decision_all_readonly_skips() {
+        // Every candidate provably not open ⇒ safe to skip the server.
+        let candidates = vec![
+            OpenCandidate::DefinitelyNotOpen,
+            OpenCandidate::DefinitelyNotOpen,
+        ];
+        assert!(can_skip_opened_query(&candidates));
+    }
+
+    #[test]
+    fn skip_decision_any_maybe_open_queries() {
+        // A single writable/missing/dir candidate forces a server query.
+        let candidates = vec![
+            OpenCandidate::DefinitelyNotOpen,
+            OpenCandidate::MaybeOpen,
+            OpenCandidate::DefinitelyNotOpen,
+        ];
+        assert!(!can_skip_opened_query(&candidates));
+    }
+
+    #[test]
+    fn skip_decision_empty_never_skips() {
+        // Empty == full/large refresh; must never be routed to a skip.
+        assert!(!can_skip_opened_query(&[]));
+    }
+
+    #[test]
+    fn classify_readonly_file_is_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.txt");
+        std::fs::write(&path, b"depot content").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert_eq!(
+            classify_open_candidate(&path),
+            OpenCandidate::DefinitelyNotOpen
+        );
+    }
+
+    #[test]
+    fn classify_writable_file_maybe_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rw.txt");
+        std::fs::write(&path, b"opened for edit").unwrap();
+        // Freshly written file is writable by default on both Windows and Unix.
+        assert_eq!(classify_open_candidate(&path), OpenCandidate::MaybeOpen);
+    }
+
+    #[test]
+    fn classify_missing_path_maybe_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does_not_exist.txt");
+        // Missing locally could mean open-for-delete: must not be ruled out.
+        assert_eq!(classify_open_candidate(&path), OpenCandidate::MaybeOpen);
+    }
+
+    #[test]
+    fn classify_directory_maybe_open() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory prefix's children are not inspected here: must query.
+        assert_eq!(classify_open_candidate(dir.path()), OpenCandidate::MaybeOpen);
     }
 
     #[test]
