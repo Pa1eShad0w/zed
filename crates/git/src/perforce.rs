@@ -318,6 +318,30 @@ fn can_skip_opened_query(candidates: &[OpenCandidate]) -> bool {
             .all(|c| *c == OpenCandidate::DefinitelyNotOpen)
 }
 
+/// Filter the paths that actually need a `p4 open` for `action`.
+///
+/// For [`P4OpenAction::Edit`], a file that is already writable on disk is already open for
+/// edit (or untracked) — a second `p4 edit` is a redundant server round-trip ("currently
+/// opened for edit"). So we keep only the read-only (not-yet-open) files. This makes the
+/// auto-checkout hooks idempotent: the first edit opens the file, and once it is writable
+/// every later edit/save skips the server. `Add`/`Delete` are not gated this way.
+fn paths_to_open(
+    action: P4OpenAction,
+    working_directory: &Path,
+    paths: Vec<RepoPath>,
+) -> Vec<RepoPath> {
+    if action != P4OpenAction::Edit {
+        return paths;
+    }
+    paths
+        .into_iter()
+        .filter(|p| {
+            classify_open_candidate(&working_directory.join(p.as_std_path()))
+                == OpenCandidate::DefinitelyNotOpen
+        })
+        .collect()
+}
+
 /// Which Perforce "open" action a save/create/delete should perform.
 ///
 /// Mirrors vscode-perforce's `FileSystemActions`: a save/modify of an existing tracked file
@@ -933,15 +957,18 @@ impl PerforceRepository {
     /// `paths` is a no-op. Errors surface to the caller (e.g. a save can report that the
     /// `p4 edit` failed) rather than panicking.
     pub fn open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
+        let paths = paths_to_open(action, &self.working_directory, paths);
         if paths.is_empty() {
             return Task::ready(Ok(()));
         }
         let cli = self.cli.clone();
         let args = p4_open_args(action, &self.client_name, &paths);
+        let verb = action.verb();
+        let n = paths.len();
         self.cli.executor.clone().spawn(async move {
             let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
-            anyhow::ensure!(ok, "p4 {} failed: {stderr}", action.verb());
-            log::debug!("perforce: p4 {} -> {}", action.verb(), stdout.trim_end());
+            anyhow::ensure!(ok, "p4 {verb} failed: {stderr}");
+            log::info!("perforce: auto-checkout p4 {verb} ({n} path(s)) -> {}", stdout.trim_end());
             Ok(())
         })
     }
@@ -1176,6 +1203,34 @@ mod tests {
         let args = p4_open_args(P4OpenAction::Edit, "c", &[repo_path("f.rs")]);
         assert!(!args.iter().any(|a| a == "-ztag"));
         assert_eq!(args[0], "edit");
+    }
+
+    #[test]
+    fn edit_skips_already_writable_files() {
+        // An already-writable file is already open for edit; a second `p4 edit` is wasted.
+        let dir = tempfile::tempdir().unwrap();
+        let ro_path = dir.path().join("ro.txt");
+        std::fs::write(&ro_path, b"synced").unwrap();
+        let mut perms = std::fs::metadata(&ro_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&ro_path, perms).unwrap();
+        std::fs::write(dir.path().join("rw.txt"), b"already open").unwrap();
+
+        // Edit: only the read-only file needs checkout.
+        let kept = paths_to_open(
+            P4OpenAction::Edit,
+            dir.path(),
+            vec![repo_path("ro.txt"), repo_path("rw.txt")],
+        );
+        assert_eq!(kept, vec![repo_path("ro.txt")]);
+
+        // Add/Delete are not gated by the read-only bit.
+        let added = paths_to_open(
+            P4OpenAction::Add,
+            dir.path(),
+            vec![repo_path("ro.txt"), repo_path("rw.txt")],
+        );
+        assert_eq!(added.len(), 2);
     }
 
     #[test]
