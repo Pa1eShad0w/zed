@@ -388,21 +388,22 @@ impl RemoteBufferStore {
 }
 
 impl LocalBufferStore {
-    /// Build the Perforce auto-checkout pre-save task for a save of `path` in `worktree`.
+    /// Resolve the Perforce auto-checkout request for a save of `path`, if any.
     ///
-    /// Returns `None` when there is nothing to do — no `GitStore` back-reference, the
-    /// relevant switch is disabled, or (resolved later, cheaply) the path is not in a
-    /// Perforce workspace. A new file maps to `p4 add`, an existing one to `p4 edit`. The
-    /// returned task resolves to `Ok(())` instantly for git/non-VCS paths, so awaiting it
-    /// before the disk write never penalizes normal saves.
-    fn perforce_pre_save_task(
+    /// Returns the (weak GitStore, action, project path) ingredients — NOT a pre-spawned
+    /// task — because the two actions must be ordered differently around the disk write:
+    /// `Edit` runs BEFORE the write (a synced file is read-only on disk; `p4 edit` makes it
+    /// writable), while `Add` must run AFTER (`p4 add` requires the file to exist on disk).
+    /// `None` when there is no GitStore back-reference or the relevant switch is off. The
+    /// `perforce_open_for` call itself is a no-op resolving instantly for git/non-VCS paths.
+    fn perforce_open_request(
         &self,
         worktree: &Entity<Worktree>,
         path: &Arc<RelPath>,
         is_new_file: bool,
         cx: &mut Context<BufferStore>,
-    ) -> Option<Task<Result<()>>> {
-        let git_store = self.git_store.as_ref()?.upgrade()?;
+    ) -> Option<(WeakEntity<GitStore>, git::perforce::P4OpenAction, ProjectPath)> {
+        let git_store = self.git_store.clone()?;
 
         let settings = ProjectSettings::get_global(cx).perforce;
         let action = if is_new_file {
@@ -421,9 +422,7 @@ impl LocalBufferStore {
             worktree_id: worktree.read(cx).id(),
             path: path.clone(),
         };
-        Some(git_store.update(cx, |git_store, cx| {
-            git_store.perforce_open_for(&project_path, action, cx)
-        }))
+        Some((git_store, action, project_path))
     }
 
     fn save_local_buffer(
@@ -450,38 +449,46 @@ impl LocalBufferStore {
             has_changed_file = true;
         }
 
-        // Perforce auto-checkout pre-save hook: before writing to disk, open the file in the
-        // depot so a synced (read-only) file becomes writable, or a new file is added. This
-        // mirrors vscode-perforce's `onWillSaveTextDocument`. It is a no-op for git and
-        // non-VCS paths (the GitStore resolves no Perforce repo and returns immediately), so
-        // normal file saving is unaffected. We compute the action and project path here while
-        // `path` is still available, then await it inside the spawned task before the write.
-        let perforce_pre_save = self.perforce_pre_save_task(
-            &worktree,
-            &path,
-            is_new_file,
-            cx,
-        );
+        // Perforce auto-checkout hook (mirrors vscode-perforce). No-op for git/non-VCS paths
+        // (GitStore resolves no Perforce repo and returns instantly), so normal saves are
+        // unaffected. `Edit` opens a synced read-only file before the write so the write
+        // succeeds; `Add` runs after the write since `p4 add` needs the file on disk.
+        let perforce = self.perforce_open_request(&worktree, &path, is_new_file, cx);
 
         cx.spawn(async move |this, cx| {
-            if let Some(pre_save) = perforce_pre_save {
-                // Best-effort, mirroring vscode-perforce: a failed `p4 edit`/`add` must NOT
-                // abort the save. For a synced read-only file the edit succeeds and the write
-                // then works; for an untracked file the edit fails harmlessly and the write
-                // proceeds (the file isn't read-only). Only a genuinely read-only file whose
-                // checkout failed will then fail at `write_file`, with a clear OS error — the
-                // same outcome as without this feature, never a silent corruption.
-                pre_save.await.log_err();
+            // Best-effort throughout: a failed `p4 edit`/`add` must never abort the save.
+            if let Some((git_store, action, project_path)) = &perforce
+                && *action == git::perforce::P4OpenAction::Edit
+                && let Some(git_store) = git_store.upgrade()
+            {
+                // Open for edit BEFORE the write. gpui Tasks are eager, so this must be
+                // awaited before the write task is even created, or the write races the
+                // checkout and fails on the still-read-only file.
+                git_store
+                    .update(cx, |git_store, cx| {
+                        git_store.perforce_open_for(project_path, *action, cx)
+                    })
+                    .await
+                    .log_err();
             }
-            // Start the disk write only AFTER the pre-save checkout completes: gpui `Task`s
-            // are eager (they run on creation), so creating the write task before awaiting
-            // the `p4 edit` would race the write against the checkout and fail on the
-            // still-read-only file. For git / non-VCS paths the pre-save resolves instantly,
-            // so this ordering is free.
+
             let save = worktree.update(cx, |worktree, cx| {
                 worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
             });
             let new_file = save.await?;
+
+            // Open for add AFTER the write — `p4 add` requires the file to exist on disk.
+            if let Some((git_store, action, project_path)) = &perforce
+                && *action == git::perforce::P4OpenAction::Add
+                && let Some(git_store) = git_store.upgrade()
+            {
+                git_store
+                    .update(cx, |git_store, cx| {
+                        git_store.perforce_open_for(project_path, *action, cx)
+                    })
+                    .await
+                    .log_err();
+            }
             let mtime = new_file.disk_state().mtime();
             this.update(cx, |this, cx| {
                 if let Some((downstream_client, project_id)) = this.downstream_client.clone() {

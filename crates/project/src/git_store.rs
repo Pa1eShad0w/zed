@@ -2062,6 +2062,13 @@ impl GitStore {
     ) {
         match event {
             BufferStoreEvent::BufferAdded(buffer) => {
+                // Prune the auto-checkout dedup set when the buffer is dropped, so a buffer
+                // edited then closed without saving (no clean DirtyChanged) doesn't leak.
+                let buffer_id = buffer.read(cx).remote_id();
+                cx.observe_release(buffer, move |this, _buffer, _cx| {
+                    this.perforce_edited_buffers.remove(&buffer_id);
+                })
+                .detach();
                 cx.subscribe(buffer, |this, buffer, event, cx| match event {
                     BufferEvent::LanguageChanged(_) => {
                         let buffer_id = buffer.read(cx).remote_id();
