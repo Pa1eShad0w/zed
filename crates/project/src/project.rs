@@ -2546,8 +2546,24 @@ impl Project {
                 "No worktree for path {project_path:?}"
             ))));
         };
-        worktree.update(cx, |worktree, cx| {
+        // Perforce auto-add (mirrors vscode-perforce's `addOnFileCreate`): open the new file
+        // for add in the depot, AFTER it has been created on disk (`p4 add` needs the file to
+        // exist). No-op for directories, git, and non-VCS paths.
+        let perforce_add = if is_directory {
+            None
+        } else {
+            self.perforce_add_task(&project_path, cx)
+        };
+        let create = worktree.update(cx, |worktree, cx| {
             worktree.create_entry(project_path.path, is_directory, None, cx)
+        });
+        cx.spawn(async move |_, _| {
+            let created = create.await?;
+            if let Some(perforce_add) = perforce_add {
+                // Best-effort: a failed `p4 add` must not fail the file creation.
+                perforce_add.await.log_err();
+            }
+            Ok(created)
         })
     }
 
@@ -2698,6 +2714,22 @@ impl Project {
         };
         Some(self.git_store.update(cx, |git_store, cx| {
             git_store.perforce_open_for(&project_path, git::perforce::P4OpenAction::Delete, cx)
+        }))
+    }
+
+    /// Build the Perforce open-for-add task for a newly created `project_path`, or `None` when
+    /// `add_on_file_create` is disabled. No-op for git and non-VCS paths.
+    fn perforce_add_task(
+        &self,
+        project_path: &ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        if !ProjectSettings::get_global(cx).perforce.add_on_file_create {
+            return None;
+        }
+        let project_path = project_path.clone();
+        Some(self.git_store.update(cx, |git_store, cx| {
+            git_store.perforce_open_for(&project_path, git::perforce::P4OpenAction::Add, cx)
         }))
     }
 
