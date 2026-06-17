@@ -510,6 +510,8 @@ pub struct PerforceSettings {
     pub add_on_file_create: bool,
     /// Run `p4 delete` when a file is deleted.
     pub delete_on_file_delete: bool,
+    /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    pub max_history_count: usize,
 }
 
 impl Default for PerforceSettings {
@@ -519,6 +521,7 @@ impl Default for PerforceSettings {
             edit_on_file_modified: true,
             add_on_file_create: true,
             delete_on_file_delete: true,
+            max_history_count: 50,
         }
     }
 }
@@ -732,6 +735,9 @@ impl Settings for ProjectSettings {
                 delete_on_file_delete: p4
                     .and_then(|p| p.delete_on_file_delete)
                     .unwrap_or(default.delete_on_file_delete),
+                max_history_count: p4
+                    .and_then(|p| p.max_history_count)
+                    .unwrap_or(default.max_history_count),
             }
         };
         Self {

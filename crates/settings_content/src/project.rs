@@ -600,6 +600,10 @@ pub struct PerforceSettings {
     ///
     /// Default: true
     pub delete_on_file_delete: Option<bool>,
+    /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    ///
+    /// Default: 50
+    pub max_history_count: Option<usize>,
 }
 
 #[with_fallible_options]

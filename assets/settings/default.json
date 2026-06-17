@@ -1679,6 +1679,8 @@
     "add_on_file_create": true,
     // Run `p4 delete` when a file in the workspace is deleted.
     "delete_on_file_delete": true,
+    // Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    "max_history_count": 50,
   },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [
