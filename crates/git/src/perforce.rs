@@ -211,6 +211,20 @@ pub(crate) fn parse_ztag(output: &str) -> Vec<HashMap<String, String>> {
     records
 }
 
+/// Parse `p4 -ztag opened` output into a map of repo path -> action verb (`add`, `edit`,
+/// `delete`, `move/add`, ...). Used by delete handling to choose revert vs delete.
+fn parse_opened_actions(client_name: &str, opened_output: &str) -> HashMap<RepoPath, String> {
+    let mut map = HashMap::default();
+    for record in parse_ztag(opened_output) {
+        if let (Some(client_file), Some(action)) = (record.get("clientFile"), record.get("action"))
+            && let Some(repo_path) = client_path_to_repo_path(client_name, client_file)
+        {
+            map.insert(repo_path, action.clone());
+        }
+    }
+    map
+}
+
 /// Map a `p4 opened`/`fstat` action verb to a [`StatusCode`].
 ///
 /// Verified against vscode-perforce `src/scm/Status.ts`. We record the Perforce "opened"
@@ -1217,6 +1231,11 @@ impl PerforceRepository {
     /// `paths` is a no-op. Errors surface to the caller (e.g. a save can report that the
     /// `p4 edit` failed) rather than panicking.
     pub fn open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
+        // Delete needs special handling: `p4 delete` errors on a file already opened for
+        // add/edit, so we must revert (and, for edit, then delete) instead.
+        if action == P4OpenAction::Delete {
+            return self.delete_paths(paths);
+        }
         let paths = paths_to_open(action, &self.working_directory, paths);
         if paths.is_empty() {
             return Task::ready(Ok(()));
@@ -1229,6 +1248,62 @@ impl PerforceRepository {
             let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
             anyhow::ensure!(ok, "p4 {verb} failed: {stderr}");
             log::info!("perforce: auto-checkout p4 {verb} ({n} path(s)) -> {}", stdout.trim_end());
+            Ok(())
+        })
+    }
+
+    /// Handle a delete, accounting for the file's current open state (a plain `p4 delete`
+    /// fails if the file is already open):
+    /// - opened for add → `p4 revert` (drop the add; it was never in the depot)
+    /// - opened for edit/etc → `p4 revert -k` (un-open, keep the already-removed local file)
+    ///   then `p4 delete` (mark for delete in the depot)
+    /// - not open → `p4 delete`
+    fn delete_paths(&self, paths: Vec<RepoPath>) -> Task<Result<()>> {
+        if paths.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        let cli = self.cli.clone();
+        let client_name = self.client_name.clone();
+        self.cli.executor.clone().spawn(async move {
+            let targets: Vec<String> = paths
+                .iter()
+                .map(|p| format!("//{}/{}", client_name, p.as_unix_str()))
+                .collect();
+
+            let mut opened_args = vec!["opened".to_string()];
+            opened_args.extend(targets.iter().cloned());
+            let (opened_out, _, _) = cli.run_lenient(true, &opened_args).await?;
+            let opened = parse_opened_actions(&client_name, &opened_out);
+
+            let (mut revert_add, mut revert_edit, mut plain_delete) =
+                (Vec::new(), Vec::new(), Vec::new());
+            for (path, target) in paths.iter().zip(targets) {
+                match opened.get(path).map(String::as_str) {
+                    Some("add" | "move/add" | "branch" | "import") => revert_add.push(target),
+                    Some(_) => revert_edit.push(target),
+                    None => plain_delete.push(target),
+                }
+            }
+
+            if !revert_add.is_empty() {
+                let mut args = vec!["revert".to_string()];
+                args.extend(revert_add);
+                cli.run_lenient(false, &args).await.ok();
+            }
+            if !revert_edit.is_empty() {
+                let mut revert = vec!["revert".to_string(), "-k".to_string()];
+                revert.extend(revert_edit.iter().cloned());
+                cli.run_lenient(false, &revert).await.ok();
+                let mut del = vec!["delete".to_string()];
+                del.extend(revert_edit);
+                cli.run_lenient(false, &del).await.ok();
+            }
+            if !plain_delete.is_empty() {
+                let mut args = vec!["delete".to_string()];
+                args.extend(plain_delete);
+                cli.run_lenient(false, &args).await.ok();
+            }
+            log::info!("perforce: auto-delete {} path(s)", paths.len());
             Ok(())
         })
     }
@@ -1463,6 +1538,20 @@ mod tests {
         let args = p4_open_args(P4OpenAction::Edit, "c", &[repo_path("f.rs")]);
         assert!(!args.iter().any(|a| a == "-ztag"));
         assert_eq!(args[0], "edit");
+    }
+
+    #[test]
+    fn opened_actions_parse() {
+        let ztag = "\
+... clientFile //some_client_name/a/edited.cpp
+... action edit
+
+... clientFile //some_client_name/b/added.md
+... action add
+";
+        let map = parse_opened_actions("some_client_name", ztag);
+        assert_eq!(map.get(&repo_path("a/edited.cpp")).map(String::as_str), Some("edit"));
+        assert_eq!(map.get(&repo_path("b/added.md")).map(String::as_str), Some("add"));
     }
 
     #[test]

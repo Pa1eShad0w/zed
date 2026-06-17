@@ -441,10 +441,11 @@ impl LocalBufferStore {
         let has_bom = buffer.has_bom();
         let version = buffer.version();
         let buffer_id = buffer.remote_id();
-        let file = buffer.file().cloned();
-        let is_new_file = file
-            .as_ref()
-            .is_some_and(|file| file.disk_state() == DiskState::New);
+        // A target path not yet in the worktree is a file being created — an untitled buffer
+        // saved into the project, or a brand-new path — which Perforce should `add`; an
+        // existing path is an `edit`. Zed's `DiskState::New` isn't set on a save-as, so we
+        // check the target path directly rather than the buffer's (possibly stale) file.
+        let is_new_file = worktree.read(cx).entry_for_path(&path).is_none();
         if is_new_file {
             has_changed_file = true;
         }
