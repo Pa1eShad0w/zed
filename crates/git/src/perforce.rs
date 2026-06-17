@@ -380,32 +380,27 @@ fn parse_annotate_changes(output: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Parse `p4 -ztag filelog -l` output into per-change metadata.
+/// Parse `p4 -ztag describe -s <changes...>` output into per-change metadata.
 ///
-/// filelog tagged output carries index-suffixed fields for each revision of the file
-/// (`change0`, `user0`, `time0`, `desc0`, `change1`, ...). A multi-line `-l` description can
-/// contain blank lines that split the tagged block into several records, so we merge all
-/// records before walking the indices.
-fn parse_filelog_meta(ztag_output: &str) -> HashMap<u32, ChangeMeta> {
-    let mut all: HashMap<String, String> = HashMap::default();
-    for record in parse_ztag(ztag_output) {
-        all.extend(record);
-    }
+/// Each change is its own tagged record with `change`, `user`, `time` (epoch seconds), and
+/// `desc`. We keep the first line of `desc` as the summary. (`describe` is used rather than
+/// `filelog` because, with branch-following annotate, the contributing changes live in the
+/// parent stream and `describe` resolves any change number directly.)
+fn parse_describe_meta(ztag_output: &str) -> HashMap<u32, ChangeMeta> {
     let mut map: HashMap<u32, ChangeMeta> = HashMap::default();
-    let mut i = 0usize;
-    while let Some(change_str) = all.get(&format!("change{i}")) {
-        if let Ok(change) = change_str.parse::<u32>() {
-            map.entry(change).or_insert_with(|| ChangeMeta {
-                user: all.get(&format!("user{i}")).cloned(),
-                time: all.get(&format!("time{i}")).and_then(|t| t.parse::<i64>().ok()),
-                summary: all
-                    .get(&format!("desc{i}"))
-                    .and_then(|d| d.lines().next())
-                    .map(|line| line.trim().to_string())
-                    .filter(|s| !s.is_empty()),
-            });
-        }
-        i += 1;
+    for record in parse_ztag(ztag_output) {
+        let Some(change) = record.get("change").and_then(|c| c.parse::<u32>().ok()) else {
+            continue;
+        };
+        map.entry(change).or_insert_with(|| ChangeMeta {
+            user: record.get("user").cloned(),
+            time: record.get("time").and_then(|t| t.parse::<i64>().ok()),
+            summary: record
+                .get("desc")
+                .and_then(|d| d.lines().next())
+                .map(|line| line.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        });
     }
     map
 }
@@ -440,11 +435,13 @@ fn build_p4_blame(
             author: meta.user.clone(),
             author_mail: None,
             author_time: meta.time,
-            author_tz: None,
+            // p4 change times are epoch seconds in UTC. `author_offset_date_time()` needs a
+            // tz to render a real timestamp (otherwise it falls back to "now"), so mark UTC.
+            author_tz: meta.time.map(|_| "+0000".to_string()),
             committer_name: meta.user.clone(),
             committer_email: None,
             committer_time: meta.time,
-            committer_tz: None,
+            committer_tz: meta.time.map(|_| "+0000".to_string()),
             summary: meta.summary.clone(),
             previous: None,
             filename: filename.clone(),
@@ -856,14 +853,32 @@ impl GitRepository for PerforceRepository {
             }
 
             let target = format!("{client_path}#have");
+            // `-i` follows branch history so each line traces to its real authoring change.
+            // (In a stream, plain annotate attributes every line to the populate change.)
             let (annotate_output, _, _) = cli
-                .run_lenient(false, &["annotate", "-c", "-q", "-dw", &target])
+                .run_lenient(false, &["annotate", "-c", "-q", "-i", "-dw", &target])
                 .await?;
-            let filelog_output = cli
-                .run(true, &["filelog", "-l", "-m", &max.to_string(), &target])
-                .await
-                .unwrap_or_default();
-            let meta = parse_filelog_meta(&filelog_output);
+
+            // Contributing changes, in first-appearance order, deduped and capped to
+            // `max_history_count`. These live in the parent stream for integrated lines, so
+            // `p4 describe` (which resolves any change number) supplies their metadata.
+            let mut unique: Vec<u32> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for &change in parse_annotate_changes(&annotate_output).iter() {
+                if change != 0 && seen.insert(change) {
+                    unique.push(change);
+                }
+            }
+            unique.truncate(max);
+
+            let mut meta: HashMap<u32, ChangeMeta> = HashMap::default();
+            for chunk in unique.chunks(50) {
+                let mut args: Vec<String> = vec!["describe".into(), "-s".into()];
+                args.extend(chunk.iter().map(|c| c.to_string()));
+                if let Ok(out) = cli.run(true, &args).await {
+                    meta.extend(parse_describe_meta(&out));
+                }
+            }
             let blame = build_p4_blame(&annotate_output, &meta, filename);
 
             cache.lock().insert(
@@ -1414,24 +1429,25 @@ mod tests {
     }
 
     #[test]
-    fn filelog_meta_parses_indexed_fields() {
+    fn describe_meta_parses_change_records() {
+        // Real `p4 -ztag describe -s` shape: one blank-line-separated record per change.
         let ztag = "\
-... change0 2001
-... user0 devuser2
-... time0 1700000000
-... desc0 add curves
+... change 2001
+... user devuser2
+... time 1700000000
+... desc add curves
 
-... change1 2002
-... user1 someone
-... time1 1690000000
-... desc1 initial import
+... change 2002
+... user devuser3
+... time 1690000000
+... desc [CODE] initial import
 ";
-        let meta = parse_filelog_meta(ztag);
+        let meta = parse_describe_meta(ztag);
         let a = meta.get(&2001).unwrap();
         assert_eq!(a.user.as_deref(), Some("devuser2"));
         assert_eq!(a.time, Some(1700000000));
         assert_eq!(a.summary.as_deref(), Some("add curves"));
-        assert_eq!(meta.get(&2002).unwrap().summary.as_deref(), Some("initial import"));
+        assert_eq!(meta.get(&2002).unwrap().summary.as_deref(), Some("[CODE] initial import"));
     }
 
     #[test]
