@@ -167,6 +167,11 @@ pub struct BlameEntry {
 
     pub previous: Option<String>,
     pub filename: String,
+
+    /// Optional VCS-specific revision label to display instead of the abbreviated `sha`
+    /// (e.g. a Perforce change number like `@7328353`). `None` for git, which uses `sha`.
+    #[serde(default)]
+    pub revision_label: Option<String>,
 }
 
 impl BlameEntry {
@@ -215,6 +220,7 @@ impl BlameEntry {
             summary: None,
             previous: None,
             filename: String::new(),
+            revision_label: None,
         })
     }
 

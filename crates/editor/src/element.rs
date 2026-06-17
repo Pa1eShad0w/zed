@@ -451,6 +451,7 @@ impl EditorElement {
         register_action(editor, window, Editor::open_permalink_to_line);
         register_action(editor, window, Editor::copy_file_location);
         register_action(editor, window, Editor::toggle_git_blame);
+        register_action(editor, window, Editor::toggle_perforce_annotate);
         register_action(editor, window, Editor::toggle_git_blame_inline);
         register_action(editor, window, Editor::open_git_blame_commit);
         register_action(editor, window, Editor::toggle_selected_diff_hunks);

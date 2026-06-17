@@ -1293,6 +1293,7 @@ mod tests {
             summary: None,
             previous: None,
             filename: String::new(),
+            revision_label: None,
         }
     }
 }

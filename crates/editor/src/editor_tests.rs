@@ -30404,6 +30404,7 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
                 summary: None,
                 previous: None,
                 filename: String::new(),
+                revision_label: None,
             },
             gpui::point(gpui::px(0.), gpui::px(0.)),
             false,

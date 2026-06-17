@@ -15,7 +15,7 @@
 //! - Every `p4` invocation here is verified against the vscode-perforce extension's
 //!   `src/api/commands/*.ts` for flag/output correctness.
 
-use crate::blame::Blame;
+use crate::blame::{Blame, BlameEntry};
 use crate::repository::{
     AskPassDelegate, BranchesScanResult, CommitDetails, CommitDiff, CommitOptions, CreateWorktreeTarget,
     DiffType, FetchOptions, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
@@ -29,7 +29,9 @@ use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
+use parking_lot::Mutex;
 use rope::Rope;
+use std::time::SystemTime;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -342,6 +344,116 @@ fn paths_to_open(
         .collect()
 }
 
+/// Per-changelist metadata parsed from `p4 filelog`, keyed by change number.
+#[derive(Debug, Clone, Default)]
+struct ChangeMeta {
+    user: Option<String>,
+    /// Unix epoch seconds.
+    time: Option<i64>,
+    /// First line of the changelist description.
+    summary: Option<String>,
+}
+
+/// Map a Perforce change number to a synthetic git [`Oid`].
+///
+/// `BlameEntry.sha` is a fixed-width git hash and cannot hold a decimal change number, so we
+/// encode the number into the leading bytes. The blame UI shows the human-readable
+/// `@change` via `revision_label`; this synthetic Oid is only used as a stable per-change
+/// key (e.g. for the gutter's deterministic color and the `messages` map).
+fn change_to_oid(change: u32) -> Oid {
+    let mut bytes = [0u8; 20];
+    bytes[..4].copy_from_slice(&change.to_be_bytes());
+    Oid::from_bytes(&bytes).expect("20 bytes is a valid SHA-1 oid")
+}
+
+/// Parse `p4 annotate -c -q` output into the change number contributing each line, in order.
+///
+/// With `-c` and `-q`, every output line is `<change>: <text>` (one per file line, no header).
+/// We only need the leading change number per line.
+fn parse_annotate_changes(output: &str) -> Vec<u32> {
+    output
+        .lines()
+        .map(|line| {
+            let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Parse `p4 -ztag filelog -l` output into per-change metadata.
+///
+/// filelog tagged output carries index-suffixed fields for each revision of the file
+/// (`change0`, `user0`, `time0`, `desc0`, `change1`, ...). A multi-line `-l` description can
+/// contain blank lines that split the tagged block into several records, so we merge all
+/// records before walking the indices.
+fn parse_filelog_meta(ztag_output: &str) -> HashMap<u32, ChangeMeta> {
+    let mut all: HashMap<String, String> = HashMap::default();
+    for record in parse_ztag(ztag_output) {
+        all.extend(record);
+    }
+    let mut map: HashMap<u32, ChangeMeta> = HashMap::default();
+    let mut i = 0usize;
+    while let Some(change_str) = all.get(&format!("change{i}")) {
+        if let Ok(change) = change_str.parse::<u32>() {
+            map.entry(change).or_insert_with(|| ChangeMeta {
+                user: all.get(&format!("user{i}")).cloned(),
+                time: all.get(&format!("time{i}")).and_then(|t| t.parse::<i64>().ok()),
+                summary: all
+                    .get(&format!("desc{i}"))
+                    .and_then(|d| d.lines().next())
+                    .map(|line| line.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            });
+        }
+        i += 1;
+    }
+    map
+}
+
+/// Combine `p4 annotate` (line -> change) with `p4 filelog` (change -> metadata) into a
+/// [`Blame`]. Consecutive lines sharing a change number collapse into one [`BlameEntry`].
+fn build_p4_blame(
+    annotate_output: &str,
+    filelog_meta: &HashMap<u32, ChangeMeta>,
+    filename: String,
+) -> Blame {
+    let changes = parse_annotate_changes(annotate_output);
+    let mut entries = Vec::new();
+    let mut messages: HashMap<Oid, String> = HashMap::default();
+
+    let mut i = 0;
+    while i < changes.len() {
+        let change = changes[i];
+        let start = i;
+        while i < changes.len() && changes[i] == change {
+            i += 1;
+        }
+        let oid = change_to_oid(change);
+        let meta = filelog_meta.get(&change).cloned().unwrap_or_default();
+        if let Some(summary) = &meta.summary {
+            messages.entry(oid).or_insert_with(|| summary.clone());
+        }
+        entries.push(BlameEntry {
+            sha: oid,
+            range: start as u32..i as u32,
+            original_line_number: start as u32 + 1,
+            author: meta.user.clone(),
+            author_mail: None,
+            author_time: meta.time,
+            author_tz: None,
+            committer_name: meta.user.clone(),
+            committer_email: None,
+            committer_time: meta.time,
+            committer_tz: None,
+            summary: meta.summary.clone(),
+            previous: None,
+            filename: filename.clone(),
+            revision_label: Some(format!("@{change}")),
+        });
+    }
+    Blame { entries, messages }
+}
+
 /// Which Perforce "open" action a save/create/delete should perform.
 ///
 /// Mirrors vscode-perforce's `FileSystemActions`: a save/modify of an existing tracked file
@@ -398,7 +510,18 @@ pub struct PerforceRepository {
     /// Local workspace root (client root).
     working_directory: PathBuf,
     client_name: String,
+    /// Max revisions fetched for file history (`p4 filelog -m`); from settings (default 50).
+    max_history_count: usize,
+    /// Cache of computed blame per file, keyed by the file's on-disk mtime, so we skip
+    /// re-running the slow `p4 annotate` when the file hasn't changed (e.g. focus switches,
+    /// or the editor's debounced re-blame while a buffer has unsaved edits).
+    blame_cache: Arc<Mutex<HashMap<RepoPath, BlameCacheEntry>>>,
     is_trusted: Arc<AtomicBool>,
+}
+
+struct BlameCacheEntry {
+    mtime: Option<SystemTime>,
+    blame: Blame,
 }
 
 impl PerforceRepository {
@@ -407,6 +530,7 @@ impl PerforceRepository {
         p4_binary_path: PathBuf,
         workspace: PerforceWorkspace,
         envs: Arc<HashMap<String, String>>,
+        max_history_count: usize,
         executor: BackgroundExecutor,
     ) -> Self {
         let working_directory = workspace.client_root;
@@ -420,6 +544,8 @@ impl PerforceRepository {
             cli,
             working_directory,
             client_name: workspace.client_name,
+            max_history_count,
+            blame_cache: Arc::new(Mutex::new(HashMap::default())),
             is_trusted: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -568,6 +694,10 @@ impl GitRepository for PerforceRepository {
         self.is_trusted.load(Ordering::SeqCst)
     }
 
+    fn is_perforce(&self) -> bool {
+        true
+    }
+
     /// Phase 2 auto-checkout: open files for edit/add/delete (see [`Self::open_for`]).
     fn perforce_open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
         self.open_for(action, paths)
@@ -699,11 +829,53 @@ impl GitRepository for PerforceRepository {
 
     fn blame(
         &self,
-        _path: RepoPath,
+        path: RepoPath,
         _content: Rope,
         _line_ending: LineEnding,
     ) -> BoxFuture<'_, Result<Blame>> {
-        unsupported_result!()
+        // Annotate the synced (`#have`) revision — this is what's on disk, and naturally
+        // shows only "have and earlier" history (direct history; integration-following is a
+        // later, on-demand command). `_content` (the possibly-dirty buffer) is ignored: p4
+        // annotate works on the depot revision, so lines may drift if the buffer has unsaved
+        // edits, and realign on save.
+        let cli = self.cli.clone();
+        let client_path = self.client_syntax_path(&path);
+        let abs = self.working_directory.join(path.as_std_path());
+        let filename = path.as_unix_str().to_string();
+        let max = self.max_history_count;
+        let cache = self.blame_cache.clone();
+        async move {
+            // Skip the slow re-annotate when the file on disk hasn't changed since last time
+            // (the editor re-requests blame on a debounce while editing; an unsaved buffer
+            // leaves the file mtime untouched).
+            let mtime = std::fs::metadata(&abs).and_then(|m| m.modified()).ok();
+            if let Some(hit) = cache.lock().get(&path) {
+                if hit.mtime == mtime {
+                    return Ok(hit.blame.clone());
+                }
+            }
+
+            let target = format!("{client_path}#have");
+            let (annotate_output, _, _) = cli
+                .run_lenient(false, &["annotate", "-c", "-q", "-dw", &target])
+                .await?;
+            let filelog_output = cli
+                .run(true, &["filelog", "-l", "-m", &max.to_string(), &target])
+                .await
+                .unwrap_or_default();
+            let meta = parse_filelog_meta(&filelog_output);
+            let blame = build_p4_blame(&annotate_output, &meta, filename);
+
+            cache.lock().insert(
+                path,
+                BlameCacheEntry {
+                    mtime,
+                    blame: blame.clone(),
+                },
+            );
+            Ok(blame)
+        }
+        .boxed()
     }
 
     fn stage_paths(
@@ -1231,6 +1403,64 @@ mod tests {
             vec![repo_path("ro.txt"), repo_path("rw.txt")],
         );
         assert_eq!(added.len(), 2);
+    }
+
+    // ---- blame (p4 annotate + filelog) ----
+
+    #[test]
+    fn annotate_changes_parse_leading_change() {
+        let out = "2001: line one\n2002: line two\n2001: line three\n";
+        assert_eq!(parse_annotate_changes(out), vec![2001, 2002, 2001]);
+    }
+
+    #[test]
+    fn filelog_meta_parses_indexed_fields() {
+        let ztag = "\
+... change0 2001
+... user0 devuser2
+... time0 1700000000
+... desc0 add curves
+
+... change1 2002
+... user1 someone
+... time1 1690000000
+... desc1 initial import
+";
+        let meta = parse_filelog_meta(ztag);
+        let a = meta.get(&2001).unwrap();
+        assert_eq!(a.user.as_deref(), Some("devuser2"));
+        assert_eq!(a.time, Some(1700000000));
+        assert_eq!(a.summary.as_deref(), Some("add curves"));
+        assert_eq!(meta.get(&2002).unwrap().summary.as_deref(), Some("initial import"));
+    }
+
+    #[test]
+    fn build_blame_groups_consecutive_changes() {
+        let annotate = "2001: a\n2001: b\n2002: c\n";
+        let mut meta = HashMap::default();
+        meta.insert(
+            2001,
+            ChangeMeta {
+                user: Some("devuser2".into()),
+                time: Some(1700000000),
+                summary: Some("add curves".into()),
+            },
+        );
+        let blame = build_p4_blame(annotate, &meta, "a/b.cpp".into());
+        assert_eq!(blame.entries.len(), 2);
+        assert_eq!(blame.entries[0].range, 0..2);
+        assert_eq!(blame.entries[0].revision_label.as_deref(), Some("@2001"));
+        assert_eq!(blame.entries[0].author.as_deref(), Some("devuser2"));
+        assert_eq!(blame.entries[0].summary.as_deref(), Some("add curves"));
+        assert_eq!(blame.entries[1].range, 2..3);
+        assert_eq!(blame.entries[1].revision_label.as_deref(), Some("@2002"));
+        // Distinct synthetic oids per change (drives the gutter color).
+        assert_ne!(blame.entries[0].sha, blame.entries[1].sha);
+        // Description recorded in the messages map.
+        assert_eq!(
+            blame.messages.get(&change_to_oid(2001)).map(String::as_str),
+            Some("add curves")
+        );
     }
 
     #[test]

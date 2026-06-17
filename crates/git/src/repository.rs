@@ -1078,6 +1078,13 @@ pub trait GitRepository: Send + Sync {
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
 
+    /// Whether this backend is a Perforce workspace (vs git). Used by the UI to adapt
+    /// action labels (e.g. "Blame" -> "Annotate"). Defaults to `false`; only the Perforce
+    /// backend overrides it.
+    fn is_perforce(&self) -> bool {
+        false
+    }
+
     /// Perforce auto-checkout: open the given files for edit/add/delete in the depot.
     ///
     /// This is the hook the project's save/create/delete flow calls so a Perforce workspace

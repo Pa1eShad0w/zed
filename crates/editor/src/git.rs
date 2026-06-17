@@ -225,6 +225,18 @@ impl Editor {
         cx.notify();
     }
 
+    /// Perforce-flavored alias for [`Self::toggle_git_blame`]. Same gutter toggle; exists so
+    /// the command palette/keybindings can surface "perforce: annotate" in a Perforce
+    /// workspace (the gutter then renders `p4 annotate` data via the Perforce backend).
+    pub fn toggle_perforce_annotate(
+        &mut self,
+        _: &::git::Annotate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_git_blame(&::git::Blame, window, cx);
+    }
+
     pub fn toggle_git_blame_inline(
         &mut self,
         _: &ToggleGitBlameInline,

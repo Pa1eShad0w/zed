@@ -6247,5 +6247,6 @@ fn blame_entry(sha: &str, range: Range<u32>) -> git::blame::BlameEntry {
         summary: None,
         previous: None,
         filename: String::new(),
+        revision_label: None,
     }
 }

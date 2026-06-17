@@ -479,6 +479,9 @@ message BlameEntry {
   optional string previous = 14;
 
   string filename = 15;
+
+  // VCS-specific revision label shown instead of the abbreviated sha (e.g. Perforce "@123").
+  optional string revision_label = 16;
 }
 
 message CommitMessage {

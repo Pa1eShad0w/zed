@@ -467,10 +467,13 @@ impl LocalRepositoryState {
             )
             .await
             .with_context(|| format!("not a Perforce workspace at {work_directory_abs_path:?}"))?;
+            let max_history_count =
+                cx.update(|cx| ProjectSettings::get_global(cx).perforce.max_history_count);
             Arc::new(PerforceRepository::new(
                 p4_binary_path,
                 workspace,
                 environment.clone(),
+                max_history_count,
                 executor,
             ))
         } else {
@@ -5073,6 +5076,16 @@ impl Repository {
         }
     }
 
+    /// Whether this repository is backed by Perforce (vs git). Synchronous: reads the
+    /// already-resolved backend via `peek()`, so it is safe to call from UI render. Returns
+    /// `false` until the backend resolves or for remote repositories.
+    pub fn is_perforce(&self) -> bool {
+        match self.repository_state.peek() {
+            Some(Ok(RepositoryState::Local(state))) => state.backend.is_perforce(),
+            _ => false,
+        }
+    }
+
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }
@@ -9211,6 +9224,7 @@ fn serialize_blame_buffer_response(blame: Option<git::blame::Blame>) -> proto::B
             summary: entry.summary,
             previous: entry.previous,
             filename: entry.filename,
+            revision_label: entry.revision_label,
         })
         .collect::<Vec<_>>();
 
@@ -9251,6 +9265,7 @@ fn deserialize_blame_buffer_response(
                 summary: entry.summary,
                 previous: entry.previous,
                 filename: entry.filename,
+                revision_label: entry.revision_label,
             })
         })
         .collect::<Vec<_>>();

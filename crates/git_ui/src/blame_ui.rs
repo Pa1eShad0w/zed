@@ -39,7 +39,11 @@ impl BlameRenderer for GitBlameRenderer {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let relative_timestamp = blame_entry_relative_timestamp(&blame_entry);
-        let short_commit_id = blame_entry.sha.display_short();
+        // Perforce supplies a `@change` label; git falls back to the abbreviated sha.
+        let short_commit_id = blame_entry
+            .revision_label
+            .clone()
+            .unwrap_or_else(|| blame_entry.sha.display_short());
         let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
         let name = util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED);
 
@@ -210,10 +214,15 @@ impl BlameRenderer for GitBlameRenderer {
         )
         .render(window, cx);
 
-        let short_commit_id = sha
-            .get(..git::SHORT_SHA_LENGTH)
-            .map(|sha| sha.to_string().into())
-            .unwrap_or_else(|| sha.clone());
+        let short_commit_id = blame
+            .revision_label
+            .clone()
+            .map(SharedString::from)
+            .unwrap_or_else(|| {
+                sha.get(..git::SHORT_SHA_LENGTH)
+                    .map(|sha| sha.to_string().into())
+                    .unwrap_or_else(|| sha.clone())
+            });
         let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
         let absolute_timestamp = time_format::format_localized_timestamp(
             commit_time,

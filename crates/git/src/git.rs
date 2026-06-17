@@ -29,6 +29,14 @@ pub const INDEX_LOCK: &str = "index.lock";
 pub const REPO_EXCLUDE: &str = "info/exclude";
 
 actions!(
+    perforce,
+    [
+        /// Toggles the Perforce annotation (blame) gutter for the current file.
+        Annotate
+    ]
+);
+
+actions!(
     git,
     [
         // per-hunk
