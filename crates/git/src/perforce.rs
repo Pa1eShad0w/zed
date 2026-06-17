@@ -377,22 +377,35 @@ struct AnnotatedLine {
     time: Option<i64>,
 }
 
-/// Parse `p4 -ztag annotate -c -u -i` into one [`AnnotatedLine`] per file line, in order.
+/// The `-F` template fed to annotate: one line per record as `lower|user|time`.
 ///
-/// `-ztag` is essential here: it delimits each line as a tagged record, immune to depot
-/// files whose lines lack a trailing newline. Plain annotate concatenates such records onto
-/// one physical line, which corrupts a newline-based line->change mapping. Each line record
-/// carries `lower` (origin change), `user`, and `time`; the leading file-header record (which
-/// has no `lower`) is skipped.
-fn parse_ztag_annotate(output: &str) -> Vec<AnnotatedLine> {
-    parse_ztag(output)
-        .into_iter()
-        .filter_map(|record| {
-            let change = record.get("lower").and_then(|c| c.parse::<u32>().ok())?;
+/// We use `p4 -ztag -F` rather than parsing the default tagged output because the default
+/// `... data` field mis-frames records when a depot line lacks a trailing newline (a
+/// server-side quirk: consecutive records run together on one physical line, corrupting any
+/// newline-based mapping). `-F` makes p4 emit exactly one newline-terminated line per record,
+/// which is robust. `lower` is the change that introduced the line (origin attribution,
+/// matching p4merge); `|` is a safe separator (never present in a change number or user id).
+const ANNOTATE_FORMAT: &str = "%lower%|%user%|%time%";
+
+/// Parse the `-F ANNOTATE_FORMAT` annotate output into one [`AnnotatedLine`] per file line.
+///
+/// Each line is `<lower>|<user>|<time>`. The leading file-header record has an empty `lower`
+/// and is dropped by the `u32` parse.
+fn parse_formatted_annotate(output: &str) -> Vec<AnnotatedLine> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let change = parts.next()?.trim().parse::<u32>().ok()?;
+            let user = parts
+                .next()
+                .map(str::to_string)
+                .filter(|u| !u.is_empty());
+            let time = parts.next().and_then(parse_p4_datetime);
             Some(AnnotatedLine {
                 change,
-                user: record.get("user").cloned(),
-                time: record.get("time").and_then(|t| parse_p4_datetime(t)),
+                user,
+                time,
             })
         })
         .collect()
@@ -895,14 +908,17 @@ impl GitRepository for PerforceRepository {
             }
 
             let target = format!("{client_path}#have");
-            // `-ztag` gives one tagged record per line (robust to lines without trailing
-            // newlines); `-i` follows branch history so each line's `lower` is its real
-            // origin change; `-u` includes the author and time inline, per line — so author
-            // and time need no extra calls and are never capped.
+            // `-ztag -F "%lower%|%user%|%time%"` makes p4 emit one robust, newline-terminated
+            // line per annotated file line (immune to depot lines without trailing newlines).
+            // `-i` follows branch history so `lower` is each line's real origin change; `-u`
+            // supplies author+time inline (per line, never capped).
             let (annotate_output, _, _) = cli
-                .run_lenient(true, &["annotate", "-c", "-u", "-i", &target])
+                .run_lenient(
+                    true,
+                    &["-F", ANNOTATE_FORMAT, "annotate", "-q", "-u", "-c", "-i", &target],
+                )
                 .await?;
-            let lines = parse_ztag_annotate(&annotate_output);
+            let lines = parse_formatted_annotate(&annotate_output);
 
             // Descriptions (hover text only) come from `p4 describe`, capped to
             // `max_history_count` to bound cost. Author/time already came from annotate.
@@ -1467,27 +1483,15 @@ mod tests {
     // ---- blame (p4 annotate + filelog) ----
 
     #[test]
-    fn ztag_annotate_parses_origin_change_user_time() {
-        // The header record (has `depotFile`, no `lower`) is skipped; each line record uses
-        // `lower` (origin change) + `user` + `time`.
-        let ztag = "\
-... depotFile //depot/x
-... rev 1
-... change 3001
-
-... upper 3001
-... lower 1001
-... user devuser1
-... time 2020/01/02 16:53:00
-... data # header
-
-... upper 3001
-... lower 1002
-... user devuser2
-... time 2020/02/03 09:00:00
-... data ## End
+    fn formatted_annotate_parses_origin_change_user_time() {
+        // `-F "%lower%|%user%|%time%"` output: one `lower|user|time` line per file line. The
+        // header record has an empty lower and is dropped.
+        let out = "\
+||
+1001|devuser1|2020/01/02 16:53:00
+1002|devuser2|2020/02/03 09:00:00
 ";
-        let lines = parse_ztag_annotate(ztag);
+        let lines = parse_formatted_annotate(out);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].change, 1001);
         assert_eq!(lines[0].user.as_deref(), Some("devuser1"));
