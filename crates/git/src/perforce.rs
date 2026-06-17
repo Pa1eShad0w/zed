@@ -911,11 +911,24 @@ impl GitRepository for PerforceRepository {
             // `-ztag -F "%lower%|%user%|%time%"` makes p4 emit one robust, newline-terminated
             // line per annotated file line (immune to depot lines without trailing newlines).
             // `-i` follows branch history so `lower` is each line's real origin change; `-u`
-            // supplies author+time inline (per line, never capped).
+            // supplies author+time inline (per line, never capped); `-dw` (whitespace-aware
+            // diff, as p4merge uses) gives the correct attribution for lines whose blame would
+            // otherwise drift to a later, unrelated edit. `-dw` is safe here only because
+            // `-F` controls record framing — without `-F` it corrupts the line mapping.
             let (annotate_output, _, _) = cli
                 .run_lenient(
                     true,
-                    &["-F", ANNOTATE_FORMAT, "annotate", "-q", "-u", "-c", "-i", &target],
+                    &[
+                        "-F",
+                        ANNOTATE_FORMAT,
+                        "annotate",
+                        "-q",
+                        "-u",
+                        "-c",
+                        "-i",
+                        "-dw",
+                        &target,
+                    ],
                 )
                 .await?;
             let lines = parse_formatted_annotate(&annotate_output);
