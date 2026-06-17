@@ -1501,8 +1501,8 @@ mod tests {
         // header record has an empty lower and is dropped.
         let out = "\
 ||
-1001|devuser1|2020/01/02 16:53:00
-1002|devuser2|2020/02/03 09:00:00
+1001|devuser1|2020/01/02 03:04:05
+1002|devuser2|2020/02/03 04:05:06
 ";
         let lines = parse_formatted_annotate(out);
         assert_eq!(lines.len(), 2);
@@ -1524,21 +1524,21 @@ mod tests {
 
     #[test]
     fn describe_meta_parses_change_records() {
-        // Real `p4 -ztag describe -s` shape: one blank-line-separated record per change.
+        // `p4 -ztag describe -s` shape: one blank-line-separated record per change.
         let ztag = "\
 ... change 2001
-... user devuser2
+... user devuser1
 ... time 1700000000
 ... desc add curves
 
 ... change 2002
-... user devuser3
+... user devuser2
 ... time 1690000000
 ... desc [CODE] initial import
 ";
         let meta = parse_describe_meta(ztag);
         let a = meta.get(&2001).unwrap();
-        assert_eq!(a.user.as_deref(), Some("devuser2"));
+        assert_eq!(a.user.as_deref(), Some("devuser1"));
         assert_eq!(a.time, Some(1700000000));
         assert_eq!(a.summary.as_deref(), Some("add curves"));
         assert_eq!(meta.get(&2002).unwrap().summary.as_deref(), Some("[CODE] initial import"));
@@ -1549,17 +1549,17 @@ mod tests {
         let lines = vec![
             AnnotatedLine {
                 change: 2001,
-                user: Some("devuser2".into()),
+                user: Some("devuser1".into()),
                 time: Some(1700000000),
             },
             AnnotatedLine {
                 change: 2001,
-                user: Some("devuser2".into()),
+                user: Some("devuser1".into()),
                 time: Some(1700000000),
             },
             AnnotatedLine {
                 change: 2002,
-                user: Some("devuser4".into()),
+                user: Some("devuser2".into()),
                 time: Some(1690000000),
             },
         ];
@@ -1576,12 +1576,12 @@ mod tests {
         assert_eq!(blame.entries.len(), 2);
         assert_eq!(blame.entries[0].range, 0..2);
         assert_eq!(blame.entries[0].revision_label.as_deref(), Some("@2001"));
-        assert_eq!(blame.entries[0].author.as_deref(), Some("devuser2"));
+        assert_eq!(blame.entries[0].author.as_deref(), Some("devuser1"));
         assert_eq!(blame.entries[0].author_time, Some(1700000000));
         assert_eq!(blame.entries[0].summary.as_deref(), Some("add curves"));
         assert_eq!(blame.entries[1].range, 2..3);
         assert_eq!(blame.entries[1].revision_label.as_deref(), Some("@2002"));
-        assert_eq!(blame.entries[1].author.as_deref(), Some("devuser4"));
+        assert_eq!(blame.entries[1].author.as_deref(), Some("devuser2"));
         // A line whose description wasn't fetched still has author/time, just no summary.
         assert_eq!(blame.entries[1].summary, None);
         // Distinct synthetic oids per change (drives the gutter color).
