@@ -162,6 +162,9 @@ impl Asset for CommitAvatarAsset {
 
 pub struct CommitTooltip {
     commit: CommitDetails,
+    /// VCS-specific revision label (e.g. Perforce `@7328353`) shown instead of the
+    /// abbreviated sha; `None` for git.
+    revision_label: Option<SharedString>,
     scroll_handle: ScrollHandle,
     markdown: Entity<Markdown>,
     repository: Entity<Repository>,
@@ -181,7 +184,7 @@ impl CommitTooltip {
             .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
             .unwrap_or(OffsetDateTime::now_utc());
 
-        Self::new(
+        let mut tooltip = Self::new(
             CommitDetails {
                 sha: blame.sha.to_string().into(),
                 commit_time,
@@ -196,7 +199,9 @@ impl CommitTooltip {
             repository,
             workspace,
             cx,
-        )
+        );
+        tooltip.revision_label = blame.revision_label.clone().map(SharedString::from);
+        tooltip
     }
 
     pub fn new(
@@ -219,6 +224,7 @@ impl CommitTooltip {
         });
         Self {
             commit,
+            revision_label: None,
             repository,
             workspace,
             scroll_handle: ScrollHandle::new(),
@@ -235,12 +241,13 @@ impl Render for CommitTooltip {
 
         let author_email = self.commit.author_email.clone();
 
-        let short_commit_id = self
-            .commit
-            .sha
-            .get(0..git::SHORT_SHA_LENGTH)
-            .map(|sha| sha.to_string().into())
-            .unwrap_or_else(|| self.commit.sha.clone());
+        let short_commit_id = self.revision_label.clone().unwrap_or_else(|| {
+            self.commit
+                .sha
+                .get(0..git::SHORT_SHA_LENGTH)
+                .map(|sha| sha.to_string().into())
+                .unwrap_or_else(|| self.commit.sha.clone())
+        });
         let full_sha = self.commit.sha.to_string();
         let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
         let absolute_timestamp = time_format::format_localized_timestamp(

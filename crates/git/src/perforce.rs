@@ -855,8 +855,11 @@ impl GitRepository for PerforceRepository {
             let target = format!("{client_path}#have");
             // `-i` follows branch history so each line traces to its real authoring change.
             // (In a stream, plain annotate attributes every line to the populate change.)
+            // NOTE: do NOT pass a `-d` whitespace flag here — `-dw`/`-db`/`-dl` make p4
+            // annotate drop the newline around blank/whitespace-only lines, merging two file
+            // lines into one output line and corrupting the line->change alignment.
             let (annotate_output, _, _) = cli
-                .run_lenient(false, &["annotate", "-c", "-q", "-i", "-dw", &target])
+                .run_lenient(false, &["annotate", "-c", "-q", "-i", &target])
                 .await?;
 
             // Contributing changes, in first-appearance order, deduped and capped to
