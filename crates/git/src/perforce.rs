@@ -366,18 +366,55 @@ fn change_to_oid(change: u32) -> Oid {
     Oid::from_bytes(&bytes).expect("20 bytes is a valid SHA-1 oid")
 }
 
-/// Parse `p4 annotate -c -q` output into the change number contributing each line, in order.
+/// One annotated file line from `p4 -ztag annotate -c -u -i`.
+#[derive(Debug, Clone)]
+struct AnnotatedLine {
+    /// Origin change — annotate's `lower`, i.e. the change that introduced the line. This
+    /// matches p4merge's attribution. 0 if unparsable.
+    change: u32,
+    user: Option<String>,
+    /// Unix epoch seconds, parsed from annotate's `time` field.
+    time: Option<i64>,
+}
+
+/// Parse `p4 -ztag annotate -c -u -i` into one [`AnnotatedLine`] per file line, in order.
 ///
-/// With `-c` and `-q`, every output line is `<change>: <text>` (one per file line, no header).
-/// We only need the leading change number per line.
-fn parse_annotate_changes(output: &str) -> Vec<u32> {
-    output
-        .lines()
-        .map(|line| {
-            let digits: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse::<u32>().unwrap_or(0)
+/// `-ztag` is essential here: it delimits each line as a tagged record, immune to depot
+/// files whose lines lack a trailing newline. Plain annotate concatenates such records onto
+/// one physical line, which corrupts a newline-based line->change mapping. Each line record
+/// carries `lower` (origin change), `user`, and `time`; the leading file-header record (which
+/// has no `lower`) is skipped.
+fn parse_ztag_annotate(output: &str) -> Vec<AnnotatedLine> {
+    parse_ztag(output)
+        .into_iter()
+        .filter_map(|record| {
+            let change = record.get("lower").and_then(|c| c.parse::<u32>().ok())?;
+            Some(AnnotatedLine {
+                change,
+                user: record.get("user").cloned(),
+                time: record.get("time").and_then(|t| parse_p4_datetime(t)),
+            })
         })
         .collect()
+}
+
+/// Parse a Perforce display timestamp (`YYYY/MM/DD HH:MM:SS`) into epoch seconds.
+///
+/// Treated as UTC — good enough for the gutter's relative ("3 months ago") rendering. A
+/// bare `YYYY/MM/DD` (no time) is accepted too.
+fn parse_p4_datetime(s: &str) -> Option<i64> {
+    let (date, clock) = s.trim().split_once(' ').unwrap_or((s.trim(), "00:00:00"));
+    let mut d = date.split('/');
+    let year: i32 = d.next()?.parse().ok()?;
+    let month: u8 = d.next()?.parse().ok()?;
+    let day: u8 = d.next()?.parse().ok()?;
+    let mut t = clock.split(':');
+    let hour: u8 = t.next().unwrap_or("0").parse().ok()?;
+    let minute: u8 = t.next().unwrap_or("0").parse().ok()?;
+    let second: u8 = t.next().unwrap_or("0").parse().ok()?;
+    let date = time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()?;
+    let clock = time::Time::from_hms(hour, minute, second).ok()?;
+    Some(date.with_time(clock).assume_utc().unix_timestamp())
 }
 
 /// Parse `p4 -ztag describe -s <changes...>` output into per-change metadata.
@@ -405,44 +442,49 @@ fn parse_describe_meta(ztag_output: &str) -> HashMap<u32, ChangeMeta> {
     map
 }
 
-/// Combine `p4 annotate` (line -> change) with `p4 filelog` (change -> metadata) into a
-/// [`Blame`]. Consecutive lines sharing a change number collapse into one [`BlameEntry`].
+/// Combine annotated lines (line -> origin change + author + time, from `-ztag annotate`)
+/// with per-change descriptions (from `p4 describe`) into a [`Blame`]. Consecutive lines
+/// sharing a change collapse into one [`BlameEntry`].
+///
+/// Author and time come from annotate itself (every line, no cap); only the description
+/// (shown in the hover) comes from `describe`, which is capped — a line whose description
+/// wasn't fetched still shows its author, time, and `@change`.
 fn build_p4_blame(
-    annotate_output: &str,
-    filelog_meta: &HashMap<u32, ChangeMeta>,
+    lines: &[AnnotatedLine],
+    descriptions: &HashMap<u32, ChangeMeta>,
     filename: String,
 ) -> Blame {
-    let changes = parse_annotate_changes(annotate_output);
     let mut entries = Vec::new();
     let mut messages: HashMap<Oid, String> = HashMap::default();
 
     let mut i = 0;
-    while i < changes.len() {
-        let change = changes[i];
+    while i < lines.len() {
+        let change = lines[i].change;
         let start = i;
-        while i < changes.len() && changes[i] == change {
+        while i < lines.len() && lines[i].change == change {
             i += 1;
         }
+        let line = &lines[start];
         let oid = change_to_oid(change);
-        let meta = filelog_meta.get(&change).cloned().unwrap_or_default();
-        if let Some(summary) = &meta.summary {
+        let summary = descriptions.get(&change).and_then(|m| m.summary.clone());
+        if let Some(summary) = &summary {
             messages.entry(oid).or_insert_with(|| summary.clone());
         }
         entries.push(BlameEntry {
             sha: oid,
             range: start as u32..i as u32,
             original_line_number: start as u32 + 1,
-            author: meta.user.clone(),
+            author: line.user.clone(),
             author_mail: None,
-            author_time: meta.time,
-            // p4 change times are epoch seconds in UTC. `author_offset_date_time()` needs a
-            // tz to render a real timestamp (otherwise it falls back to "now"), so mark UTC.
-            author_tz: meta.time.map(|_| "+0000".to_string()),
-            committer_name: meta.user.clone(),
+            author_time: line.time,
+            // `author_offset_date_time()` needs a tz or it falls back to now(); annotate
+            // times are parsed as UTC.
+            author_tz: line.time.map(|_| "+0000".to_string()),
+            committer_name: line.user.clone(),
             committer_email: None,
-            committer_time: meta.time,
-            committer_tz: meta.time.map(|_| "+0000".to_string()),
-            summary: meta.summary.clone(),
+            committer_time: line.time,
+            committer_tz: line.time.map(|_| "+0000".to_string()),
+            summary,
             previous: None,
             filename: filename.clone(),
             revision_label: Some(format!("@{change}")),
@@ -853,36 +895,35 @@ impl GitRepository for PerforceRepository {
             }
 
             let target = format!("{client_path}#have");
-            // `-i` follows branch history so each line traces to its real authoring change.
-            // (In a stream, plain annotate attributes every line to the populate change.)
-            // NOTE: do NOT pass a `-d` whitespace flag here — `-dw`/`-db`/`-dl` make p4
-            // annotate drop the newline around blank/whitespace-only lines, merging two file
-            // lines into one output line and corrupting the line->change alignment.
+            // `-ztag` gives one tagged record per line (robust to lines without trailing
+            // newlines); `-i` follows branch history so each line's `lower` is its real
+            // origin change; `-u` includes the author and time inline, per line — so author
+            // and time need no extra calls and are never capped.
             let (annotate_output, _, _) = cli
-                .run_lenient(false, &["annotate", "-c", "-q", "-i", &target])
+                .run_lenient(true, &["annotate", "-c", "-u", "-i", &target])
                 .await?;
+            let lines = parse_ztag_annotate(&annotate_output);
 
-            // Contributing changes, in first-appearance order, deduped and capped to
-            // `max_history_count`. These live in the parent stream for integrated lines, so
-            // `p4 describe` (which resolves any change number) supplies their metadata.
+            // Descriptions (hover text only) come from `p4 describe`, capped to
+            // `max_history_count` to bound cost. Author/time already came from annotate.
             let mut unique: Vec<u32> = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for &change in parse_annotate_changes(&annotate_output).iter() {
-                if change != 0 && seen.insert(change) {
-                    unique.push(change);
+            for line in &lines {
+                if line.change != 0 && seen.insert(line.change) {
+                    unique.push(line.change);
                 }
             }
             unique.truncate(max);
 
-            let mut meta: HashMap<u32, ChangeMeta> = HashMap::default();
+            let mut descriptions: HashMap<u32, ChangeMeta> = HashMap::default();
             for chunk in unique.chunks(50) {
                 let mut args: Vec<String> = vec!["describe".into(), "-s".into()];
                 args.extend(chunk.iter().map(|c| c.to_string()));
                 if let Ok(out) = cli.run(true, &args).await {
-                    meta.extend(parse_describe_meta(&out));
+                    descriptions.extend(parse_describe_meta(&out));
                 }
             }
-            let blame = build_p4_blame(&annotate_output, &meta, filename);
+            let blame = build_p4_blame(&lines, &descriptions, filename);
 
             cache.lock().insert(
                 path,
@@ -1426,9 +1467,42 @@ mod tests {
     // ---- blame (p4 annotate + filelog) ----
 
     #[test]
-    fn annotate_changes_parse_leading_change() {
-        let out = "2001: line one\n2002: line two\n2001: line three\n";
-        assert_eq!(parse_annotate_changes(out), vec![2001, 2002, 2001]);
+    fn ztag_annotate_parses_origin_change_user_time() {
+        // The header record (has `depotFile`, no `lower`) is skipped; each line record uses
+        // `lower` (origin change) + `user` + `time`.
+        let ztag = "\
+... depotFile //depot/x
+... rev 1
+... change 3001
+
+... upper 3001
+... lower 1001
+... user devuser1
+... time 2020/01/02 16:53:00
+... data # header
+
+... upper 3001
+... lower 1002
+... user devuser2
+... time 2020/02/03 09:00:00
+... data ## End
+";
+        let lines = parse_ztag_annotate(ztag);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].change, 1001);
+        assert_eq!(lines[0].user.as_deref(), Some("devuser1"));
+        assert!(lines[0].time.is_some()); // real timestamp, not None -> not "just now"
+        assert_eq!(lines[1].change, 1002);
+        assert_eq!(lines[1].user.as_deref(), Some("devuser2"));
+    }
+
+    #[test]
+    fn p4_datetime_parses() {
+        let t1 = parse_p4_datetime("2020/01/02 16:53:00").unwrap();
+        let t0 = parse_p4_datetime("2020/01/02 00:00:00").unwrap();
+        assert_eq!(t1 - t0, 16 * 3600 + 53 * 60); // time-of-day delta
+        assert!(parse_p4_datetime("2020/01/02").is_some());
+        assert!(parse_p4_datetime("garbage").is_none());
     }
 
     #[test]
@@ -1455,27 +1529,46 @@ mod tests {
 
     #[test]
     fn build_blame_groups_consecutive_changes() {
-        let annotate = "2001: a\n2001: b\n2002: c\n";
-        let mut meta = HashMap::default();
-        meta.insert(
-            2001,
-            ChangeMeta {
+        let lines = vec![
+            AnnotatedLine {
+                change: 2001,
                 user: Some("devuser2".into()),
                 time: Some(1700000000),
+            },
+            AnnotatedLine {
+                change: 2001,
+                user: Some("devuser2".into()),
+                time: Some(1700000000),
+            },
+            AnnotatedLine {
+                change: 2002,
+                user: Some("devuser4".into()),
+                time: Some(1690000000),
+            },
+        ];
+        let mut descriptions = HashMap::default();
+        descriptions.insert(
+            2001,
+            ChangeMeta {
+                user: None,
+                time: None,
                 summary: Some("add curves".into()),
             },
         );
-        let blame = build_p4_blame(annotate, &meta, "a/b.cpp".into());
+        let blame = build_p4_blame(&lines, &descriptions, "a/b.cpp".into());
         assert_eq!(blame.entries.len(), 2);
         assert_eq!(blame.entries[0].range, 0..2);
         assert_eq!(blame.entries[0].revision_label.as_deref(), Some("@2001"));
         assert_eq!(blame.entries[0].author.as_deref(), Some("devuser2"));
+        assert_eq!(blame.entries[0].author_time, Some(1700000000));
         assert_eq!(blame.entries[0].summary.as_deref(), Some("add curves"));
         assert_eq!(blame.entries[1].range, 2..3);
         assert_eq!(blame.entries[1].revision_label.as_deref(), Some("@2002"));
+        assert_eq!(blame.entries[1].author.as_deref(), Some("devuser4"));
+        // A line whose description wasn't fetched still has author/time, just no summary.
+        assert_eq!(blame.entries[1].summary, None);
         // Distinct synthetic oids per change (drives the gutter color).
         assert_ne!(blame.entries[0].sha, blame.entries[1].sha);
-        // Description recorded in the messages map.
         assert_eq!(
             blame.messages.get(&change_to_oid(2001)).map(String::as_str),
             Some("add curves")
