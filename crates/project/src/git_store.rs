@@ -2340,6 +2340,47 @@ impl GitStore {
         })
     }
 
+    /// Perforce auto-checkout hook for a file rename: record the depot move (`p4 move`).
+    ///
+    /// Resolves `src` and `dst` to the same Perforce repository and delegates to the backend.
+    /// Returns a task resolving to `Ok(())` immediately for git/non-VCS paths (the backend's
+    /// `perforce_move` is a no-op) and for a cross-repository rename (not a single `p4 move`).
+    /// Must be called **before** the on-disk rename: the backend opens `src` for edit, which
+    /// requires it to still exist on disk.
+    pub fn perforce_move(
+        &self,
+        src: &ProjectPath,
+        dst: &ProjectPath,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some((repo, src_repo_path)) = self.repository_and_path_for_project_path(src, cx) else {
+            return Task::ready(Ok(()));
+        };
+        let Some((dst_repo, dst_repo_path)) =
+            self.repository_and_path_for_project_path(dst, cx)
+        else {
+            return Task::ready(Ok(()));
+        };
+        // A move that crosses repository boundaries is not a single `p4 move`; skip it
+        // (best-effort), leaving the depot for the user to reconcile.
+        if repo.entity_id() != dst_repo.entity_id() {
+            return Task::ready(Ok(()));
+        }
+        let repo = repo.downgrade();
+        cx.spawn(async move |cx| {
+            let repository_state = repo
+                .update(cx, |repo, _| repo.repository_state.clone())?
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match repository_state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_move(src_repo_path, dst_repo_path).await
+                }
+                RepositoryState::Remote(_) => Ok(()),
+            }
+        })
+    }
+
     /// `editOnFileModified` hook: open a Perforce-tracked buffer for edit the first time it
     /// is modified in its current dirty cycle.
     ///
@@ -2357,7 +2398,10 @@ impl GitStore {
         if !source.is_local() {
             return;
         }
-        if !ProjectSettings::get_global(cx).perforce.edit_on_file_modified {
+        if !ProjectSettings::get_global(cx)
+            .perforce
+            .edit_on_file_modified
+        {
             return;
         }
         let buffer_id = buffer.read(cx).remote_id();
@@ -2379,8 +2423,7 @@ impl GitStore {
         // Mark first so a burst of edits doesn't queue duplicate `p4 edit` calls; the entry is
         // cleared when the buffer next becomes clean.
         self.perforce_edited_buffers.insert(buffer_id);
-        let task =
-            self.perforce_open_for(&project_path, git::perforce::P4OpenAction::Edit, cx);
+        let task = self.perforce_open_for(&project_path, git::perforce::P4OpenAction::Edit, cx);
         cx.spawn(async move |this, cx| {
             if task.await.log_err().is_none() {
                 // The edit failed (e.g. file not in depot); allow a later retry.
@@ -9688,7 +9731,10 @@ mod tests {
                 })
             })
             .await;
-        assert!(noop.is_ok(), "perforce hook must be a no-op off a P4 workspace");
+        assert!(
+            noop.is_ok(),
+            "perforce hook must be a no-op off a P4 workspace"
+        );
 
         // End to end: an ordinary edit + save still writes to disk (the pre-save hook runs but
         // does nothing for this git-backed file).

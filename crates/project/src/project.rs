@@ -2601,6 +2601,26 @@ impl Project {
         let worktree_id = worktree.read(cx).id();
         let is_root_entry = self.entry_is_worktree_root(entry_id, cx);
 
+        // Perforce auto-checkout: record the rename as a depot move (mirrors vscode-perforce's
+        // explorer move). Built here (and awaited below) so it runs BEFORE the on-disk rename —
+        // `p4 move` opens the source for edit, which needs the source to still exist on disk; we
+        // pass `-k` so p4 leaves the workspace file for Zed's own rename to move. No-op for
+        // directories, the worktree root, git, and non-VCS paths.
+        let perforce_move = if is_dir
+            || is_root_entry
+            || !ProjectSettings::get_global(cx).perforce.move_on_file_rename
+        {
+            None
+        } else {
+            let src = ProjectPath {
+                worktree_id,
+                path: old_path.clone(),
+            };
+            Some(self.git_store.update(cx, |git_store, cx| {
+                git_store.perforce_move(&src, &new_path, cx)
+            }))
+        };
+
         let lsp_store = self.lsp_store().downgrade();
         cx.spawn(async move |project, cx| {
             let (old_abs_path, new_abs_path) = {
@@ -2624,6 +2644,11 @@ impl Project {
                 cx.clone(),
             )
             .await;
+
+            // Best-effort, before the disk move: a failed `p4 move` must not abort the rename.
+            if let Some(perforce_move) = perforce_move {
+                perforce_move.await.log_err();
+            }
 
             let entry = worktree_store
                 .update(cx, |worktree_store, cx| {
@@ -2701,7 +2726,10 @@ impl Project {
         worktree: &Entity<Worktree>,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if !ProjectSettings::get_global(cx).perforce.delete_on_file_delete {
+        if !ProjectSettings::get_global(cx)
+            .perforce
+            .delete_on_file_delete
+        {
             return None;
         }
         let entry = worktree.read(cx).entry_for_id(entry_id)?;

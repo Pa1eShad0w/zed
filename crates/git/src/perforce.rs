@@ -561,6 +561,22 @@ fn p4_open_args(action: P4OpenAction, client_name: &str, paths: &[RepoPath]) -> 
     args
 }
 
+/// Build the `p4 move -k <src> <dst>` argument vector (no `-ztag`; output is not parsed).
+///
+/// `-k` performs the rename on the server **without** moving the workspace file — Zed's own
+/// worktree rename already moves the file on disk, so without `-k` p4 would try to move an
+/// already-moved file and fail. Source must be open for edit/add first (see [`Self::move_path`]).
+/// Verified against vscode-perforce `src/api/commands/basicOps.ts` (`p4 move`) and P4V's
+/// `edit`→`move` sequence.
+fn p4_move_args(client_name: &str, src: &RepoPath, dst: &RepoPath) -> Vec<String> {
+    vec![
+        "move".to_string(),
+        "-k".to_string(),
+        format!("//{}/{}", client_name, src.as_unix_str()),
+        format!("//{}/{}", client_name, dst.as_unix_str()),
+    ]
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -767,6 +783,11 @@ impl GitRepository for PerforceRepository {
     /// Phase 2 auto-checkout: open files for edit/add/delete (see [`Self::open_for`]).
     fn perforce_open_for(&self, action: P4OpenAction, paths: Vec<RepoPath>) -> Task<Result<()>> {
         self.open_for(action, paths)
+    }
+
+    /// Phase 2 auto-checkout: record a file rename as a depot move (see [`Self::move_path`]).
+    fn perforce_move(&self, src: RepoPath, dst: RepoPath) -> Task<Result<()>> {
+        self.move_path(src, dst)
     }
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
@@ -1307,6 +1328,33 @@ impl PerforceRepository {
             Ok(())
         })
     }
+
+    /// Open-for-edit + move a renamed file in the depot (`p4 edit src` then `p4 move -k src dst`).
+    ///
+    /// Mirrors vscode-perforce's `moveOneFile` and P4V's `edit`→`move` sequence. The leading
+    /// `p4 edit` is best-effort (lenient): `p4 move` requires the source open for edit *or* add,
+    /// so a file already open for add is fine and an un-tracked source simply makes the whole
+    /// move a no-op. `-k` keeps p4 off the workspace file because Zed's worktree rename performs
+    /// the on-disk move itself — this method must run **before** that disk move while `src` still
+    /// exists on disk.
+    pub fn move_path(&self, src: RepoPath, dst: RepoPath) -> Task<Result<()>> {
+        let cli = self.cli.clone();
+        let edit_args = p4_open_args(P4OpenAction::Edit, &self.client_name, &[src.clone()]);
+        let move_args = p4_move_args(&self.client_name, &src, &dst);
+        self.cli.executor.clone().spawn(async move {
+            // Open source for edit first; ignore failure (already open for add, or untracked).
+            cli.run_lenient(false, &edit_args).await.ok();
+            let (stdout, stderr, ok) = cli.run_lenient(false, &move_args).await?;
+            anyhow::ensure!(ok, "p4 move failed: {stderr}");
+            log::info!(
+                "perforce: move {} -> {} -> {}",
+                src.as_unix_str(),
+                dst.as_unix_str(),
+                stdout.trim_end()
+            );
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1538,6 +1586,26 @@ mod tests {
         let args = p4_open_args(P4OpenAction::Edit, "c", &[repo_path("f.rs")]);
         assert!(!args.iter().any(|a| a == "-ztag"));
         assert_eq!(args[0], "edit");
+    }
+
+    #[test]
+    fn move_args_keep_workspace_client_syntax() {
+        // `p4 move -k` records the depot rename only; Zed performs the on-disk move, so `-k`
+        // must always be present (otherwise p4 would fight Zed over moving the file).
+        let args = p4_move_args(
+            "some_client_name",
+            &repo_path("a/old.txt"),
+            &repo_path("b/new.txt"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "move".to_string(),
+                "-k".to_string(),
+                "//some_client_name/a/old.txt".to_string(),
+                "//some_client_name/b/new.txt".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -1099,6 +1099,14 @@ pub trait GitRepository: Send + Sync {
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))
     }
+
+    /// Perforce auto-checkout: record a file rename as a depot move (`p4 move`). A **no-op**
+    /// for non-Perforce backends (git), so normal renames are unaffected. Only the Perforce
+    /// backend overrides it. `src`/`dst` are repo-relative; `src` must still exist on disk when
+    /// this is called (the backend opens it for edit), and the caller performs the on-disk move.
+    fn perforce_move(&self, _src: RepoPath, _dst: RepoPath) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
 }
 
 pub enum DiffType {
