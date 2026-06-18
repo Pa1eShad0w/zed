@@ -93,6 +93,12 @@ pub struct SessionSettings {
     ///
     /// Default: true
     pub restore_unsaved_buffers: bool,
+    /// Maximum size, in bytes, of a buffer whose unsaved contents will be
+    /// persisted for session restore. Buffers larger than this are not
+    /// serialized, so a huge file can't balloon the workspace database.
+    ///
+    /// Default: 52428800 (50 MB)
+    pub restore_unsaved_buffers_max_size: usize,
     /// Whether or not to skip worktree trust checks.
     /// When trusted, project settings are synchronized automatically,
     /// language and MCP servers are downloaded and started automatically.
@@ -510,6 +516,8 @@ pub struct PerforceSettings {
     pub add_on_file_create: bool,
     /// Run `p4 delete` when a file is deleted.
     pub delete_on_file_delete: bool,
+    /// Run `p4 move` when a file is renamed or moved.
+    pub move_on_file_rename: bool,
     /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
     pub max_history_count: usize,
 }
@@ -521,6 +529,7 @@ impl Default for PerforceSettings {
             edit_on_file_modified: true,
             add_on_file_create: true,
             delete_on_file_delete: true,
+            move_on_file_rename: true,
             max_history_count: 50,
         }
     }
@@ -735,6 +744,9 @@ impl Settings for ProjectSettings {
                 delete_on_file_delete: p4
                     .and_then(|p| p.delete_on_file_delete)
                     .unwrap_or(default.delete_on_file_delete),
+                move_on_file_rename: p4
+                    .and_then(|p| p.move_on_file_rename)
+                    .unwrap_or(default.move_on_file_rename),
                 max_history_count: p4
                     .and_then(|p| p.max_history_count)
                     .unwrap_or(default.max_history_count),
@@ -813,6 +825,11 @@ impl Settings for ProjectSettings {
             load_direnv: project.load_direnv.clone().unwrap(),
             session: SessionSettings {
                 restore_unsaved_buffers: content.session.unwrap().restore_unsaved_buffers.unwrap(),
+                restore_unsaved_buffers_max_size: content
+                    .session
+                    .unwrap()
+                    .restore_unsaved_buffers_max_size
+                    .unwrap(),
                 trust_all_worktrees: content.session.unwrap().trust_all_worktrees.unwrap(),
             },
         }

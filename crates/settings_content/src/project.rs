@@ -381,6 +381,13 @@ pub struct SessionSettingsContent {
     ///
     /// Default: true
     pub restore_unsaved_buffers: Option<bool>,
+    /// Maximum size, in bytes, of a buffer whose unsaved contents will be
+    /// persisted for session restore. Buffers larger than this (for example a
+    /// huge log file opened in the editor) are not serialized, so they can't
+    /// balloon the workspace database.
+    ///
+    /// Default: 52428800 (50 MB)
+    pub restore_unsaved_buffers_max_size: Option<usize>,
     /// Whether or not to skip worktree trust checks.
     /// When trusted, project settings are synchronized automatically,
     /// language and MCP servers are downloaded and started automatically.
@@ -600,6 +607,10 @@ pub struct PerforceSettings {
     ///
     /// Default: true
     pub delete_on_file_delete: Option<bool>,
+    /// Run `p4 move` when a file in the workspace is renamed or moved.
+    ///
+    /// Default: true
+    pub move_on_file_rename: Option<bool>,
     /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
     ///
     /// Default: 50

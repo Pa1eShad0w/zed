@@ -1679,6 +1679,8 @@
     "add_on_file_create": true,
     // Run `p4 delete` when a file in the workspace is deleted.
     "delete_on_file_delete": true,
+    // Run `p4 move` when a file in the workspace is renamed or moved.
+    "move_on_file_rename": true,
     // Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
     "max_history_count": 50,
   },
@@ -2436,6 +2438,13 @@
     //
     // Default: true
     "restore_unsaved_buffers": true,
+    // Maximum size, in bytes, of a buffer whose unsaved contents will be
+    // persisted for session restore. Buffers larger than this (for example a
+    // huge log file opened in the editor) are not serialized, so they can't
+    // balloon the workspace database.
+    //
+    // Default: 52428800 (50 MB)
+    "restore_unsaved_buffers_max_size": 52428800,
     // Whether or not to skip worktree trust checks.
     // When trusted, project settings are synchronized automatically,
     // language and MCP servers are downloaded and started automatically.

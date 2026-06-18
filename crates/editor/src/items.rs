@@ -511,6 +511,21 @@ fn serialize_anchor(anchor: &Anchor) -> proto::EditorAnchor {
     }
 }
 
+/// Whether a buffer's full contents should be persisted to the workspace
+/// database for session restore.
+///
+/// Very large buffers (for example a multi-hundred-megabyte log file opened in
+/// the editor) are skipped: serializing them would balloon the workspace SQLite
+/// database, which never shrinks on its own once the rows are later deleted.
+fn should_serialize_buffer_contents(
+    serialize_dirty_buffers: bool,
+    is_dirty: bool,
+    buffer_byte_len: usize,
+    max_size: usize,
+) -> bool {
+    serialize_dirty_buffers && is_dirty && buffer_byte_len <= max_size
+}
+
 fn serialize_excerpt_range(range: ExcerptRange<language::Anchor>) -> proto::ExcerptRange {
     let context_start = language::proto::serialize_anchor(&range.context.start);
     let context_end = language::proto::serialize_anchor(&range.context.end);
@@ -1455,13 +1470,21 @@ impl SerializableItem for Editor {
 
         let is_dirty = buffer.read(cx).is_dirty();
         let mtime = buffer.read(cx).saved_mtime();
+        let max_size = ProjectSettings::get_global(cx)
+            .session
+            .restore_unsaved_buffers_max_size;
 
         let snapshot = buffer.read(cx).snapshot();
 
         let db = EditorDb::global(cx);
         Some(cx.spawn_in(window, async move |_this, cx| {
             cx.background_spawn(async move {
-                let (contents, language) = if serialize_dirty_buffers && is_dirty {
+                let (contents, language) = if should_serialize_buffer_contents(
+                    serialize_dirty_buffers,
+                    is_dirty,
+                    snapshot.len(),
+                    max_size,
+                ) {
                     let contents = snapshot.text();
                     let language = snapshot.language().map(|lang| lang.name().to_string());
                     (Some(contents), language)
@@ -2266,6 +2289,16 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use util::{path, rel_path::RelPath};
+
+    #[test]
+    fn does_not_serialize_contents_for_buffers_over_max_size() {
+        let max = 1000;
+        // A dirty buffer at or under the cap is serialized for restore.
+        assert!(should_serialize_buffer_contents(true, true, max, max));
+        // A dirty buffer larger than the cap is NOT serialized, so a huge file
+        // can't balloon the workspace database.
+        assert!(!should_serialize_buffer_contents(true, true, max + 1, max));
+    }
 
     #[gpui::test]
     fn test_path_for_file(cx: &mut App) {
