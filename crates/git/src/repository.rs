@@ -1107,6 +1107,25 @@ pub trait GitRepository: Send + Sync {
     fn perforce_move(&self, _src: RepoPath, _dst: RepoPath) -> Task<Result<()>> {
         Task::ready(Ok(()))
     }
+
+    /// Perforce Changes panel: list pending changelists with their open files. A **no-op**
+    /// returning an empty list for non-Perforce backends (git has no changelists), so the panel
+    /// simply renders no changelist groups. Only the Perforce backend overrides it.
+    fn perforce_changelists(&self) -> Task<Result<Vec<crate::perforce::PerforceChangelist>>> {
+        Task::ready(Ok(Vec::new()))
+    }
+
+    /// Perforce Changes panel drag-and-drop: move `file` into the `target` changelist.
+    /// `shelved_source` = `None` for a pending file (`p4 reopen`), `Some(src_cl)` for a shelved
+    /// file (`p4 unshelve`). A **no-op** for non-Perforce backends. Only Perforce overrides it.
+    fn perforce_move_to_changelist(
+        &self,
+        _file: RepoPath,
+        _target: crate::perforce::ChangelistId,
+        _shelved_source: Option<u32>,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
 }
 
 pub enum DiffType {

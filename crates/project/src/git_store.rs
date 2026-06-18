@@ -5136,6 +5136,56 @@ impl Repository {
         }
     }
 
+    /// Perforce Changes panel: list this client's pending changelists with their files.
+    ///
+    /// Delegates to the backend's `perforce_changelists` (a no-op empty list for git/non-VCS
+    /// repos, so the panel just renders nothing). Remote repositories return empty for the MVP —
+    /// changelist browsing is a host-local concern. Takes `&App` (not `&mut`) so a UI render path
+    /// can kick it off via `repo.read(cx).perforce_changelists(cx)`.
+    pub fn perforce_changelists(
+        &self,
+        cx: &App,
+    ) -> Task<Result<Vec<git::perforce::PerforceChangelist>>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_changelists().await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
+    /// Perforce Changes panel drag-and-drop: move `file` into the `target` changelist
+    /// (`p4 reopen` for a pending file, `p4 unshelve` when `shelved_source` is set). No-op for
+    /// git/non-VCS repos and for remote projects (a host-local concern in the MVP).
+    pub fn perforce_move_to_changelist(
+        &self,
+        file: RepoPath,
+        target: git::perforce::ChangelistId,
+        shelved_source: Option<u32>,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state
+                .await
+                .map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend
+                        .perforce_move_to_changelist(file, target, shelved_source)
+                        .await
+                }
+                RepositoryState::Remote(_) => Ok(()),
+            }
+        })
+    }
+
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }

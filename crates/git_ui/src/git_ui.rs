@@ -42,6 +42,7 @@ mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
 pub mod multi_diff_view;
+pub mod perforce_panel;
 pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
@@ -83,6 +84,7 @@ pub fn init(cx: &mut App) {
         ProjectDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
+        perforce_panel::register(workspace);
         repository_selector::register(workspace);
         git_picker::register(workspace);
 

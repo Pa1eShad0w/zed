@@ -202,13 +202,85 @@ pub(crate) fn parse_ztag(output: &str) -> Vec<HashMap<String, String>> {
                 current.insert(key.to_string(), value.to_string());
             }
         }
-        // Lines not starting with "... " are continuations of a multi-line value
-        // (uncommon in the fields we read); ignored for MVP.
+        // Lines not starting with "... " are continuations of a multi-line value; the generic
+        // single-line consumers (opened/fstat/info, and blame which takes only the first desc
+        // line) don't need them. Multi-line changelist descriptions use `parse_pending_changes`.
     }
     if !current.is_empty() {
         records.push(current);
     }
     records
+}
+
+/// One pending changelist as reported by `p4 changes -s pending -l`.
+struct PendingChange {
+    number: u32,
+    description: String,
+    /// `changes -l` set the `... shelved` flag — this changelist has shelved files to fetch.
+    has_shelved: bool,
+}
+
+/// Parse `p4 -ztag changes -s pending -l` into `(change number, full description)` pairs.
+///
+/// Why not [`parse_ztag`]: a changelist's `desc` is a **multi-line** value that itself contains
+/// blank lines (e.g. a paragraph break), so the generic "blank line = record boundary" rule would
+/// truncate the description and split one changelist into bogus records. Here we instead treat
+/// each `... change N` line as the start of a record and append every non-`... ` line (blank
+/// lines included) to the `desc` value, until the next `... <field>` ends it. This is robust to
+/// `desc` appearing last (as in `changes`) or mid-record (as in `describe`).
+fn parse_pending_changes(output: &str) -> Vec<PendingChange> {
+    let mut out: Vec<PendingChange> = Vec::new();
+    let mut change: Option<u32> = None;
+    let mut desc = String::new();
+    let mut shelved = false;
+    let mut in_desc = false;
+
+    for raw in output.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("... ") {
+            let mut parts = rest.splitn(2, ' ');
+            let key = parts.next().unwrap_or_default();
+            let value = parts.next().unwrap_or_default();
+            match key {
+                "change" => {
+                    if let Some(number) = change.take() {
+                        out.push(PendingChange {
+                            number,
+                            description: std::mem::take(&mut desc).trim().to_string(),
+                            has_shelved: shelved,
+                        });
+                    }
+                    desc.clear();
+                    shelved = false;
+                    change = value.parse::<u32>().ok();
+                    in_desc = false;
+                }
+                // `changes -l` reports a `... shelved` flag field for changelists that have
+                // shelved files; presence (any value) means there are shelves to fetch.
+                "shelved" => {
+                    shelved = true;
+                    in_desc = false;
+                }
+                "desc" => {
+                    desc.push_str(value);
+                    in_desc = true;
+                }
+                _ => in_desc = false,
+            }
+        } else if in_desc {
+            // Continuation line (a blank line included) belongs to the multi-line description.
+            desc.push('\n');
+            desc.push_str(line);
+        }
+    }
+    if let Some(number) = change.take() {
+        out.push(PendingChange {
+            number,
+            description: desc.trim().to_string(),
+            has_shelved: shelved,
+        });
+    }
+    out
 }
 
 /// Parse `p4 -ztag opened` output into a map of repo path -> action verb (`add`, `edit`,
@@ -253,6 +325,60 @@ fn client_path_to_repo_path(client_name: &str, client_file: &str) -> Option<Repo
     Some(RepoPath::from_rel_path(&rel_path))
 }
 
+/// Convert an `fstat`-style `clientFile` — which is a **local filesystem path** (e.g.
+/// `E:/Projects\client\a\b.txt`), unlike `opened`'s client-syntax path — into a repo-relative
+/// [`RepoPath`] by stripping the client root. Separators are normalized to `/` first (p4 mixes
+/// `/` and `\` on Windows) and the prefix match is case-insensitive (Windows paths).
+fn local_path_to_repo_path(working_directory: &Path, client_file: &str) -> Option<RepoPath> {
+    let root = working_directory.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let file = client_file.replace('\\', "/");
+    if file.len() < root.len() || !file[..root.len()].eq_ignore_ascii_case(root) {
+        return None;
+    }
+    let rel = file[root.len()..].trim_start_matches('/');
+    if rel.is_empty() {
+        return None;
+    }
+    let rel_path = RelPath::unix(rel).ok()?;
+    Some(RepoPath::from_rel_path(&rel_path))
+}
+
+/// Parse `p4 -ztag fstat -Rs -e <cl> //client/...` (shelved files of one changelist) into
+/// `(change number, file)` pairs. Each shelved file reports a local `clientFile`, an `action`,
+/// and its `change`; records lacking those (e.g. the trailing changelist-description record) are
+/// skipped. Every returned file is marked `shelved`.
+fn parse_shelved_files(
+    working_directory: &Path,
+    fstat_output: &str,
+) -> Vec<(u32, ChangelistFile)> {
+    let mut out = Vec::new();
+    for record in parse_ztag(fstat_output) {
+        let (Some(client_file), Some(action), Some(change)) = (
+            record.get("clientFile"),
+            record.get("action"),
+            record.get("change").and_then(|c| c.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        let (Some(status), Some(path)) = (
+            action_to_status(action),
+            local_path_to_repo_path(working_directory, client_file),
+        ) else {
+            continue;
+        };
+        out.push((
+            change,
+            ChangelistFile {
+                path,
+                status,
+                shelved: true,
+            },
+        ));
+    }
+    out
+}
+
 /// Build a [`GitStatus`] from `p4 -ztag opened` output.
 ///
 /// MVP strategy: `p4 opened` lists exactly the files open in this client (it does not scan
@@ -280,6 +406,141 @@ fn parse_opened_status(client_name: &str, opened_output: &str) -> GitStatus {
     GitStatus {
         entries: entries.into(),
     }
+}
+
+/// Identifies a pending changelist for the Changes panel: the special default changelist, or a
+/// numbered one. The grouping puts [`ChangelistId::Default`] first, then numbered changelists in
+/// descending order (newest first), matching P4V.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChangelistId {
+    Default,
+    Numbered(u32),
+}
+
+impl ChangelistId {
+    /// The `-c` argument value `p4` expects for this changelist (`default` or the number).
+    fn as_p4_arg(self) -> String {
+        match self {
+            ChangelistId::Default => "default".to_string(),
+            ChangelistId::Numbered(n) => n.to_string(),
+        }
+    }
+}
+
+/// One file open (or shelved) in a changelist, for the Changes panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelistFile {
+    pub path: RepoPath,
+    pub status: FileStatus,
+    pub shelved: bool,
+}
+
+/// A pending changelist with its files, for the Changes panel grouping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerforceChangelist {
+    pub id: ChangelistId,
+    pub description: String,
+    pub files: Vec<ChangelistFile>,
+}
+
+/// Parse a `p4 opened`/`changes` `change` field (`"default"` or a decimal number).
+fn parse_change_field(field: &str) -> Option<ChangelistId> {
+    if field == "default" {
+        Some(ChangelistId::Default)
+    } else {
+        field.parse::<u32>().ok().map(ChangelistId::Numbered)
+    }
+}
+
+/// Aggregate `p4 -ztag opened` (files + their `change`) and `p4 -ztag changes -s pending -l`
+/// (changelist numbers + descriptions) into the grouped model the Changes panel renders.
+///
+/// Why this instead of P4V's per-changelist `fstat` for opened files (N+1): one `opened` call
+/// already reports every open file with its `change` field, so a single aggregation pass buckets
+/// them. `changes` is only needed for the descriptions and to surface *empty* pending changelists
+/// (which have no `opened` files). Shelved files ARE a separate per-changelist `fstat -Rs` axis
+/// (passed in via `shelved`), appended after the opened files of each changelist. The default
+/// changelist is always emitted first; numbered changelists follow in descending order.
+fn build_changelists(
+    client_name: &str,
+    opened_output: &str,
+    changes: &[PendingChange],
+    shelved: Vec<(u32, ChangelistFile)>,
+) -> Vec<PerforceChangelist> {
+    // Numbered changelists + (possibly multi-line) descriptions from `changes -s pending`.
+    let mut descriptions: HashMap<u32, String> = HashMap::default();
+    for change in changes {
+        descriptions
+            .entry(change.number)
+            .or_insert_with(|| change.description.clone());
+    }
+
+    // Bucket opened files by their changelist.
+    let mut files: HashMap<ChangelistId, Vec<ChangelistFile>> = HashMap::default();
+    for record in parse_ztag(opened_output) {
+        let (Some(action), Some(change_field), Some(client_file)) = (
+            record.get("action"),
+            record.get("change"),
+            record.get("clientFile"),
+        ) else {
+            continue;
+        };
+        let (Some(status), Some(id), Some(path)) = (
+            action_to_status(action),
+            parse_change_field(change_field),
+            client_path_to_repo_path(client_name, client_file),
+        ) else {
+            continue;
+        };
+        files.entry(id).or_default().push(ChangelistFile {
+            path,
+            status,
+            shelved: false,
+        });
+    }
+
+    // Shelved files always belong to a numbered changelist (you cannot shelve in the default).
+    for (change, file) in shelved {
+        files
+            .entry(ChangelistId::Numbered(change))
+            .or_default()
+            .push(file);
+    }
+
+    // Numbered changelist set = union of those reported by `changes` and any referenced by an
+    // opened or shelved file (defensive: never silently drop a file whose changelist was missed).
+    let mut numbered: Vec<u32> = descriptions.keys().copied().collect();
+    for id in files.keys() {
+        if let ChangelistId::Numbered(n) = id
+            && !descriptions.contains_key(n)
+        {
+            numbered.push(*n);
+        }
+    }
+    numbered.sort_unstable_by(|a, b| b.cmp(a));
+    numbered.dedup();
+
+    // Within a changelist: opened files first, then shelved, each group sorted by path.
+    let take_sorted = |files: &mut HashMap<ChangelistId, Vec<ChangelistFile>>, id: ChangelistId| {
+        let mut v = files.remove(&id).unwrap_or_default();
+        v.sort_by(|a, b| (a.shelved, &a.path).cmp(&(b.shelved, &b.path)));
+        v
+    };
+
+    let mut result = Vec::with_capacity(numbered.len() + 1);
+    result.push(PerforceChangelist {
+        id: ChangelistId::Default,
+        description: String::new(),
+        files: take_sorted(&mut files, ChangelistId::Default),
+    });
+    for change in numbered {
+        result.push(PerforceChangelist {
+            id: ChangelistId::Numbered(change),
+            description: descriptions.get(&change).cloned().unwrap_or_default(),
+            files: take_sorted(&mut files, ChangelistId::Numbered(change)),
+        });
+    }
+    result
 }
 
 /// On-disk open-candidate classification of a single scoped path, used by the
@@ -703,6 +964,39 @@ fn p4_move_args(client_name: &str, src: &RepoPath, dst: &RepoPath) -> Vec<String
     ]
 }
 
+/// `p4 reopen -c <target> <file>` — move an already-open (pending) file into another changelist.
+/// Verified against the P4V drag-between-changelists log (identical command for add/edit files).
+fn p4_reopen_args(client_name: &str, target: ChangelistId, file: &RepoPath) -> Vec<String> {
+    vec![
+        "reopen".to_string(),
+        "-c".to_string(),
+        target.as_p4_arg(),
+        format!("//{}/{}", client_name, file.as_unix_str()),
+    ]
+}
+
+/// `p4 unshelve -s <source> -c <target> -Af <file>` — restore a shelved file into another
+/// changelist as an opened file. This is the P4V behavior when a *shelved* file is dragged onto
+/// a changelist (verified against the P4V log). Unlike [`p4_reopen_args`] (which relocates an
+/// already-open file), unshelve *copies* the shelf content into the workspace as an open file and
+/// leaves the original shelf intact; `-Af` restricts the operation to files (not the stream spec).
+fn p4_unshelve_args(
+    client_name: &str,
+    source: u32,
+    target: ChangelistId,
+    file: &RepoPath,
+) -> Vec<String> {
+    vec![
+        "unshelve".to_string(),
+        "-s".to_string(),
+        source.to_string(),
+        "-c".to_string(),
+        target.as_p4_arg(),
+        "-Af".to_string(),
+        format!("//{}/{}", client_name, file.as_unix_str()),
+    ]
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -927,6 +1221,22 @@ impl GitRepository for PerforceRepository {
     /// Phase 2 auto-checkout: record a file rename as a depot move (see [`Self::move_path`]).
     fn perforce_move(&self, src: RepoPath, dst: RepoPath) -> Task<Result<()>> {
         self.move_path(src, dst)
+    }
+
+    /// Changes panel: list pending changelists with their files (see [`Self::changelists`]).
+    fn perforce_changelists(&self) -> Task<Result<Vec<PerforceChangelist>>> {
+        self.changelists()
+    }
+
+    /// Changes panel drag-and-drop: move a file into another changelist (see
+    /// [`Self::move_to_changelist`]).
+    fn perforce_move_to_changelist(
+        &self,
+        file: RepoPath,
+        target: ChangelistId,
+        shelved_source: Option<u32>,
+    ) -> Task<Result<()>> {
+        self.move_to_changelist(file, target, shelved_source)
     }
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
@@ -1516,6 +1826,88 @@ impl PerforceRepository {
             Ok(())
         })
     }
+
+    /// List the client's pending changelists with their open and shelved files, for the Changes
+    /// panel.
+    ///
+    /// Opened files: `p4 -ztag opened` reports every open file with its `change` field in one shot
+    /// (avoiding P4V's per-changelist `fstat` N+1), and `p4 -ztag changes -s pending -l -c <client>`
+    /// supplies descriptions + surfaces empty pending changelists. `-c <client>` scopes to this
+    /// workspace's changelists (a client is owned by one user, so no `-u` filter and no hardcoded
+    /// user). Shelved files: fetched with `p4 -ztag fstat -Rs -e <cl>` **only** for changelists
+    /// that `changes -l` flagged as having shelves (a global `fstat -Rs` would scan the whole
+    /// workspace). Aggregation is the pure [`build_changelists`].
+    pub fn changelists(&self) -> Task<Result<Vec<PerforceChangelist>>> {
+        let cli = self.cli.clone();
+        let client_name = self.client_name.clone();
+        let working_directory = self.working_directory.clone();
+        let depot_glob = format!("//{client_name}/...");
+        let changes_args = vec![
+            "changes".to_string(),
+            "-s".to_string(),
+            "pending".to_string(),
+            "-l".to_string(),
+            "-c".to_string(),
+            client_name.clone(),
+        ];
+        self.cli.executor.clone().spawn(async move {
+            let (opened, _stderr, _ok) = cli.run_lenient(true, &["opened"]).await?;
+            let (changes_out, _stderr, _ok) = cli.run_lenient(true, &changes_args).await?;
+            let changes = parse_pending_changes(&changes_out);
+
+            // Shelved files: one `fstat -Rs -e <cl>` per changelist that has shelves.
+            let mut shelved = Vec::new();
+            for change in changes.iter().filter(|c| c.has_shelved) {
+                let args = vec![
+                    "fstat".to_string(),
+                    "-Rs".to_string(),
+                    "-e".to_string(),
+                    change.number.to_string(),
+                    depot_glob.clone(),
+                ];
+                let (out, _stderr, _ok) = cli.run_lenient(true, &args).await?;
+                shelved.extend(parse_shelved_files(&working_directory, &out));
+            }
+
+            let groups = build_changelists(&client_name, &opened, &changes, shelved);
+            log::debug!(
+                "perforce: changelists client={client_name} -> {} group(s)",
+                groups.len()
+            );
+            Ok(groups)
+        })
+    }
+
+    /// Move a file into `target` changelist via drag-and-drop in the Changes panel.
+    ///
+    /// `shelved_source` distinguishes the two P4V behaviors (see [`p4_reopen_args`] /
+    /// [`p4_unshelve_args`]): `None` = a pending (open) file → `p4 reopen -c` relocates it;
+    /// `Some(src)` = a shelved file → `p4 unshelve -s src -c target -Af` restores it into the
+    /// target as an open file (the original shelf stays). Best-effort: a non-zero result (e.g.
+    /// unshelve needing a manual `p4 resolve`) is surfaced as an error for the caller to log.
+    pub fn move_to_changelist(
+        &self,
+        file: RepoPath,
+        target: ChangelistId,
+        shelved_source: Option<u32>,
+    ) -> Task<Result<()>> {
+        let cli = self.cli.clone();
+        let args = match shelved_source {
+            Some(source) => p4_unshelve_args(&self.client_name, source, target, &file),
+            None => p4_reopen_args(&self.client_name, target, &file),
+        };
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
+            anyhow::ensure!(ok, "p4 move-to-changelist failed: {stderr}");
+            log::info!(
+                "perforce: move {} -> changelist {} -> {}",
+                file.as_unix_str(),
+                target.as_p4_arg(),
+                stdout.trim_end()
+            );
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1577,6 +1969,67 @@ mod tests {
     }
 
     #[test]
+    fn pending_changes_keep_multiline_desc_with_blank_lines() {
+        // Real `changes -l` framing: desc is the last field, its value spans multiple lines
+        // *including a blank line*, and records are separated by blank line(s). The blank line
+        // inside the description must NOT split the record or truncate the description.
+        let output = "\
+... change 7398454
+... status pending
+... desc single line summary
+
+
+... change 7397357
+... status pending
+... shelved
+... desc first line
+
+second paragraph
+- bullet a
+- bullet b
+
+
+... change 7334528
+... status pending
+... desc only line
+";
+        let parsed = parse_pending_changes(output);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].number, 7398454);
+        assert_eq!(parsed[0].description, "single line summary");
+        assert!(!parsed[0].has_shelved);
+        assert_eq!(parsed[1].number, 7397357);
+        assert_eq!(
+            parsed[1].description,
+            "first line\n\nsecond paragraph\n- bullet a\n- bullet b"
+        );
+        // `... shelved` flag detected (must not be swallowed by the multi-line desc continuation).
+        assert!(parsed[1].has_shelved);
+        assert_eq!(parsed[2].number, 7334528);
+        assert_eq!(parsed[2].description, "only line");
+        assert!(!parsed[2].has_shelved);
+    }
+
+    #[test]
+    fn pending_changes_handle_desc_not_last_field() {
+        // `describe -s` framing puts fields after desc; the continuation must stop at the next
+        // `... <field>` line, not bleed the following fields into the description.
+        let output = "\
+... change 42
+... user someuser
+... desc line one
+
+line two
+... status pending
+... changeType public
+";
+        let parsed = parse_pending_changes(output);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].number, 42);
+        assert_eq!(parsed[0].description, "line one\n\nline two");
+    }
+
+    #[test]
     fn client_path_strips_client_prefix() {
         let p = client_path_to_repo_path("some_client_name", "//some_client_name/a/added.md")
             .expect("should map");
@@ -1600,6 +2053,133 @@ mod tests {
         assert!(map["a/added.md"].is_created());
         assert!(map["b/edited.cpp"].is_modified());
         assert!(map["c/gone.txt"].is_deleted());
+    }
+
+    // Real `p4 -ztag changes -s pending -l` output shape: one record per pending changelist.
+    // Descriptions are arbitrary fixture text. `6500000` has no opened files (an empty pending
+    // changelist) and must still appear in the grouping.
+    const CHANGES_FIXTURE: &str = "\
+... change 6596347
+... time 1700000000
+... user someuser
+... client some_client_name
+... status pending
+... changeType public
+... desc First feature work
+
+... change 6500000
+... time 1699000000
+... user someuser
+... client some_client_name
+... status pending
+... changeType public
+... desc Older change
+";
+
+    #[test]
+    fn changelists_group_files_and_sort_default_first_then_descending() {
+        let changes = parse_pending_changes(CHANGES_FIXTURE);
+        let groups = build_changelists("some_client_name", OPENED_FIXTURE, &changes, Vec::new());
+
+        // Default first, then numbered changelists in descending order. The empty pending
+        // changelist (6500000) still appears.
+        let ids: Vec<ChangelistId> = groups.iter().map(|g| g.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ChangelistId::Default,
+                ChangelistId::Numbered(6596347),
+                ChangelistId::Numbered(6500000),
+            ]
+        );
+
+        // Default changelist: the one edited file, no fabricated description.
+        let default = &groups[0];
+        assert_eq!(default.description, "");
+        assert_eq!(default.files.len(), 1);
+        assert_eq!(default.files[0].path.as_unix_str(), "b/edited.cpp");
+        assert!(default.files[0].status.is_modified());
+        assert!(!default.files[0].shelved);
+
+        // Numbered changelist: description from `changes`, files sorted by path.
+        let cl = &groups[1];
+        assert_eq!(cl.description, "First feature work");
+        let files: Vec<(&str, bool)> = cl
+            .files
+            .iter()
+            .map(|f| (f.path.as_unix_str(), f.status.is_deleted()))
+            .collect();
+        assert_eq!(files, vec![("a/added.md", false), ("c/gone.txt", true)]);
+
+        // Empty pending changelist: present, described, no files.
+        let empty = &groups[2];
+        assert_eq!(empty.description, "Older change");
+        assert!(empty.files.is_empty());
+    }
+
+    #[test]
+    fn local_path_maps_under_client_root() {
+        // `fstat` reports `clientFile` as a local OS path (mixed separators on Windows); it must
+        // map to a repo-relative path by stripping the client root, case-insensitively.
+        let root = Path::new("E:/Projects/some_client_name");
+        let p = local_path_to_repo_path(root, "E:/Projects\\some_client_name\\a\\shelved.md")
+            .expect("should map under root");
+        assert_eq!(p.as_unix_str(), "a/shelved.md");
+        // Different case in the drive/root still maps (Windows paths are case-insensitive).
+        let p2 = local_path_to_repo_path(root, "e:/projects/SOME_CLIENT_NAME/b/x.txt")
+            .expect("case-insensitive root");
+        assert_eq!(p2.as_unix_str(), "b/x.txt");
+        // A path outside the client root does not map.
+        assert!(local_path_to_repo_path(root, "D:/elsewhere/a.md").is_none());
+    }
+
+    // Real `p4 -ztag fstat -Rs -e <cl>` shape: one record per shelved file (local `clientFile`),
+    // then a trailing changelist-description record with no `clientFile` that must be skipped.
+    const SHELVED_FIXTURE: &str = "\
+... depotFile //Depot.Project/Release/branch_x/a/shelved_add.md
+... clientFile E:/Projects\\some_client_name\\a\\shelved_add.md
+... shelved
+... isMapped
+... action add
+... change 6596347
+... type text
+
+... desc a shelved changelist
+";
+
+    #[test]
+    fn shelved_files_parse_with_local_paths() {
+        let root = Path::new("E:/Projects/some_client_name");
+        let parsed = parse_shelved_files(root, SHELVED_FIXTURE);
+        assert_eq!(parsed.len(), 1);
+        let (change, file) = &parsed[0];
+        assert_eq!(*change, 6596347);
+        assert_eq!(file.path.as_unix_str(), "a/shelved_add.md");
+        assert!(file.shelved);
+        assert!(file.status.is_created());
+    }
+
+    #[test]
+    fn changelists_append_shelved_after_opened() {
+        let changes = parse_pending_changes(CHANGES_FIXTURE);
+        let shelved = vec![(
+            6596347u32,
+            ChangelistFile {
+                path: repo_path("a/shelved.md"),
+                status: action_to_status("edit").unwrap(),
+                shelved: true,
+            },
+        )];
+        let groups = build_changelists("some_client_name", OPENED_FIXTURE, &changes, shelved);
+
+        // 6596347 had two opened files (add + delete); the shelved file is appended after them.
+        let cl = &groups[1];
+        assert_eq!(cl.id, ChangelistId::Numbered(6596347));
+        assert_eq!(cl.files.len(), 3);
+        assert_eq!(cl.files.iter().filter(|f| !f.shelved).count(), 2);
+        let last = cl.files.last().unwrap();
+        assert!(last.shelved);
+        assert_eq!(last.path.as_unix_str(), "a/shelved.md");
     }
 
     #[test]
@@ -1765,6 +2345,47 @@ mod tests {
                 "-k".to_string(),
                 "//some_client_name/a/old.txt".to_string(),
                 "//some_client_name/b/new.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reopen_args_target_changelist() {
+        // Numbered target.
+        let args = p4_reopen_args("c", ChangelistId::Numbered(60000001), &repo_path("a/b.txt"));
+        assert_eq!(
+            args,
+            vec![
+                "reopen".to_string(),
+                "-c".to_string(),
+                "60000001".to_string(),
+                "//c/a/b.txt".to_string(),
+            ]
+        );
+        // Default target uses the literal "default".
+        let default = p4_reopen_args("c", ChangelistId::Default, &repo_path("a/b.txt"));
+        assert_eq!(default[2], "default");
+    }
+
+    #[test]
+    fn unshelve_args_restore_into_target() {
+        // Shelved-file drag: `unshelve -s <source> -c <target> -Af <file>` (files only).
+        let args = p4_unshelve_args(
+            "c",
+            7369367,
+            ChangelistId::Numbered(7397357),
+            &repo_path("a/b.md"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "unshelve".to_string(),
+                "-s".to_string(),
+                "7369367".to_string(),
+                "-c".to_string(),
+                "7397357".to_string(),
+                "-Af".to_string(),
+                "//c/a/b.md".to_string(),
             ]
         );
     }
