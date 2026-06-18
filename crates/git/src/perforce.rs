@@ -476,8 +476,31 @@ fn parse_describe_meta(ztag_output: &str) -> HashMap<u32, ChangeMeta> {
 /// Author and time come from annotate itself (every line, no cap); only the description
 /// (shown in the hover) comes from `describe`, which is capped — a line whose description
 /// wasn't fetched still shows its author, time, and `@change`.
+///
+/// This is the depot-aligned convenience form (every line attributed), used by the
+/// consecutive-grouping unit test. Production blame always routes through
+/// [`build_p4_blame_mapped`] (with `None` holes for locally added/edited rows) via the
+/// dirty-buffer remap, so this wrapper is test-only.
+#[cfg(test)]
 fn build_p4_blame(
     lines: &[AnnotatedLine],
+    descriptions: &HashMap<u32, ChangeMeta>,
+    filename: String,
+) -> Blame {
+    let mapped: Vec<Option<AnnotatedLine>> = lines.iter().cloned().map(Some).collect();
+    build_p4_blame_mapped(&mapped, descriptions, filename)
+}
+
+/// Like [`build_p4_blame`] but over a per-*buffer*-line mapping: `Some(line)` carries the
+/// depot attribution for that buffer row; `None` means the row is locally added/edited and
+/// must show **no** blame (mirroring how git leaves uncommitted rows unattributed).
+///
+/// Each `None` is simply skipped, leaving that row uncovered by any [`BlameEntry`] range —
+/// the editor's `build_blame_entry_sum_tree` fills uncovered rows with `blame: None`, so the
+/// gutter and inline indicator render blank there, while attributed rows keep their correct
+/// (offset) buffer row via the running index.
+fn build_p4_blame_mapped(
+    lines: &[Option<AnnotatedLine>],
     descriptions: &HashMap<u32, ChangeMeta>,
     filename: String,
 ) -> Blame {
@@ -486,12 +509,19 @@ fn build_p4_blame(
 
     let mut i = 0;
     while i < lines.len() {
-        let change = lines[i].change;
+        // Skip locally added/edited rows: they carry no depot attribution.
+        let Some(line) = &lines[i] else {
+            i += 1;
+            continue;
+        };
+        let change = line.change;
         let start = i;
-        while i < lines.len() && lines[i].change == change {
+        // Group consecutive rows that share the same depot change AND are not holes.
+        while i < lines.len()
+            && lines[i].as_ref().is_some_and(|l| l.change == change)
+        {
             i += 1;
         }
-        let line = &lines[start];
         let oid = change_to_oid(change);
         let summary = descriptions.get(&change).and_then(|m| m.summary.clone());
         if let Some(summary) = &summary {
@@ -518,6 +548,102 @@ fn build_p4_blame(
         });
     }
     Blame { entries, messages }
+}
+
+/// Remap a depot annotation onto the local buffer content so each *buffer* line carries the
+/// depot attribution of the matching depot line, and locally added/edited lines carry none.
+///
+/// Why this exists: `p4 annotate` can only annotate a server revision (`#have`), never the
+/// dirty buffer — unlike `git blame --contents -`, which blames the exact buffer bytes the
+/// editor passes in. So the raw annotation is aligned to the depot file, not the buffer. When
+/// the buffer has local edits the rows drift and the wrong author shows. To get git-equivalent
+/// behavior we diff the depot `#have` text against the buffer `content` and project the
+/// annotation through that diff, exactly as git's `--contents` does internally.
+///
+/// `depot_text` is the depot `#have` content (`p4 print -q`), expected to have one line per
+/// entry in `depot` (which is what [`parse_formatted_annotate`] yields, one record per depot
+/// line). The diff is a line-text LCS between `depot_text` and `content`.
+///
+/// Returns one entry per buffer line (`result.len()` == buffer line count):
+/// - `Some(depot_line)` — the buffer line matches a depot line; use that attribution.
+/// - `None` — the buffer line was locally inserted or edited; show no blame.
+/// Depot lines deleted locally are simply dropped (they have no buffer row).
+///
+/// Safety net: if `depot_text`'s line count disagrees with `depot.len()` (an annotate/print
+/// framing surprise), we cannot trust the alignment, so we return the raw annotation
+/// unchanged (`Some` for every depot line) rather than risk mis-attributing — blame is never
+/// lost, it just falls back to the previous depot-aligned behavior.
+fn remap_annotation_to_content(
+    depot: &[AnnotatedLine],
+    depot_text: &str,
+    content: &Rope,
+) -> Vec<Option<AnnotatedLine>> {
+    let depot_lines: Vec<&str> = split_lines(depot_text);
+    if depot_lines.len() != depot.len() {
+        // Alignment we can't trust: fall back to the raw (depot-aligned) annotation.
+        return depot.iter().cloned().map(Some).collect();
+    }
+    let buffer_text = content.to_string();
+    let buffer_lines: Vec<&str> = split_lines(&buffer_text);
+
+    // Longest-common-subsequence between depot and buffer line texts. `matches[b] = Some(d)`
+    // means buffer line `b` is unchanged and corresponds to depot line `d`.
+    let matches = lcs_line_match(&depot_lines, &buffer_lines);
+    matches
+        .into_iter()
+        .map(|d| d.map(|d| depot[d].clone()))
+        .collect()
+}
+
+/// Split text into logical lines for line-diffing, ignoring a single trailing newline so a
+/// file with and without a final newline diff the same. An empty string yields no lines.
+fn split_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let trimmed = text.strip_suffix('\n').unwrap_or(text);
+    // `split('\n')` on "a\nb" -> ["a", "b"]; on "" (after stripping a lone "\n") -> [""],
+    // but we returned early for the fully-empty case so a single empty line is preserved.
+    trimmed.split('\n').map(|l| l.trim_end_matches('\r')).collect()
+}
+
+/// Classic LCS over two line-text slices, returning for each `b`-line the matched `a`-index
+/// (or `None` if that `b`-line is an insertion/edit). Result length == `b.len()`.
+///
+/// O(len(a) * len(b)) time and space — fine for source files (annotate is already the slow
+/// part). Lines compared by exact text equality, matching git's default whitespace-sensitive
+/// blame mapping.
+fn lcs_line_match(a: &[&str], b: &[&str]) -> Vec<Option<usize>> {
+    let (n, m) = (a.len(), b.len());
+    // dp[i][j] = LCS length of a[i..] and b[j..]. (n+1) x (m+1) table.
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    // Backtrack: walk forward choosing matches that preserve the LCS length.
+    let mut result = vec![None; m];
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            result[j] = Some(i);
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            // Depot line deleted in buffer: advance depot.
+            i += 1;
+        } else {
+            // Buffer line inserted/edited: leave None, advance buffer.
+            j += 1;
+        }
+    }
+    // Any remaining buffer lines (tail insertions) stay None.
+    result
 }
 
 /// Which Perforce "open" action a save/create/delete should perform.
@@ -601,9 +727,22 @@ pub struct PerforceRepository {
     is_trusted: Arc<AtomicBool>,
 }
 
+/// Cached *depot-side* blame inputs for a file, keyed by the file's on-disk mtime.
+///
+/// We cache only the mtime-stable depot data (the per-line annotation and the depot `#have`
+/// text), NOT a finished [`Blame`]. The finished blame depends on the (possibly dirty) buffer
+/// `content`, which changes on every keystroke while the file's mtime is unchanged — so the
+/// dirty-buffer remap ([`remap_annotation_to_content`]) must run fresh on each `blame()` call.
+/// The remap is cheap (a line-text LCS); the expensive `p4 annotate`/`describe` round-trips
+/// are what this cache skips while the file on disk is unchanged.
 struct BlameCacheEntry {
     mtime: Option<SystemTime>,
-    blame: Blame,
+    /// Per-depot-line annotation (origin change/author/time), aligned 1:1 with `depot_text`.
+    lines: Vec<AnnotatedLine>,
+    /// Depot `#have` content, used to diff against the buffer for the dirty-buffer remap.
+    depot_text: String,
+    /// Per-change descriptions (hover summaries), capped to `max_history_count`.
+    descriptions: HashMap<u32, ChangeMeta>,
 }
 
 impl PerforceRepository {
@@ -917,14 +1056,16 @@ impl GitRepository for PerforceRepository {
     fn blame(
         &self,
         path: RepoPath,
-        _content: Rope,
+        content: Rope,
         _line_ending: LineEnding,
     ) -> BoxFuture<'_, Result<Blame>> {
-        // Annotate the synced (`#have`) revision — this is what's on disk, and naturally
-        // shows only "have and earlier" history (direct history; integration-following is a
-        // later, on-demand command). `_content` (the possibly-dirty buffer) is ignored: p4
-        // annotate works on the depot revision, so lines may drift if the buffer has unsaved
-        // edits, and realign on save.
+        // Annotate the synced (`#have`) revision — this is what the depot knows; `p4 annotate`
+        // can only annotate a server revision, never the dirty buffer (unlike `git blame
+        // --contents -`). So the raw annotation is aligned to the depot file. We then diff the
+        // depot `#have` text against the editor-supplied `content` (the possibly-dirty buffer)
+        // and project the annotation through that diff (see `remap_annotation_to_content`), so
+        // locally added/edited lines show no blame and the rest are offset correctly — exactly
+        // how git behaves for an unsaved buffer.
         let cli = self.cli.clone();
         let client_path = self.client_syntax_path(&path);
         let abs = self.working_directory.join(path.as_std_path());
@@ -934,11 +1075,18 @@ impl GitRepository for PerforceRepository {
         async move {
             // Skip the slow re-annotate when the file on disk hasn't changed since last time
             // (the editor re-requests blame on a debounce while editing; an unsaved buffer
-            // leaves the file mtime untouched).
+            // leaves the file mtime untouched). The dirty-buffer remap still runs fresh below
+            // against the current `content`, since the cache holds only depot-side inputs.
             let mtime = std::fs::metadata(&abs).and_then(|m| m.modified()).ok();
             if let Some(hit) = cache.lock().get(&path) {
                 if hit.mtime == mtime {
-                    return Ok(hit.blame.clone());
+                    let mapped =
+                        remap_annotation_to_content(&hit.lines, &hit.depot_text, &content);
+                    return Ok(build_p4_blame_mapped(
+                        &mapped,
+                        &hit.descriptions,
+                        filename,
+                    ));
                 }
             }
 
@@ -968,6 +1116,14 @@ impl GitRepository for PerforceRepository {
                 .await?;
             let lines = parse_formatted_annotate(&annotate_output);
 
+            // Depot `#have` text, to diff against the buffer for the dirty-buffer remap. This
+            // is mtime-stable (depot revision), so it's cached alongside the annotation; the
+            // remap itself runs every call against the current buffer `content`.
+            let depot_text = cli
+                .run(false, &["print", "-q", &target])
+                .await
+                .unwrap_or_default();
+
             // Descriptions (hover text only) come from `p4 describe`, capped to
             // `max_history_count` to bound cost. Author/time already came from annotate.
             let mut unique: Vec<u32> = Vec::new();
@@ -987,13 +1143,18 @@ impl GitRepository for PerforceRepository {
                     descriptions.extend(parse_describe_meta(&out));
                 }
             }
-            let blame = build_p4_blame(&lines, &descriptions, filename);
+            // Remap the depot annotation onto the (possibly dirty) buffer content so locally
+            // added/edited rows show no blame and the rest are offset (git-equivalent).
+            let mapped = remap_annotation_to_content(&lines, &depot_text, &content);
+            let blame = build_p4_blame_mapped(&mapped, &descriptions, filename);
 
             cache.lock().insert(
                 path,
                 BlameCacheEntry {
                     mtime,
-                    blame: blame.clone(),
+                    lines,
+                    depot_text,
+                    descriptions,
                 },
             );
             Ok(blame)
@@ -1747,6 +1908,95 @@ mod tests {
             blame.messages.get(&change_to_oid(2001)).map(String::as_str),
             Some("add curves")
         );
+    }
+
+    // ---- dirty-buffer remap: align depot annotation onto the local buffer ----
+
+    fn annotated(change: u32) -> AnnotatedLine {
+        AnnotatedLine {
+            change,
+            user: Some(format!("user{change}")),
+            time: Some(1_700_000_000 + change as i64),
+        }
+    }
+
+    #[test]
+    fn remap_clean_buffer_is_identity() {
+        // Buffer identical to depot#have: every line keeps its depot attribution, in order.
+        let depot = vec![annotated(1001), annotated(1001), annotated(1002)];
+        let depot_text = "a\nb\nc\n";
+        let content = Rope::from("a\nb\nc\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        assert_eq!(changes, vec![Some(1001), Some(1001), Some(1002)]);
+    }
+
+    #[test]
+    fn remap_inserted_line_gets_no_blame_and_shifts_rest() {
+        // Depot has 3 lines (a,b,c). Buffer inserts a new line "x" between b and c.
+        // The inserted line must carry NO depot attribution (None); a/b/c keep theirs,
+        // and c is correctly offset down by one row.
+        let depot = vec![annotated(1001), annotated(1002), annotated(1003)];
+        let depot_text = "a\nb\nc\n";
+        let content = Rope::from("a\nb\nx\nc\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        assert_eq!(changes, vec![Some(1001), Some(1002), None, Some(1003)]);
+    }
+
+    #[test]
+    fn remap_edited_line_gets_no_blame() {
+        // Depot a,b,c. Buffer edits the middle line b -> B. The edited line shows no blame;
+        // a and c retain their original depot authors at the right rows.
+        let depot = vec![annotated(1001), annotated(1002), annotated(1003)];
+        let depot_text = "a\nb\nc\n";
+        let content = Rope::from("a\nB\nc\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        assert_eq!(changes, vec![Some(1001), None, Some(1003)]);
+    }
+
+    #[test]
+    fn remap_deleted_line_drops_depot_row() {
+        // Depot a,b,c. Buffer deletes b. Remaining buffer lines a,c keep their depot authors.
+        let depot = vec![annotated(1001), annotated(1002), annotated(1003)];
+        let depot_text = "a\nb\nc\n";
+        let content = Rope::from("a\nc\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        assert_eq!(changes, vec![Some(1001), Some(1003)]);
+    }
+
+    #[test]
+    fn remap_mismatched_counts_falls_back_to_raw() {
+        // If depot_text line count disagrees with the annotation length, keep the raw
+        // depot-aligned annotation (never lose blame).
+        let depot = vec![annotated(1001), annotated(1002)];
+        let depot_text = "a\nb\nc\n"; // 3 lines vs 2 annotation entries
+        let content = Rope::from("a\nb\nc\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        assert_eq!(changes, vec![Some(1001), Some(1002)]);
+    }
+
+    #[test]
+    fn blame_from_remapped_hides_holes_and_offsets() {
+        // End-to-end through build_p4_blame_mapped: an inserted line (None) produces a gap in
+        // the blame ranges (so the editor renders no gutter/inline for it), and the depot
+        // entry below the insertion is shifted to its new buffer row.
+        let mapped = vec![
+            Some(annotated(2001)),
+            None, // locally inserted/edited -> no blame
+            Some(annotated(2002)),
+        ];
+        let descriptions = HashMap::default();
+        let blame = build_p4_blame_mapped(&mapped, &descriptions, "a/b.cpp".into());
+        // Two attributed entries; the hole at row 1 is left uncovered (rendered blank).
+        assert_eq!(blame.entries.len(), 2);
+        assert_eq!(blame.entries[0].range, 0..1);
+        assert_eq!(blame.entries[0].revision_label.as_deref(), Some("@2001"));
+        assert_eq!(blame.entries[1].range, 2..3);
+        assert_eq!(blame.entries[1].revision_label.as_deref(), Some("@2002"));
     }
 
     #[test]
