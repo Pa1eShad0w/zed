@@ -155,6 +155,11 @@ pub struct ProjectPanel {
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
+    /// Perforce opened files behind head revision, keyed like `diagnostics` by (worktree, path),
+    /// for the out-of-date badge. Empty for non-Perforce workspaces. Refreshed by
+    /// `update_perforce_out_of_date`.
+    perforce_out_of_date: HashSet<(WorktreeId, Arc<RelPath>)>,
+    perforce_out_of_date_task: Task<()>,
     // We keep track of the mouse down state on entries so we don't flash the UI
     // in case a user clicks to open a file.
     mouse_down: bool,
@@ -284,6 +289,9 @@ struct EntryDetails {
     diagnostic_severity: Option<DiagnosticSeverity>,
     diagnostic_count: Option<DiagnosticCount>,
     git_status: GitSummary,
+    /// Perforce: this opened file is behind head revision (have < head), so the entry shows an
+    /// out-of-date badge. Always `false` for non-Perforce workspaces.
+    perforce_out_of_date: bool,
     is_private: bool,
     worktree_id: WorktreeId,
     canonical_path: Option<Arc<Path>>,
@@ -647,6 +655,7 @@ impl ProjectPanel {
                     | GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_) => {
                         this.update_visible_entries(None, false, false, window, cx);
+                        this.update_perforce_out_of_date(cx);
                         cx.notify();
                     }
                     _ => {}
@@ -862,6 +871,8 @@ impl ProjectPanel {
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
+                perforce_out_of_date: Default::default(),
+                perforce_out_of_date_task: Task::ready(()),
                 scroll_handle,
                 mouse_down: false,
                 hover_expand_task: None,
@@ -1037,6 +1048,50 @@ impl ProjectPanel {
             } else {
                 Default::default()
             };
+    }
+
+    /// Refresh the Perforce out-of-date set (opened files behind head revision) that drives the
+    /// entry badge. Gated on the active repository being Perforce-backed: a non-Perforce workspace
+    /// clears the set and runs no `p4`, so git workspaces are completely unaffected. The query
+    /// (`p4 fstat -Ro`) runs on the background executor and only scans opened files.
+    fn update_perforce_out_of_date(&mut self, cx: &mut Context<Self>) {
+        let perforce_repo = self
+            .project
+            .read(cx)
+            .active_repository(cx)
+            .filter(|repo| repo.read(cx).is_perforce());
+        let Some(repo) = perforce_repo else {
+            if !self.perforce_out_of_date.is_empty() {
+                self.perforce_out_of_date.clear();
+                cx.notify();
+            }
+            return;
+        };
+        let task = repo.read(cx).perforce_out_of_date_paths(cx);
+        self.perforce_out_of_date_task = cx.spawn(async move |this, cx| {
+            let Ok(paths) = task.await else { return };
+            this.update(cx, |this, cx| {
+                let Some(repo) = this
+                    .project
+                    .read(cx)
+                    .active_repository(cx)
+                    .filter(|repo| repo.read(cx).is_perforce())
+                else {
+                    return;
+                };
+                let mapped: HashSet<(WorktreeId, Arc<RelPath>)> = paths
+                    .iter()
+                    .filter_map(|repo_path| {
+                        let project_path =
+                            repo.read(cx).repo_path_to_project_path(repo_path, cx)?;
+                        Some((project_path.worktree_id, project_path.path))
+                    })
+                    .collect();
+                this.perforce_out_of_date = mapped;
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     fn update_strongest_diagnostic_severity(
@@ -5398,6 +5453,7 @@ impl ProjectPanel {
         let filename_text_color = details.filename_text_color;
         let diagnostic_severity = details.diagnostic_severity;
         let diagnostic_count = details.diagnostic_count;
+        let perforce_out_of_date = details.perforce_out_of_date;
         let item_colors = get_item_color(is_sticky, cx);
 
         let canonical_path = details
@@ -5905,7 +5961,8 @@ impl ProjectPanel {
                             )
                         },
                     )
-                    .child(if let Some(icon) = &icon {
+                    .child({
+                        let icon_element = if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
                         {
@@ -5954,6 +6011,24 @@ impl ProjectPanel {
                             .size(IconSize::default().rems())
                             .invisible()
                             .flex_none()
+                        };
+                        // Only out-of-date entries get the relative wrapper + badge; every other
+                        // entry (and all git workspaces) renders the icon exactly as before.
+                        if perforce_out_of_date {
+                            div()
+                                .relative()
+                                .child(icon_element)
+                                .child(
+                                    div().absolute().bottom(px(-1.)).left(px(-1.)).child(
+                                        Icon::new(IconName::Triangle)
+                                            .size(IconSize::Indicator)
+                                            .color(Color::Warning),
+                                    ),
+                                )
+                                .into_any_element()
+                        } else {
+                            icon_element.into_any_element()
+                        }
                     })
                     .child(if show_editor {
                         h_flex().h_6().w_full().child(self.filename_editor.clone())
@@ -6327,6 +6402,12 @@ impl ProjectPanel {
             .as_ref()
             .is_some_and(|e| e.is_cut() && e.items().contains(&selection));
 
+        // Perforce out-of-date set is keyed by (worktree, path) exactly like `diagnostics`; it is
+        // empty for non-Perforce workspaces, so this lookup is free and always false there.
+        let perforce_out_of_date = self
+            .perforce_out_of_date
+            .contains(&(worktree_id, entry.path.clone()));
+
         EntryDetails {
             filename,
             icon,
@@ -6345,6 +6426,7 @@ impl ProjectPanel {
             diagnostic_severity,
             diagnostic_count,
             git_status,
+            perforce_out_of_date,
             is_private: entry.is_private,
             worktree_id,
             canonical_path: entry.canonical_path.clone(),
