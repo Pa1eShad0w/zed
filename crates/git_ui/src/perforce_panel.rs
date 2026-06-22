@@ -101,6 +101,9 @@ impl Render for DraggedPerforceFileView {
 pub struct PerforcePanel {
     project: Entity<Project>,
     active_repository: Option<Entity<Repository>>,
+    /// Cached "is the active repo Perforce-backed", resolved asynchronously (the repository state
+    /// is a lazily-polled `Shared`, so a synchronous check is unreliable). Gates the dock icon.
+    active_is_perforce: bool,
     changelists: Vec<PerforceChangelist>,
     /// Flattened, collapse-aware row list driving the `uniform_list` (rebuilt on data/expand
     /// changes). Virtualized rendering keeps large changelists (hundreds of files) responsive.
@@ -161,16 +164,18 @@ impl PerforcePanel {
                 cx.subscribe(&git_store, |this: &mut Self, _git_store, event, cx| match event {
                 GitStoreEvent::ActiveRepositoryChanged(_)
                 | GitStoreEvent::RepositoryAdded
-                | GitStoreEvent::RepositoryRemoved(_) => {
-                    this.active_repository = this.project.read(cx).active_repository(cx);
-                    this.reload(cx);
-                }
-                GitStoreEvent::RepositoryUpdated(
+                | GitStoreEvent::RepositoryRemoved(_)
+                | GitStoreEvent::RepositoryUpdated(
                     _,
                     RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
                     true,
                 ) => {
-                    this.reload(cx);
+                    // Perforce detection is async; the repo may only now have resolved to a
+                    // Perforce backend. Re-read the active repo and re-resolve `is_perforce`, which
+                    // drives the state, caches the result, notifies the dock (so its icon appears),
+                    // and reloads.
+                    this.active_repository = this.project.read(cx).active_repository(cx);
+                    this.refresh_is_perforce(cx);
                 }
                 _ => {}
             });
@@ -178,6 +183,7 @@ impl PerforcePanel {
             let this = Self {
                 project,
                 active_repository,
+                active_is_perforce: false,
                 changelists: Vec::new(),
                 entries: Vec::new(),
                 expanded: HashSet::default(),
@@ -191,16 +197,59 @@ impl PerforcePanel {
                 reload_task: Task::ready(()),
                 _subscriptions: vec![subscription, window_activation],
             };
-            // Initial population happens on `set_active(true)` when the panel is first shown;
-            // while hidden we intentionally issue no `p4` queries.
+            // Resolve `is_perforce` once at startup: the repo may already be active with no further
+            // event coming, so the dock icon needs this initial async resolution to appear.
+            if let Some(repo) = this.active_repository.clone() {
+                let task = repo.read(cx).is_perforce_resolved(cx);
+                cx.spawn(async move |this, cx| {
+                    let is_perforce = task.await;
+                    this.update(cx, |this, cx| {
+                        this.active_is_perforce = is_perforce;
+                        cx.notify();
+                        this.reload(cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             this
         })
     }
 
-    fn is_active_perforce(&self, cx: &App) -> bool {
-        self.active_repository
-            .as_ref()
-            .is_some_and(|repo| repo.read(cx).is_perforce())
+    /// Whether the active repository is Perforce-backed. Reads the cached `active_is_perforce`,
+    /// which is resolved asynchronously on repository changes (see `refresh_is_perforce`) because
+    /// the repository state is a lazily-polled `Shared` — a synchronous peek returns `None` until
+    /// it is driven, which would keep the dock icon hidden forever.
+    fn is_active_perforce(&self, _cx: &App) -> bool {
+        self.active_is_perforce
+    }
+
+    /// Re-resolve whether the active repository is Perforce-backed (driving its state to
+    /// completion), then cache it, notify the dock so it re-evaluates the panel icon, and reload.
+    fn refresh_is_perforce(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            if self.active_is_perforce {
+                self.active_is_perforce = false;
+                cx.notify();
+            }
+            self.reload(cx);
+            return;
+        };
+        let task = repo.read(cx).is_perforce_resolved(cx);
+        cx.spawn(async move |this, cx| {
+            let is_perforce = task.await;
+            this.update(cx, |this, cx| {
+                if this.active_is_perforce != is_perforce {
+                    this.active_is_perforce = is_perforce;
+                }
+                // Notify unconditionally so the dock re-evaluates `icon()` even when the panel is
+                // inactive (otherwise the icon can never appear: a closed panel never notifies).
+                cx.notify();
+                this.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-fetch the pending changelists for the active Perforce repository. A no-op (clears the

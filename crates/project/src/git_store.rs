@@ -5150,11 +5150,27 @@ impl Repository {
     /// Whether this repository is backed by Perforce (vs git). Synchronous: reads the
     /// already-resolved backend via `peek()`, so it is safe to call from UI render. Returns
     /// `false` until the backend resolves or for remote repositories.
+    /// Synchronous best-effort check: only true once `repository_state` has been driven to
+    /// completion (its `Shared` is polled lazily, so this is `false` until something awaits it).
+    /// UI that needs a reliable answer should use [`Self::is_perforce_resolved`].
     pub fn is_perforce(&self) -> bool {
         match self.repository_state.peek() {
             Some(Ok(RepositoryState::Local(state))) => state.backend.is_perforce(),
             _ => false,
         }
+    }
+
+    /// Resolve whether this repository is Perforce-backed, awaiting `repository_state` (which also
+    /// drives that lazy `Shared` to completion). Reliable regardless of whether the state has been
+    /// polled yet — used by the Perforce panel to decide whether to surface its dock icon.
+    pub fn is_perforce_resolved(&self, cx: &App) -> Task<bool> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            matches!(
+                repository_state.await,
+                Ok(RepositoryState::Local(state)) if state.backend.is_perforce()
+            )
+        })
     }
 
     /// Perforce Changes panel: list this client's pending changelists with their files.
