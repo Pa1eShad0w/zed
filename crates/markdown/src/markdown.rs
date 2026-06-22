@@ -112,6 +112,13 @@ pub struct MarkdownStyle {
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
+    /// Line height applied to body paragraphs and list items.
+    pub paragraph_line_height: DefiniteLength,
+    /// Whitespace inserted on each side of inline code spans to give the
+    /// highlighted background horizontal breathing room. Empty = none.
+    /// These characters are rendered-only (no source mapping) so they never
+    /// reach the clipboard or selection.
+    pub inline_code_padding: SharedString,
 }
 
 impl Default for MarkdownStyle {
@@ -136,6 +143,8 @@ impl Default for MarkdownStyle {
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
+            paragraph_line_height: rems(1.3).into(),
+            inline_code_padding: SharedString::default(),
         }
     }
 }
@@ -258,7 +267,7 @@ impl MarkdownStyle {
                 font_features: Some(theme_settings.buffer_font.features.clone()),
                 font_size: Some(buffer_font_size.into()),
                 font_weight: Some(buffer_font_weight),
-                background_color: Some(colors.editor_foreground.opacity(0.08)),
+                background_color: Some(colors.editor_foreground.opacity(0.12)),
                 ..Default::default()
             },
             link: TextStyleRefinement {
@@ -299,6 +308,8 @@ impl MarkdownStyle {
                     }),
                 },
             ),
+            paragraph_line_height: rems(1.3).into(),
+            inline_code_padding: "\u{2009}".into(),
             ..Default::default()
         };
 
@@ -317,6 +328,10 @@ impl MarkdownStyle {
         self.base_text_style.color = colors.text_muted.blend(colors.text.opacity(0.25));
         self.inline_code.color = Some(colors.text);
         self.heading.text.color = Some(colors.text);
+
+        self.paragraph_line_height = rems(1.6).into();
+        self.inline_code.background_color = Some(colors.editor_foreground.opacity(0.16));
+        self.inline_code_padding = "\u{2002}".into();
 
         self.heading_level_styles = Some(HeadingLevelStyles {
             h1: Some(TextStyleRefinement {
@@ -1297,6 +1312,8 @@ impl MarkdownElement {
             None
         };
 
+        let pad = self.style.inline_code_padding.clone();
+        let pad_source_end = range.end + 1;
         if let Some(url) = link_url {
             builder.push_link(url.clone(), range.clone());
             let link_style = self
@@ -1306,9 +1323,14 @@ impl MarkdownElement {
                 .and_then(|callback| callback(url.as_ref(), cx))
                 .unwrap_or_else(|| self.style.link.clone());
             builder.push_text_style(self.style.inline_code.clone());
+            builder.append_styled_no_source(&pad);
             builder.push_text_style(link_style);
             builder.push_text(text, range);
             builder.pop_text_style();
+            builder.append_styled_no_source(&pad);
+            if !pad.is_empty() {
+                builder.current_source_index = pad_source_end;
+            }
             builder.pop_text_style();
         } else {
             let mut code_style = self.style.inline_code.clone();
@@ -1316,7 +1338,12 @@ impl MarkdownElement {
                 code_style.color = self.style.link.color.or(code_style.color);
             }
             builder.push_text_style(code_style);
+            builder.append_styled_no_source(&pad);
             builder.push_text(text, range);
+            builder.append_styled_no_source(&pad);
+            if !pad.is_empty() {
+                builder.current_source_index = pad_source_end;
+            }
             builder.pop_text_style();
         }
     }
@@ -1356,7 +1383,7 @@ impl MarkdownElement {
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
+            el.mb_2().line_height(self.style.paragraph_line_height)
         });
 
         paragraph = match align {
@@ -1586,7 +1613,7 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1().gap_1().line_height(self.style.paragraph_line_height)
                 })
                 .h_flex()
                 .items_start()
@@ -3192,6 +3219,20 @@ impl MarkdownElementBuilder {
         });
     }
 
+    /// Append rendered-only text (e.g. inline-code padding) using the current
+    /// text style, WITHOUT recording a source mapping. Because the next real
+    /// `push_text` records its mapping at the post-append rendered offset, these
+    /// characters fall outside every source range and are excluded from copy and
+    /// selection.
+    fn append_styled_no_source(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let text_style = self.text_style();
+        self.pending_line.text.push_str(text);
+        self.pending_line.runs.push(text_style.to_run(text.len()));
+    }
+
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
@@ -4350,6 +4391,91 @@ mod tests {
         // which extract directly from the source. With the bug, this would be 5..10
         // which includes the closing backtick at position 9.
         assert_eq!(word_range, 5..9);
+    }
+
+    fn render_markdown_with_style(
+        markdown: &str,
+        style: MarkdownStyle,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        struct StyleTestWindow;
+
+        impl Render for StyleTestWindow {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        ensure_theme_initialized(cx);
+
+        let (_, cx) = cx.add_window_view(|_, _| StyleTestWindow);
+        let markdown = cx.new(|cx| {
+            Markdown::new_with_options(
+                markdown.to_string().into(),
+                None,
+                None,
+                MarkdownOptions::default(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let (rendered, _) = cx.draw(
+            Default::default(),
+            size(px(600.0), px(600.0)),
+            |_window, _cx| {
+                MarkdownElement::new(markdown, style).code_block_renderer(
+                    CodeBlockRenderer::Default {
+                        copy_button_visibility: CopyButtonVisibility::Hidden,
+                        wrap_button_visibility: WrapButtonVisibility::Hidden,
+                        border: false,
+                    },
+                )
+            },
+        );
+        rendered.text
+    }
+
+    #[gpui::test]
+    fn test_inline_code_padding_present_in_rendered(cx: &mut TestAppContext) {
+        let style = MarkdownStyle {
+            inline_code_padding: "\u{2009}".into(),
+            ..MarkdownStyle::default()
+        };
+        let rendered = render_markdown_with_style("a `b` c", style, cx);
+        let line_text = rendered.lines.first().unwrap().layout.text();
+        assert!(
+            line_text.contains('\u{2009}'),
+            "expected thin-space padding around inline code, got {line_text:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_inline_code_padding_excluded_from_copy_midline(cx: &mut TestAppContext) {
+        let style = MarkdownStyle {
+            inline_code_padding: "\u{2009}".into(),
+            ..MarkdownStyle::default()
+        };
+        // "use `blah` here": code content "blah" at source 5..9
+        let rendered = render_markdown_with_style("use `blah` here", style, cx);
+
+        // Copy of the code content source range returns exactly "blah" (no pad).
+        assert_eq!(rendered.text_for_range(5..9), "blah");
+
+        // Double-click on the code still maps to source 5..9 and copies "blah".
+        let word_range = rendered.surrounding_word_range(6);
+        assert_eq!(word_range, 5..9);
+        assert_eq!(rendered.text_for_range(word_range), "blah");
+    }
+
+    #[gpui::test]
+    fn test_inline_code_padding_excluded_from_copy_end_of_line(cx: &mut TestAppContext) {
+        let style = MarkdownStyle {
+            inline_code_padding: "\u{2009}".into(),
+            ..MarkdownStyle::default()
+        };
+        // Code is the last thing on the line — exercises the source_end clamp edge.
+        let rendered = render_markdown_with_style("use `blah`", style, cx);
+        assert_eq!(rendered.text_for_range(5..9), "blah");
     }
 
     #[gpui::test]
