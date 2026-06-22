@@ -997,6 +997,38 @@ fn p4_unshelve_args(
     ]
 }
 
+/// `p4 revert <file>` — revert one file out of whatever changelist it is open in,
+/// restoring the depot `#have` content. p4 does not need the changelist number.
+/// Note: reverting a file opened for *add* leaves the local file on disk; the caller
+/// decides (with the user) whether to also delete it.
+/// Verified against vscode-perforce `src/api/commands/basicOps.ts` (`p4 revert`).
+fn p4_revert_args(client_name: &str, file: &RepoPath) -> Vec<String> {
+    vec![
+        "revert".to_string(),
+        format!("//{}/{}", client_name, file.as_unix_str()),
+    ]
+}
+
+/// `p4 shelve -c <changelist> <file>` — shelve one pending file into its changelist.
+/// p4 cannot shelve files that live in the default changelist, so `changelist` is always a
+/// numbered one (the panel disables Shelve for default-changelist files).
+/// Verified against vscode-perforce `src/api/commands/basicOps.ts` (`p4 shelve`).
+fn p4_shelve_args(client_name: &str, changelist: u32, file: &RepoPath) -> Vec<String> {
+    vec![
+        "shelve".to_string(),
+        "-c".to_string(),
+        changelist.to_string(),
+        format!("//{}/{}", client_name, file.as_unix_str()),
+    ]
+}
+
+/// Build a Helix Swarm changelist URL `<host>/changes/<chnum>`, mirroring the default
+/// behavior of the vscode-perforce `perforce.swarmHost` setting. A trailing slash on the
+/// configured host is trimmed so the path is not doubled.
+pub fn swarm_changelist_url(host: &str, chnum: u32) -> String {
+    format!("{}/changes/{}", host.trim_end_matches('/'), chnum)
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -1237,6 +1269,22 @@ impl GitRepository for PerforceRepository {
         shelved_source: Option<u32>,
     ) -> Task<Result<()>> {
         self.move_to_changelist(file, target, shelved_source)
+    }
+
+    /// Changes panel context menu: revert a single file (see [`Self::revert`]).
+    fn perforce_revert(&self, file: RepoPath) -> Task<Result<()>> {
+        self.revert(file)
+    }
+
+    /// Changes panel context menu: shelve a single file, optionally reverting it afterward
+    /// (see [`Self::shelve`]).
+    fn perforce_shelve(
+        &self,
+        changelist: u32,
+        file: RepoPath,
+        also_revert: bool,
+    ) -> Task<Result<()>> {
+        self.shelve(changelist, file, also_revert)
     }
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
@@ -1908,6 +1956,50 @@ impl PerforceRepository {
             Ok(())
         })
     }
+
+    /// `p4 revert <file>` — revert one file out of its changelist, restoring depot `#have`.
+    /// Reverting a file opened for *add* leaves the local file on disk; the caller (the panel)
+    /// decides, with the user, whether to delete it.
+    pub fn revert(&self, file: RepoPath) -> Task<Result<()>> {
+        let cli = self.cli.clone();
+        let args = p4_revert_args(&self.client_name, &file);
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
+            anyhow::ensure!(ok, "p4 revert failed: {stderr}");
+            log::info!("perforce: revert {} -> {}", file.as_unix_str(), stdout.trim_end());
+            Ok(())
+        })
+    }
+
+    /// `p4 shelve -c <changelist> <file>`, then (for "Shelve and Revert") `p4 revert <file>`.
+    /// The revert runs only after a successful shelve, so the shelf preserves the work before the
+    /// workspace copy is restored to depot `#have`. `changelist` must be numbered (p4 cannot
+    /// shelve from the default changelist).
+    pub fn shelve(&self, changelist: u32, file: RepoPath, also_revert: bool) -> Task<Result<()>> {
+        let cli = self.cli.clone();
+        let shelve_args = p4_shelve_args(&self.client_name, changelist, &file);
+        let revert_args = p4_revert_args(&self.client_name, &file);
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, stderr, ok) = cli.run_lenient(false, &shelve_args).await?;
+            anyhow::ensure!(ok, "p4 shelve failed: {stderr}");
+            log::info!(
+                "perforce: shelve {} -> changelist {} -> {}",
+                file.as_unix_str(),
+                changelist,
+                stdout.trim_end()
+            );
+            if also_revert {
+                let (rstdout, rstderr, rok) = cli.run_lenient(false, &revert_args).await?;
+                anyhow::ensure!(rok, "p4 revert (after shelve) failed: {rstderr}");
+                log::info!(
+                    "perforce: revert-after-shelve {} -> {}",
+                    file.as_unix_str(),
+                    rstdout.trim_end()
+                );
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2387,6 +2479,50 @@ line two
                 "-Af".to_string(),
                 "//c/a/b.md".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn revert_args_just_the_file() {
+        // Per-file revert from the context menu: `p4 revert <file>`. p4 reverts it out of
+        // whatever changelist it is open in, so no `-c` is needed.
+        let args = p4_revert_args("some_client_name", &repo_path("a/b.cpp"));
+        assert_eq!(
+            args,
+            vec![
+                "revert".to_string(),
+                "//some_client_name/a/b.cpp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shelve_args_into_numbered_changelist() {
+        // `p4 shelve -c <cl> <file>` — shelve one pending file into its (numbered) changelist.
+        // p4 cannot shelve from the default changelist, so the target is always numbered.
+        let args = p4_shelve_args("c", 6596347, &repo_path("a/b.cpp"));
+        assert_eq!(
+            args,
+            vec![
+                "shelve".to_string(),
+                "-c".to_string(),
+                "6596347".to_string(),
+                "//c/a/b.cpp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn swarm_url_appends_changes_path() {
+        // `<host>/changes/<chnum>`, mirroring vscode-perforce's default swarmHost handling.
+        assert_eq!(
+            swarm_changelist_url("https://swarm.example.com", 6596347),
+            "https://swarm.example.com/changes/6596347"
+        );
+        // A trailing slash on the host must not produce a double slash.
+        assert_eq!(
+            swarm_changelist_url("https://swarm.example.com/", 6596347),
+            "https://swarm.example.com/changes/6596347"
         );
     }
 

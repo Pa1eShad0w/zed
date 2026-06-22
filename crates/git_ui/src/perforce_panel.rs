@@ -9,29 +9,34 @@
 //! when the active repository is Perforce-backed, so git workspaces are completely unaffected.
 
 use collections::HashSet;
-use git::perforce::{ChangelistId, ChangelistFile, PerforceChangelist};
+use fs::RemoveOptions;
+use git::perforce::{ChangelistId, ChangelistFile, PerforceChangelist, swarm_changelist_url};
 use git::repository::RepoPath;
-use git::status::FileStatus;
+use git::status::{FileStatus, StageStatus};
 use gpui::{
-    Action, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, actions, rems, uniform_list,
+    Action, Anchor, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, actions, anchored, deferred, rems, uniform_list,
 };
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
+    project_settings::ProjectSettings,
 };
 use settings::Settings;
 use std::ops::Range;
 use util::ResultExt as _;
-use ui::{Scrollbars, WithScrollbar, prelude::*, tooltip_container};
+use ui::{ContextMenu, Scrollbars, Tab, Tooltip, WithScrollbar, prelude::*, tooltip_container};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::git_panel::GitPanel;
+use crate::git_panel::{GitPanel, GitStatusEntry};
 use crate::git_panel_settings::{GitPanelScrollbarAccessor, GitPanelSettings};
 use crate::git_status_icon;
+use crate::project_diff::ProjectDiff;
+use crate::solo_diff_view::SoloDiffView;
 
 actions!(
     perforce_panel,
@@ -110,6 +115,9 @@ pub struct PerforcePanel {
     active: bool,
     scroll_handle: UniformListScrollHandle,
     workspace: WeakEntity<Workspace>,
+    /// Right-click context menu for a file row: the menu entity, where it was opened, and the
+    /// dismiss subscription (mirrors `GitPanel`'s `context_menu`).
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     reload_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -126,7 +134,7 @@ impl PerforcePanel {
 
     fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let project = workspace.project().clone();
@@ -135,6 +143,16 @@ impl PerforcePanel {
         let workspace_handle = workspace.weak_handle();
 
         cx.new(|cx| {
+            // Refresh when the Zed window regains OS focus (the changelists may have changed via
+            // P4V or the CLI while Zed was in the background). `reload` is internally gated on the
+            // panel being the active/visible one and on a Perforce repo, so a background or
+            // git-only window does no `p4` work.
+            let window_activation =
+                cx.observe_window_activation(window, |this: &mut Self, window, cx| {
+                    if window.is_window_active() {
+                        this.reload(cx);
+                    }
+                });
             let subscription =
                 cx.subscribe(&git_store, |this: &mut Self, _git_store, event, cx| match event {
                 GitStoreEvent::ActiveRepositoryChanged(_)
@@ -153,7 +171,7 @@ impl PerforcePanel {
                 _ => {}
             });
 
-            let mut this = Self {
+            let this = Self {
                 project,
                 active_repository,
                 changelists: Vec::new(),
@@ -164,8 +182,9 @@ impl PerforcePanel {
                 active: false,
                 scroll_handle: UniformListScrollHandle::new(),
                 workspace: workspace_handle,
+                context_menu: None,
                 reload_task: Task::ready(()),
-                _subscriptions: vec![subscription],
+                _subscriptions: vec![subscription, window_activation],
             };
             // Initial population happens on `set_active(true)` when the panel is first shown;
             // while hidden we intentionally issue no `p4` queries.
@@ -384,6 +403,7 @@ impl PerforcePanel {
         } else {
             Color::Muted
         };
+        let menu_file = file.clone();
 
         h_flex()
             // A stable id makes the row interactive so gpui repaints its hover highlight on
@@ -449,7 +469,311 @@ impl PerforcePanel {
                         .color(Color::Accent),
                 )
             })
+            // Right-click opens the per-file context menu (revert / shelve / unshelve / diff /
+            // swarm), gated by the file's pending-vs-shelved state.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_file_context_menu(
+                        event.position,
+                        menu_file.clone(),
+                        source,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
+    }
+
+    /// Resolve the configured Swarm changelist URL for `chnum`, or `None` when `perforce.swarm_host`
+    /// is unset (the "View in Swarm" entry is then hidden).
+    fn swarm_url(&self, chnum: u32, cx: &App) -> Option<String> {
+        let host = ProjectSettings::get_global(cx).perforce.swarm_host.clone()?;
+        let host = host.trim();
+        (!host.is_empty()).then(|| swarm_changelist_url(host, chnum))
+    }
+
+    /// Store the freshly built context menu and subscribe to its dismissal (mirrors
+    /// `GitPanel::set_context_menu`).
+    fn set_context_menu(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
+                }) {
+                    cx.focus_self(window);
+                }
+                this.context_menu.take();
+                cx.notify();
+            },
+        );
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Build the right-click menu for a file row. Entries adapt to the file's state: shelve /
+    /// shelve-and-revert / revert are offered for pending files (and only when their changelist is
+    /// numbered, since p4 cannot shelve from the default changelist); unshelve only for shelved
+    /// files; "View in Swarm" only for a numbered changelist with a configured swarm host. Open
+    /// Diff is offered only for pending files (a shelved file has no working-tree diff).
+    fn deploy_file_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        file: ChangelistFile,
+        source: ChangelistId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        let numbered = match source {
+            ChangelistId::Numbered(n) => Some(n),
+            ChangelistId::Default => None,
+        };
+        let is_pending = !file.shelved;
+        let swarm = numbered.and_then(|n| self.swarm_url(n, cx));
+
+        let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            let mut menu = menu.context(self.focus_handle.clone());
+
+            // Diff entries — only meaningful for an opened (pending) file.
+            if is_pending {
+                let (f1, f2) = (file.clone(), file.clone());
+                let (w1, w2) = (weak.clone(), weak.clone());
+                menu = menu
+                    .entry("Open Diff", None, move |window, cx| {
+                        w1.update(cx, |this, cx| this.open_diff(&f1, false, window, cx))
+                            .ok();
+                    })
+                    .entry("Open Diff (File)", None, move |window, cx| {
+                        w2.update(cx, |this, cx| this.open_diff(&f2, true, window, cx))
+                            .ok();
+                    })
+                    .separator();
+            }
+
+            // Shelve / Shelve and Revert / Revert — pending files only. Shelve requires a numbered
+            // changelist.
+            if is_pending {
+                if let Some(chnum) = numbered {
+                    let (f1, f2) = (file.clone(), file.clone());
+                    let (w1, w2) = (weak.clone(), weak.clone());
+                    menu = menu
+                        .entry("Shelve", None, move |_window, cx| {
+                            w1.update(cx, |this, cx| {
+                                this.shelve_file(chnum, f1.path.clone(), false, cx)
+                            })
+                            .ok();
+                        })
+                        .entry("Shelve and Revert", None, move |_window, cx| {
+                            w2.update(cx, |this, cx| {
+                                this.shelve_file(chnum, f2.path.clone(), true, cx)
+                            })
+                            .ok();
+                        });
+                }
+                let f = file.clone();
+                let w = weak.clone();
+                menu = menu.entry("Revert", None, move |window, cx| {
+                    w.update(cx, |this, cx| this.revert_file(&f, window, cx)).ok();
+                });
+            }
+
+            // Unshelve — shelved files only. Restores the shelf into the same changelist.
+            if file.shelved {
+                if let Some(chnum) = numbered {
+                    let f = file.clone();
+                    let w = weak.clone();
+                    menu = menu.entry("Unshelve", None, move |_window, cx| {
+                        w.update(cx, |this, cx| this.unshelve_file(chnum, f.path.clone(), cx))
+                            .ok();
+                    });
+                }
+            }
+
+            // View in Swarm — needs a numbered changelist and a configured swarm host.
+            if let Some(url) = swarm.clone() {
+                menu = menu.separator().entry("View in Swarm", None, move |_window, cx| {
+                    cx.open_url(&url);
+                });
+            }
+
+            menu
+        });
+        self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// Open the file's diff. `solo` picks the single-file diff view ("Open Diff (File)"); otherwise
+    /// the project diff is deployed at this file ("Open Diff"). Reuses the git diff views, which are
+    /// backend-agnostic — the Perforce backend supplies the diff base via `load_committed_text`
+    /// (`p4 print #have`).
+    fn open_diff(
+        &mut self,
+        file: &ChangelistFile,
+        solo: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let entry = GitStatusEntry {
+            repo_path: file.path.clone(),
+            status: file.status,
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+        if solo {
+            SoloDiffView::open_or_focus(entry, repo, self.workspace.clone(), window, cx)
+                .detach_and_log_err(cx);
+        } else {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    ProjectDiff::deploy_at(workspace, Some(entry), window, cx);
+                })
+                .ok();
+        }
+    }
+
+    /// `p4 revert <file>`. For a file opened for *add*, p4 leaves the local file on disk, so first
+    /// ask whether to also delete it (default: keep). Reloads the panel afterward.
+    fn revert_file(&mut self, file: &ChangelistFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let path = file.path.clone();
+        // Reverting an added file leaves the (now un-added) file on disk; offer to delete it.
+        let delete_prompt = file.status.is_created().then(|| {
+            let abs = repo.read(cx).work_directory_abs_path.join(path.as_std_path());
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "Revert added file?",
+                Some(
+                    "The file will no longer be open for add. Keep the local file on disk, or also \
+                     delete it?",
+                ),
+                &["Keep File", "Delete File"],
+                cx,
+            );
+            (abs, prompt)
+        });
+        let fs = self.project.read(cx).fs().clone();
+        let revert = repo.read(cx).perforce_revert(path, cx);
+        // Detached (not stored in `reload_task`): a concurrent `reload()` must not cancel the
+        // delete-on-disk step or the final refresh.
+        cx.spawn(async move |this, cx| {
+            // Resolve the delete choice (index 1 == "Delete File"); the revert runs concurrently.
+            let to_delete = if let Some((abs, prompt)) = delete_prompt {
+                (prompt.await == Ok(1)).then_some(abs)
+            } else {
+                None
+            };
+            revert.await.log_err();
+            if let Some(abs) = to_delete {
+                fs.remove_file(
+                    &abs,
+                    RemoveOptions {
+                        recursive: false,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await
+                .log_err();
+            }
+            this.update(cx, |this, cx| this.reload(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// `p4 shelve -c <chnum> <file>`, optionally reverting afterward ("Shelve and Revert").
+    /// Reloads the panel when done.
+    fn shelve_file(
+        &mut self,
+        chnum: u32,
+        path: RepoPath,
+        also_revert: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let task = repo.read(cx).perforce_shelve(chnum, path, also_revert, cx);
+        cx.spawn(async move |this, cx| {
+            task.await.log_err();
+            this.update(cx, |this, cx| this.reload(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// `p4 unshelve -s <chnum> -c <chnum> -Af <file>` — restore the shelf into its own changelist
+    /// as an opened file (the shelf stays). Reuses `perforce_move_to_changelist` with the
+    /// changelist as both source and target. Reloads the panel when done.
+    fn unshelve_file(&mut self, chnum: u32, path: RepoPath, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let task = repo.read(cx).perforce_move_to_changelist(
+            path,
+            ChangelistId::Numbered(chnum),
+            Some(chnum),
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            task.await.log_err();
+            this.update(cx, |this, cx| this.reload(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Whether every changelist is currently expanded (drives the toolbar toggle).
+    fn all_expanded(&self) -> bool {
+        !self.changelists.is_empty()
+            && self.changelists.iter().all(|cl| self.expanded.contains(&cl.id))
+    }
+
+    /// Toolbar toggle: collapse all changelists if all are expanded, otherwise expand all.
+    fn toggle_all_expanded(&mut self, cx: &mut Context<Self>) {
+        if self.all_expanded() {
+            self.expanded.clear();
+        } else {
+            self.expanded = self.changelists.iter().map(|cl| cl.id).collect();
+        }
+        self.rebuild_entries();
+        cx.notify();
+    }
+
+    /// The toolbar above the changelist list: a single collapse-all / expand-all toggle, styled
+    /// like the git panel's header strip.
+    fn render_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let all_expanded = self.all_expanded();
+        let (icon, tooltip) = if all_expanded {
+            (IconName::ListCollapse, "Collapse All")
+        } else {
+            (IconName::ListTree, "Expand All")
+        };
+        h_flex()
+            .h(Tab::container_height(cx))
+            .w_full()
+            .flex_none()
+            .px_1()
+            .justify_end()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                IconButton::new("perforce-toggle-all", icon)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_all_expanded(cx))),
+            )
     }
 }
 
@@ -481,7 +805,8 @@ impl Render for PerforcePanel {
         }
 
         let entry_count = self.entries.len();
-        base.child(
+        base.child(self.render_toolbar(cx))
+            .child(
             // Parent of the virtualized list (like GitPanel): holds the `uniform_list` and the
             // themed scrollbar overlay, both wired to the shared scroll handle. Virtualization
             // keeps hundreds of files responsive.
@@ -525,6 +850,15 @@ impl Render for PerforcePanel {
                     cx,
                 ),
         )
+        .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+            deferred(
+                anchored()
+                    .position(*position)
+                    .anchor(Anchor::TopLeft)
+                    .child(menu.clone()),
+            )
+            .with_priority(1)
+        }))
     }
 }
 

@@ -588,9 +588,29 @@ pub struct GitSettings {
 /// the user works (the local read-only bit is what otherwise blocks saving). All default to
 /// `true`. They have no effect outside a Perforce workspace.
 #[with_fallible_options]
-#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct PerforceSettings {
+    /// Whether Perforce integration is enabled. When `false`, a `.p4config`
+    /// workspace is treated as a plain directory (no Perforce backend, no
+    /// auto-checkout, no Changes panel).
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Path to the `p4` command-line executable. When unset, `p4` is resolved
+    /// from the workspace `PATH`.
+    ///
+    /// Default: null
+    pub executable_path: Option<String>,
+    /// Base URL of your Helix Swarm server, used by the "View in Swarm" action.
+    /// The changelist link is formed as `<swarm_host>/changes/<changelist>`
+    /// (matching the vscode-perforce `perforce.swarmHost` setting). When unset,
+    /// the "View in Swarm" action is hidden.
+    ///
+    /// Example: `"https://swarm.example.com"`
+    ///
+    /// Default: null
+    pub swarm_host: Option<String>,
     /// Run `p4 edit` before saving a tracked, read-only file so the save succeeds.
     ///
     /// Default: true

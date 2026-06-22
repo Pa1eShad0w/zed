@@ -2651,6 +2651,15 @@ pub(super) fn render_diff_hunk_controls(
     let show_stage_restore = ProjectSettings::get_global(cx)
         .git
         .show_stage_restore_buttons;
+    // Perforce has no staging index, so the Stage/Unstage button is meaningless there. The
+    // Restore button is kept (it reverts the hunk to depot `#have`) but relabeled "Revert" to
+    // match Perforce terminology.
+    let is_perforce = editor
+        .read(cx)
+        .project()
+        .cloned()
+        .and_then(|project| project.read(cx).active_repository(cx))
+        .is_some_and(|repo| repo.read(cx).is_perforce());
 
     h_flex()
         .h(line_height)
@@ -2666,7 +2675,7 @@ pub(super) fn render_diff_hunk_controls(
         .gap_1()
         .block_mouse_except_scroll()
         .shadow_md()
-        .when(show_stage_restore, |el| {
+        .when(show_stage_restore && !is_perforce, |el| {
             el.child(if status.has_secondary_hunk() {
                 Button::new(("stage", row as u64), "Stage")
                     .alpha(if status.is_pending() { 0.66 } else { 1.0 })
@@ -2723,12 +2732,20 @@ pub(super) fn render_diff_hunk_controls(
         })
         .when(show_stage_restore, |el| {
             el.child(
-                Button::new(("restore", row as u64), "Restore")
+                Button::new(
+                    ("restore", row as u64),
+                    if is_perforce { "Revert" } else { "Restore" },
+                )
                     .tooltip({
                         let focus_handle = editor.focus_handle(cx);
+                        let tooltip_label = if is_perforce {
+                            "Revert Hunk"
+                        } else {
+                            "Restore Hunk"
+                        };
                         move |_window, cx| {
                             Tooltip::for_action_in(
-                                "Restore Hunk",
+                                tooltip_label,
                                 &::git::Restore,
                                 &focus_handle,
                                 cx,

@@ -405,7 +405,7 @@ impl LocalBufferStore {
     ) -> Option<(WeakEntity<GitStore>, git::perforce::P4OpenAction, ProjectPath)> {
         let git_store = self.git_store.clone()?;
 
-        let settings = ProjectSettings::get_global(cx).perforce;
+        let settings = ProjectSettings::get_global(cx).perforce.clone();
         let action = if is_new_file {
             if !settings.add_on_file_create {
                 return None;

@@ -444,18 +444,37 @@ impl LocalRepositoryState {
 
         // A `.p4config` marker (rather than a `.git` directory) means this work
         // directory is a Perforce workspace; build the Perforce backend instead of git.
-        let is_perforce = dot_git_abs_path
+        // The `perforce.enabled` setting (default true) can opt out entirely, in which
+        // case the workspace is treated as a plain directory.
+        let (p4_enabled, p4_executable_path) = cx.update(|cx| {
+            let p4 = &ProjectSettings::get_global(cx).perforce;
+            (p4.enabled, p4.executable_path.clone())
+        });
+        let marker_is_p4 = dot_git_abs_path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(git::perforce::is_p4_config_name);
+        // `perforce.enabled = false` opts out: a `.p4config` workspace becomes a plain directory.
+        // Bail cleanly here rather than fall through to the git branch (which would try, and fail,
+        // to open `.p4config` as a git repo with a misleading error).
+        anyhow::ensure!(
+            p4_enabled || !marker_is_p4,
+            "Perforce integration disabled (perforce.enabled = false); ignoring {dot_git_abs_path:?}"
+        );
+        let is_perforce = p4_enabled && marker_is_p4;
 
         let backend: Arc<dyn GitRepository> = if is_perforce {
-            let p4_binary_path = search_paths
-                .clone()
-                .and_then(|search_paths| {
-                    which::which_in("p4", Some(search_paths), &work_directory_abs_path).ok()
-                })
-                .or_else(|| which::which("p4").ok())
+            // Prefer the configured `perforce.executable_path`, otherwise resolve `p4`
+            // from the workspace `PATH`.
+            let configured_exe = p4_executable_path.as_deref().filter(|p| !p.is_empty());
+            let resolve_p4 = |exe: &str| {
+                which::which_in(exe, search_paths.clone(), &work_directory_abs_path)
+                    .or_else(|_| which::which(exe))
+                    .ok()
+            };
+            let p4_binary_path = configured_exe
+                .and_then(resolve_p4)
+                .or_else(|| resolve_p4("p4"))
                 .context("no p4 binary available")?;
             // Validate via `p4 info` — this also rejects a stray `.p4config` that is not
             // actually inside a usable Perforce workspace.
@@ -5180,6 +5199,43 @@ impl Repository {
                     backend
                         .perforce_move_to_changelist(file, target, shelved_source)
                         .await
+                }
+                RepositoryState::Remote(_) => Ok(()),
+            }
+        })
+    }
+
+    /// Perforce Changes panel context menu: revert a single file (`p4 revert`). No-op for
+    /// git/non-VCS repos and for remote projects (a host-local concern in the MVP).
+    pub fn perforce_revert(&self, file: RepoPath, cx: &App) -> Task<Result<()>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state.await.map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_revert(file).await
+                }
+                RepositoryState::Remote(_) => Ok(()),
+            }
+        })
+    }
+
+    /// Perforce Changes panel context menu: shelve a single file (`p4 shelve -c <cl>`), optionally
+    /// reverting it afterward ("Shelve and Revert"). No-op for git/non-VCS repos and for remote
+    /// projects (a host-local concern in the MVP).
+    pub fn perforce_shelve(
+        &self,
+        changelist: u32,
+        file: RepoPath,
+        also_revert: bool,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state.await.map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_shelve(changelist, file, also_revert).await
                 }
                 RepositoryState::Remote(_) => Ok(()),
             }

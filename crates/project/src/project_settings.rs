@@ -505,9 +505,15 @@ pub struct GitSettings {
     pub worktree_directory: String,
 }
 
-/// Resolved Perforce auto-checkout switches. All default to `true`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Resolved Perforce settings. Auto-checkout switches all default to `true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerforceSettings {
+    /// Whether Perforce integration is enabled. Default: true.
+    pub enabled: bool,
+    /// Path to the `p4` executable, or `None` to resolve from `PATH`.
+    pub executable_path: Option<String>,
+    /// Base URL of the Helix Swarm server, or `None` to hide "View in Swarm".
+    pub swarm_host: Option<String>,
     /// Run `p4 edit` before saving a tracked, read-only file.
     pub edit_on_file_save: bool,
     /// Run `p4 edit` the first time an open buffer is modified.
@@ -525,6 +531,9 @@ pub struct PerforceSettings {
 impl Default for PerforceSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
+            executable_path: None,
+            swarm_host: None,
             edit_on_file_save: true,
             edit_on_file_modified: true,
             add_on_file_create: true,
@@ -732,6 +741,13 @@ impl Settings for ProjectSettings {
             let p4 = content.perforce.as_ref();
             let default = PerforceSettings::default();
             PerforceSettings {
+                enabled: p4.and_then(|p| p.enabled).unwrap_or(default.enabled),
+                executable_path: p4
+                    .and_then(|p| p.executable_path.clone())
+                    .or(default.executable_path),
+                swarm_host: p4
+                    .and_then(|p| p.swarm_host.clone())
+                    .or(default.swarm_host),
                 edit_on_file_save: p4
                     .and_then(|p| p.edit_on_file_save)
                     .unwrap_or(default.edit_on_file_save),

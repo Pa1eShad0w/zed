@@ -1126,6 +1126,24 @@ pub trait GitRepository: Send + Sync {
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))
     }
+
+    /// Perforce Changes panel context menu: `p4 revert <file>`. A **no-op** for non-Perforce
+    /// backends. Only the Perforce backend overrides it.
+    fn perforce_revert(&self, _file: RepoPath) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    /// Perforce Changes panel context menu: `p4 shelve -c <changelist> <file>`, optionally
+    /// reverting the file afterward (the "Shelve and Revert" action). A **no-op** for non-Perforce
+    /// backends. Only the Perforce backend overrides it.
+    fn perforce_shelve(
+        &self,
+        _changelist: u32,
+        _file: RepoPath,
+        _also_revert: bool,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
 }
 
 pub enum DiffType {
