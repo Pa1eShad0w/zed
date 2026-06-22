@@ -112,6 +112,13 @@ pub struct MarkdownStyle {
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
+    /// Line height applied to body paragraphs and list items.
+    pub paragraph_line_height: DefiniteLength,
+    /// Whitespace inserted on each side of inline code spans to give the
+    /// highlighted background horizontal breathing room. Empty = none.
+    /// These characters are rendered-only (no source mapping) so they never
+    /// reach the clipboard or selection.
+    pub inline_code_padding: SharedString,
 }
 
 impl Default for MarkdownStyle {
@@ -136,6 +143,8 @@ impl Default for MarkdownStyle {
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
+            paragraph_line_height: rems(1.3).into(),
+            inline_code_padding: SharedString::default(),
         }
     }
 }
@@ -1356,7 +1365,7 @@ impl MarkdownElement {
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
+            el.mb_2().line_height(self.style.paragraph_line_height)
         });
 
         paragraph = match align {
@@ -1586,7 +1595,7 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1().gap_1().line_height(self.style.paragraph_line_height)
                 })
                 .h_flex()
                 .items_start()
