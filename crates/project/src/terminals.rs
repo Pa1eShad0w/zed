@@ -404,7 +404,7 @@ impl Project {
 
             let builder = project
                 .update(cx, move |_, cx| {
-                    let (shell, env) = {
+                    let (shell, mut env) = {
                         match remote_client {
                             Some(remote_client) => {
                                 create_remote_shell(None, env, path, remote_client, cx)?
@@ -412,6 +412,20 @@ impl Project {
                             None => (settings.shell, env),
                         }
                     };
+                    // Pin `PWD` to the terminal's actual working directory. Without this the
+                    // environment can carry a stale `PWD` inherited from wherever Zed was launched,
+                    // and tools that resolve config from `PWD` rather than the real cwd then look in
+                    // the wrong directory (e.g. `p4` failing to find the workspace `.p4config`).
+                    if let Some(local_path) = local_path.as_ref() {
+                        let pwd = local_path
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                            .trim_end_matches('/')
+                            .to_string();
+                        if !pwd.is_empty() {
+                            env.insert("PWD".to_string(), pwd);
+                        }
+                    }
                     anyhow::Ok(TerminalBuilder::new(
                         local_path.map(|path| path.to_path_buf()),
                         None,

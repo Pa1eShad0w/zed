@@ -160,6 +160,14 @@ impl P4Cli {
         }
         command.args(args);
         command.envs(self.envs.as_ref());
+        // Pin `PWD` to the working directory: `p4` resolves `.p4config` from `PWD` (not just the
+        // process cwd), and the inherited environment can carry a stale `PWD` from wherever Zed was
+        // launched, which would make `p4` search the wrong directory. (vscode-perforce sets `PWD`
+        // for the same reason.)
+        command.env(
+            "PWD",
+            self.working_directory.to_string_lossy().replace('\\', "/"),
+        );
         // Pin P4CONFIG last so it overrides any inherited/captured value. An absolute path makes
         // `p4` read exactly this workspace's config regardless of cwd (verified: resolves the
         // correct client even from an unrelated working directory).
