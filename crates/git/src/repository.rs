@@ -139,6 +139,30 @@ impl CommitDataReader {
             .map_err(|_| anyhow!("commit data reader task dropped response"))?
     }
 
+    /// Build a reader that resolves each commit via an async `resolve` closure. Used by backends
+    /// (such as Perforce) that fetch commit data per-request — e.g. `p4 describe` — instead of via
+    /// a long-lived streaming process like git's `cat-file --batch`.
+    pub fn from_async_resolver<Fut>(
+        executor: BackgroundExecutor,
+        resolve: impl 'static + Send + Sync + Fn(Oid) -> Fut,
+    ) -> Self
+    where
+        Fut: std::future::Future<Output = Result<CommitData>> + Send + 'static,
+    {
+        let (request_tx, request_rx) = async_channel::bounded::<CommitDataRequest>(64);
+        let resolve = Arc::new(resolve);
+        let task = executor.spawn(async move {
+            while let Ok(CommitDataRequest { sha, response_tx }) = request_rx.recv().await {
+                response_tx.send(resolve(sha).await).ok();
+            }
+        });
+
+        Self {
+            request_tx,
+            _task: task,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
         executor: BackgroundExecutor,
@@ -1143,6 +1167,12 @@ pub trait GitRepository: Send + Sync {
         _also_revert: bool,
     ) -> Task<Result<()>> {
         Task::ready(Ok(()))
+    }
+
+    /// The set of opened files that are behind head revision, for the out-of-date badge. An empty
+    /// set for non-Perforce backends. Only the Perforce backend overrides it.
+    fn perforce_out_of_date_paths(&self) -> Task<Result<collections::HashSet<RepoPath>>> {
+        Task::ready(Ok(collections::HashSet::default()))
     }
 }
 

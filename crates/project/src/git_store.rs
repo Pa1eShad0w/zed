@@ -5242,6 +5242,24 @@ impl Repository {
         })
     }
 
+    /// Perforce out-of-date badge: the set of opened files behind head revision. Empty for
+    /// git/non-VCS repos and for remote projects (a host-local concern in the MVP).
+    pub fn perforce_out_of_date_paths(
+        &self,
+        cx: &App,
+    ) -> Task<Result<collections::HashSet<RepoPath>>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state.await.map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_out_of_date_paths().await
+                }
+                RepositoryState::Remote(_) => Ok(collections::HashSet::default()),
+            }
+        })
+    }
+
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }

@@ -11,7 +11,7 @@
 use collections::HashSet;
 use fs::RemoveOptions;
 use git::perforce::{ChangelistId, ChangelistFile, PerforceChangelist, swarm_changelist_url};
-use git::repository::RepoPath;
+use git::repository::{LogSource, RepoPath};
 use git::status::{FileStatus, StageStatus};
 use gpui::{
     Action, Anchor, DismissEvent, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
@@ -32,6 +32,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use crate::git_graph::open_or_reuse_graph;
 use crate::git_panel::{GitPanel, GitStatusEntry};
 use crate::git_panel_settings::{GitPanelScrollbarAccessor, GitPanelSettings};
 use crate::git_status_icon;
@@ -107,6 +108,9 @@ pub struct PerforcePanel {
     /// Changelists whose files are expanded. Absent = collapsed, so the panel starts with every
     /// changelist collapsed.
     expanded: HashSet<ChangelistId>,
+    /// Opened files behind head revision (`have < head`), re-fetched on each reload. Drives the
+    /// out-of-date badge on file rows. Empty for non-Perforce repos.
+    out_of_date: HashSet<RepoPath>,
     focus_handle: FocusHandle,
     position: DockPosition,
     /// Whether the panel is the active (visible) one in its dock. We only query `p4` while the
@@ -177,6 +181,7 @@ impl PerforcePanel {
                 changelists: Vec::new(),
                 entries: Vec::new(),
                 expanded: HashSet::default(),
+                out_of_date: HashSet::default(),
                 focus_handle: cx.focus_handle(),
                 position: DockPosition::Left,
                 active: false,
@@ -217,10 +222,15 @@ impl PerforcePanel {
             return;
         };
         let task = repo.read(cx).perforce_changelists(cx);
+        // Out-of-date set runs on the background executor (`p4 fstat -Ro`), so it never blocks the
+        // render thread; the rows just gain their badge once it resolves.
+        let stale_task = repo.read(cx).perforce_out_of_date_paths(cx);
         self.reload_task = cx.spawn(async move |this, cx| {
+            let stale = stale_task.await.unwrap_or_default();
             if let Ok(groups) = task.await {
                 this.update(cx, |this, cx| {
                     this.changelists = groups;
+                    this.out_of_date = stale;
                     this.rebuild_entries();
                     cx.notify();
                 })
@@ -387,6 +397,27 @@ impl PerforcePanel {
             .into_any_element()
     }
 
+    /// The file's status icon, overlaid with a small warning triangle at the bottom-left when the
+    /// file is out of date (a newer head revision exists), reusing the diagnostic-triangle style.
+    fn render_file_icon(&self, file: &ChangelistFile) -> AnyElement {
+        let icon = git_status_icon(file.status);
+        if self.out_of_date.contains(&file.path) {
+            div()
+                .relative()
+                .child(icon)
+                .child(
+                    div().absolute().bottom(px(-2.)).left(px(-3.)).child(
+                        Icon::new(IconName::Triangle)
+                            .size(IconSize::Indicator)
+                            .color(Color::Warning),
+                    ),
+                )
+                .into_any_element()
+        } else {
+            icon.into_any_element()
+        }
+    }
+
     fn render_file_row(
         &self,
         file: &ChangelistFile,
@@ -447,7 +478,7 @@ impl PerforcePanel {
                     .min_w_0()
                     .flex_1()
                     .gap_1()
-                    .child(git_status_icon(file.status))
+                    .child(self.render_file_icon(file))
                     .child(
                         h_flex()
                             .min_w_0()
@@ -557,6 +588,18 @@ impl PerforcePanel {
                     .entry("Open Diff (File)", None, move |window, cx| {
                         w2.update(cx, |this, cx| this.open_diff(&f2, true, window, cx))
                             .ok();
+                    });
+            }
+            // File history applies to any file (pending or shelved).
+            {
+                let f = file.clone();
+                let w = weak.clone();
+                menu = menu
+                    .entry("View File History", None, move |window, cx| {
+                        w.update(cx, |this, cx| {
+                            this.view_file_history(f.path.clone(), window, cx)
+                        })
+                        .ok();
                     })
                     .separator();
             }
@@ -610,6 +653,29 @@ impl PerforcePanel {
             menu
         });
         self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// Open the file's revision history in the commit-graph view (reusing git's GitGraph via
+    /// `LogSource::Path`). The Perforce backend feeds it `p4 filelog` revisions.
+    fn view_file_history(&mut self, path: RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let repo_id = repo.read(cx).id;
+        let git_store = self.project.read(cx).git_store().clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                open_or_reuse_graph(
+                    workspace,
+                    repo_id,
+                    git_store,
+                    LogSource::Path(path),
+                    None,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
     }
 
     /// Open the file's diff. `solo` picks the single-file diff view ("Open Diff (File)"); otherwise

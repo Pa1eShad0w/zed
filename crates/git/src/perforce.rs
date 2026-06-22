@@ -17,20 +17,23 @@
 
 use crate::blame::{Blame, BlameEntry};
 use crate::repository::{
-    AskPassDelegate, BranchesScanResult, CommitDetails, CommitDiff, CommitOptions, CreateWorktreeTarget,
-    DiffType, FetchOptions, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+    AskPassDelegate, BranchesScanResult, CommitData, CommitDataReader, CommitDetails, CommitDiff,
+    CommitFile, CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, GitCommitTemplate,
+    GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
     PushOptions, RemoteCommandOutput, RepoPath, ResetMode,
 };
 use crate::{Oid, RunHook};
 use crate::stash::GitStash;
 use crate::status::{DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff};
 use anyhow::{Context as _, Result};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use parking_lot::Mutex;
 use rope::Rope;
+use smallvec::SmallVec;
+use std::str::FromStr as _;
 use std::time::SystemTime;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -641,6 +644,148 @@ fn change_to_oid(change: u32) -> Oid {
     Oid::from_bytes(&bytes).expect("20 bytes is a valid SHA-1 oid")
 }
 
+/// Inverse of [`change_to_oid`]: recover a change number from its synthetic Oid (the file-history
+/// graph uses these Oids as commit ids, so the commit-data reader decodes them back).
+fn oid_to_change(oid: &Oid) -> u32 {
+    let bytes = oid.as_bytes();
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// One revision of a file from `p4 filelog -l -t <path>` (newest first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilelogRev {
+    rev: u32,
+    change: u32,
+    action: String,
+    user: String,
+    /// Unix epoch seconds (from the `-t` timestamp), if parseable.
+    time: Option<i64>,
+    /// Full changelist description (tab-indented lines joined), from `-l`.
+    desc: String,
+}
+
+/// Parse the text output of `p4 filelog -l -t <path>` into one [`FilelogRev`] per revision.
+///
+/// The non-`-ztag` text form is used (mirroring vscode-perforce's `filelog.ts`) because it frames
+/// the multi-line description cleanly: a depot-path header line, then one `... #<rev> change ...`
+/// record per revision, with the description on following tab-indented lines. Integration records
+/// (`... ... <op> from/into //depot#n`) and blank lines are ignored.
+fn parse_filelog(output: &str) -> Vec<FilelogRev> {
+    let mut revs: Vec<FilelogRev> = Vec::new();
+    let mut desc_lines: Vec<String> = Vec::new();
+    let flush = |revs: &mut Vec<FilelogRev>, desc_lines: &mut Vec<String>| {
+        if let Some(last) = revs.last_mut() {
+            last.desc = desc_lines.join("\n").trim_end().to_string();
+        }
+        desc_lines.clear();
+    };
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix("... #") {
+            flush(&mut revs, &mut desc_lines);
+            if let Some(rev) = parse_filelog_header(header) {
+                revs.push(rev);
+            }
+        } else if let Some(desc) = line.strip_prefix('\t') {
+            desc_lines.push(desc.to_string());
+        }
+        // Everything else (depot-path header, `... ...` integration lines, blanks) is ignored.
+    }
+    flush(&mut revs, &mut desc_lines);
+    revs
+}
+
+/// Parse a filelog header body (the part after `... #`): `<rev> change <chnum> <action> on <date>
+/// by <user>@<client> (<type>)`.
+fn parse_filelog_header(s: &str) -> Option<FilelogRev> {
+    let (rev_str, rest) = s.split_once(" change ")?;
+    let rev = rev_str.trim().parse::<u32>().ok()?;
+    let (change_str, rest) = rest.split_once(' ')?;
+    let change = change_str.trim().parse::<u32>().ok()?;
+    // `<action> on <date...> by <user>@<client> (<type>)`. The date may include a time component
+    // (with `-t`), so split on the ` on `/` by ` markers rather than counting whitespace tokens.
+    let (action, rest) = rest.split_once(" on ")?;
+    let (date_part, rest) = rest.split_once(" by ")?;
+    let user = rest.split('@').next()?.trim().to_string();
+    Some(FilelogRev {
+        rev,
+        change,
+        action: action.trim().to_string(),
+        user,
+        time: parse_p4_datetime(date_part.trim()),
+        desc: String::new(),
+    })
+}
+
+/// Parse `p4 -ztag describe -s <change>` into the change's changed files as
+/// `(depotFile, rev, action)`, read from the indexed `depotFile{i}` / `rev{i}` / `action{i}`
+/// fields. Robust to a description that contains a blank line (which `parse_ztag` would split into
+/// a second record): the indexed file fields are collected from whichever record holds them.
+fn parse_describe_files(ztag_output: &str) -> Vec<(String, u32, String)> {
+    let mut out = Vec::new();
+    for record in parse_ztag(ztag_output) {
+        let mut i = 0;
+        while let Some(depot) = record.get(&format!("depotFile{i}")) {
+            let rev = record
+                .get(&format!("rev{i}"))
+                .and_then(|r| r.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            let action = record
+                .get(&format!("action{i}"))
+                .map(|a| a.trim().to_string())
+                .unwrap_or_default();
+            out.push((depot.trim().to_string(), rev, action));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Parse `p4 -ztag where <depot...>` into a depot-path → client-path map (`//client/...`), used to
+/// turn the depot paths from `describe` into workspace repo paths without hardcoding the stream
+/// root (the client view does the mapping).
+fn parse_where(ztag_output: &str) -> HashMap<String, String> {
+    parse_ztag(ztag_output)
+        .into_iter()
+        .filter_map(|record| {
+            let depot = record.get("depotFile")?.trim().to_string();
+            let client = record.get("clientFile")?.trim().to_string();
+            Some((depot, client))
+        })
+        .collect()
+}
+
+/// Parse `p4 -ztag fstat -Ro //client/...` into the set of *opened* files whose synced revision is
+/// behind the head revision (`haveRev < headRev`). `-Ro` restricts the scan to opened files, so
+/// this never walks the whole (potentially huge) workspace. Files with no head/have revision (e.g.
+/// opened for add) are not out of date.
+fn parse_out_of_date(client_name: &str, fstat_output: &str) -> HashSet<RepoPath> {
+    parse_ztag(fstat_output)
+        .into_iter()
+        .filter_map(|record| {
+            let have = record.get("haveRev")?.trim().parse::<u64>().ok()?;
+            let head = record.get("headRev")?.trim().parse::<u64>().ok()?;
+            if have >= head {
+                return None;
+            }
+            client_path_to_repo_path(client_name, record.get("clientFile")?)
+        })
+        .collect()
+}
+
+/// Build the file-history [`CommitData`] for one filelog revision. `parent` is the next-older
+/// revision's change number (the linear history parent); B1b integration branching is future work.
+fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitData {
+    CommitData {
+        sha: change_to_oid(rev.change),
+        parents: parent.map(change_to_oid).into_iter().collect(),
+        author_name: rev.user.clone().into(),
+        author_email: SharedString::default(),
+        commit_timestamp: rev.time.unwrap_or(0),
+        subject: rev.desc.lines().next().unwrap_or_default().to_string().into(),
+        message: rev.desc.clone().into(),
+    }
+}
+
 /// One annotated file line from `p4 -ztag annotate -c -u -i`.
 #[derive(Debug, Clone)]
 struct AnnotatedLine {
@@ -1050,6 +1195,9 @@ pub struct PerforceRepository {
     /// re-running the slow `p4 annotate` when the file hasn't changed (e.g. focus switches,
     /// or the editor's debounced re-blame while a buffer has unsaved edits).
     blame_cache: Arc<Mutex<HashMap<RepoPath, BlameCacheEntry>>>,
+    /// File-history commit data (keyed by change number) populated by `initial_graph_data` so the
+    /// commit-data reader and `show` can serve rows without re-querying `p4`.
+    history_cache: Arc<Mutex<HashMap<u32, CommitData>>>,
     is_trusted: Arc<AtomicBool>,
 }
 
@@ -1093,6 +1241,7 @@ impl PerforceRepository {
             client_name: workspace.client_name,
             max_history_count,
             blame_cache: Arc::new(Mutex::new(HashMap::default())),
+            history_cache: Arc::new(Mutex::new(HashMap::default())),
             is_trusted: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1287,6 +1436,11 @@ impl GitRepository for PerforceRepository {
         self.shelve(changelist, file, also_revert)
     }
 
+    /// Out-of-date badge data: opened files behind head revision (see [`Self::out_of_date_paths`]).
+    fn perforce_out_of_date_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
+        self.out_of_date_paths()
+    }
+
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
 
     fn load_index_text(&self, _path: RepoPath) -> BoxFuture<'_, Option<String>> {
@@ -1403,12 +1557,106 @@ impl GitRepository for PerforceRepository {
         unsupported_result!()
     }
 
-    fn show(&self, _commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
-        unsupported_result!()
+    /// File-history commit metadata (author/time/description) for a change. Serves from the
+    /// `initial_graph_data` cache, falling back to `p4 describe -s <change>`.
+    fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
+        let cli = self.cli.clone();
+        let cache = self.history_cache.clone();
+        self.cli
+            .executor
+            .clone()
+            .spawn(async move {
+                let change = Oid::from_str(&commit)
+                    .ok()
+                    .map(|oid| oid_to_change(&oid))
+                    .context("invalid Perforce commit id")?;
+                if let Some(data) = cache.lock().get(&change).cloned() {
+                    return Ok(CommitDetails {
+                        sha: commit.into(),
+                        message: data.message,
+                        commit_timestamp: data.commit_timestamp,
+                        author_email: data.author_email,
+                        author_name: data.author_name,
+                    });
+                }
+                let change_str = change.to_string();
+                let out = cli.run(true, &["describe", "-s", &change_str]).await?;
+                let meta = parse_describe_meta(&out)
+                    .get(&change)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(CommitDetails {
+                    sha: commit.into(),
+                    message: meta.summary.clone().unwrap_or_default().into(),
+                    commit_timestamp: meta.time.unwrap_or(0),
+                    author_email: SharedString::default(),
+                    author_name: meta.user.unwrap_or_default().into(),
+                })
+            })
+            .boxed()
     }
 
-    fn load_commit(&self, _commit: String, _cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
-        unsupported_result!()
+    /// The per-file diff of a change, for the CommitView opened from file history. `describe`
+    /// lists the changed files (depot paths + their revs); `where` maps those to workspace repo
+    /// paths (without hardcoding the stream root); `print` fetches the new (`#rev`) and old
+    /// (`#rev-1`) content for the editor to diff.
+    fn load_commit(&self, commit: String, _cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
+        let cli = self.cli.clone();
+        let client_name = self.client_name.clone();
+        self.cli.executor.clone().spawn(async move {
+            let change = Oid::from_str(&commit)
+                .ok()
+                .map(|oid| oid_to_change(&oid))
+                .context("invalid Perforce commit id")?;
+            let change_str = change.to_string();
+            let describe_out = cli.run(true, &["describe", "-s", &change_str]).await?;
+            let files = parse_describe_files(&describe_out);
+            if files.is_empty() {
+                return Ok(CommitDiff { files: Vec::new() });
+            }
+
+            // One `p4 where` maps every depot path in the change to its client path.
+            let mut where_args = vec!["where".to_string()];
+            where_args.extend(files.iter().map(|(depot, _, _)| depot.clone()));
+            let where_out = cli.run(true, &where_args).await.unwrap_or_default();
+            let depot_to_client = parse_where(&where_out);
+
+            let mut commit_files = Vec::new();
+            for (depot, rev, action) in files {
+                let Some(repo_path) = depot_to_client
+                    .get(&depot)
+                    .and_then(|client| client_path_to_repo_path(&client_name, client))
+                else {
+                    continue;
+                };
+                let is_add = matches!(action.as_str(), "add" | "branch" | "import" | "move/add");
+                let is_delete = matches!(action.as_str(), "delete" | "move/delete" | "purge");
+                let new_text = if is_delete {
+                    None
+                } else {
+                    cli.run(false, &["print", "-q", &format!("{depot}#{rev}")])
+                        .await
+                        .ok()
+                };
+                let old_text = if is_add || rev <= 1 {
+                    None
+                } else {
+                    cli.run(false, &["print", "-q", &format!("{depot}#{}", rev - 1)])
+                        .await
+                        .ok()
+                };
+                commit_files.push(CommitFile {
+                    path: repo_path,
+                    old_text,
+                    new_text,
+                    is_binary: false,
+                });
+            }
+            Ok(CommitDiff {
+                files: commit_files,
+            })
+        })
+        .boxed()
     }
 
     fn blame(
@@ -1713,13 +1961,57 @@ impl GitRepository for PerforceRepository {
         async { Ok(None) }.boxed()
     }
 
+    /// File history (the "View File History" action): stream the file's revisions as graph
+    /// commits. `p4 filelog -l -t -m <max>` gives the linear revision list (newest first); each
+    /// revision becomes a commit whose parent is the next-older revision (B1b integration branching
+    /// is future work). The per-change [`CommitData`] is cached so the commit-data reader and
+    /// `show` need no further `p4` calls. Only `LogSource::Path` is supported.
     fn initial_graph_data(
         &self,
-        _log_source: crate::repository::LogSource,
-        _log_order: crate::repository::LogOrder,
-        _request_tx: async_channel::Sender<Vec<Arc<crate::repository::InitialGraphCommitData>>>,
+        log_source: LogSource,
+        _log_order: LogOrder,
+        request_tx: async_channel::Sender<Vec<Arc<InitialGraphCommitData>>>,
     ) -> BoxFuture<'_, Result<()>> {
-        unsupported_result!()
+        let LogSource::Path(path) = log_source else {
+            return async {
+                anyhow::bail!("Perforce only supports per-file history (View File History)")
+            }
+            .boxed();
+        };
+        let cli = self.cli.clone();
+        let client_path = self.client_syntax_path(&path);
+        let max = self.max_history_count;
+        let cache = self.history_cache.clone();
+        async move {
+            let max_arg = max.to_string();
+            let args = [
+                "filelog",
+                "-l",
+                "-t",
+                "-m",
+                max_arg.as_str(),
+                client_path.as_str(),
+            ];
+            let out = cli.run(false, &args).await?;
+            let revs = parse_filelog(&out);
+            let mut initial = Vec::with_capacity(revs.len());
+            {
+                let mut cache = cache.lock();
+                for (i, rev) in revs.iter().enumerate() {
+                    let parent = revs.get(i + 1).map(|r| r.change);
+                    let data = filelog_rev_to_commit_data(rev, parent);
+                    initial.push(Arc::new(InitialGraphCommitData {
+                        sha: data.sha,
+                        parents: data.parents.clone(),
+                        ref_names: Vec::new(),
+                    }));
+                    cache.insert(rev.change, data);
+                }
+            }
+            request_tx.send(initial).await.ok();
+            Ok(())
+        }
+        .boxed()
     }
 
     fn search_commits(
@@ -1739,8 +2031,38 @@ impl GitRepository for PerforceRepository {
         unsupported_result!()
     }
 
-    fn commit_data_reader(&self) -> Result<crate::repository::CommitDataReader> {
-        anyhow::bail!(UNSUPPORTED)
+    /// Resolve per-commit file-history data on demand. Serves from the `initial_graph_data` cache
+    /// (the common case — the rows being displayed), falling back to `p4 describe -s <change>` for
+    /// a change not in the cache.
+    fn commit_data_reader(&self) -> Result<CommitDataReader> {
+        let cli = self.cli.clone();
+        let cache = self.history_cache.clone();
+        let executor = self.cli.executor.clone();
+        Ok(CommitDataReader::from_async_resolver(executor, move |oid| {
+            let cli = cli.clone();
+            let cache = cache.clone();
+            async move {
+                let change = oid_to_change(&oid);
+                if let Some(data) = cache.lock().get(&change).cloned() {
+                    return Ok(data);
+                }
+                let change_str = change.to_string();
+                let out = cli.run(true, &["describe", "-s", &change_str]).await?;
+                let meta = parse_describe_meta(&out)
+                    .get(&change)
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(CommitData {
+                    sha: oid,
+                    parents: SmallVec::new(),
+                    author_name: meta.user.unwrap_or_default().into(),
+                    author_email: SharedString::default(),
+                    commit_timestamp: meta.time.unwrap_or(0),
+                    subject: meta.summary.clone().unwrap_or_default().into(),
+                    message: meta.summary.unwrap_or_default().into(),
+                })
+            }
+        }))
     }
 
     fn update_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
@@ -1998,6 +2320,24 @@ impl PerforceRepository {
                 );
             }
             Ok(())
+        })
+    }
+
+    /// The set of *opened* workspace files whose synced revision is behind the head revision
+    /// (`p4 fstat -Ro`). `-Ro` scans only opened files, so this never walks the whole workspace —
+    /// safe for very large clients. Used to badge out-of-date files in the Changes and project
+    /// panels.
+    pub fn out_of_date_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
+        let cli = self.cli.clone();
+        let client_name = self.client_name.clone();
+        let glob = format!("//{client_name}/...");
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, _stderr, ok) = cli.run_lenient(true, &["fstat", "-Ro", &glob]).await?;
+            if !ok {
+                // No opened files (or transient error) — nothing to flag.
+                return Ok(HashSet::default());
+            }
+            Ok(parse_out_of_date(&client_name, &stdout))
         })
     }
 }
@@ -2480,6 +2820,134 @@ line two
                 "//c/a/b.md".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn out_of_date_flags_only_stale_opened_files() {
+        // `p4 -ztag fstat -Ro //client/...` reports opened files with haveRev/headRev. A file is
+        // out of date when haveRev < headRev. Added files (no revs) and up-to-date files are not.
+        let ztag = "\
+... depotFile //Depot.Project/Release/branch_x/a/stale.cpp
+... clientFile //some_client_name/a/stale.cpp
+... headRev 5
+... haveRev 3
+... action edit
+
+... depotFile //Depot.Project/Release/branch_x/b/current.cpp
+... clientFile //some_client_name/b/current.cpp
+... headRev 7
+... haveRev 7
+... action edit
+
+... depotFile //Depot.Project/Release/branch_x/c/added.md
+... clientFile //some_client_name/c/added.md
+... action add
+";
+        let stale = parse_out_of_date("some_client_name", ztag);
+        assert_eq!(stale.len(), 1);
+        assert!(stale.contains(&repo_path("a/stale.cpp")));
+        assert!(!stale.contains(&repo_path("b/current.cpp")));
+        assert!(!stale.contains(&repo_path("c/added.md")));
+    }
+
+    #[test]
+    fn describe_files_parse_indexed_records() {
+        // `p4 -ztag describe -s <change>` lists changed files as indexed fields depotFile0/rev0/
+        // action0, depotFile1/... (synthetic fixture).
+        let ztag = "\
+... change 6596347
+... user someuser
+... time 1700000000
+... depotFile0 //Depot.Project/Release/branch_x/a/b.cpp
+... action0 edit
+... type0 text
+... rev0 3
+... depotFile1 //Depot.Project/Release/branch_x/c/new.md
+... action1 add
+... type1 text
+... rev1 1
+";
+        let files = parse_describe_files(ztag);
+        assert_eq!(
+            files,
+            vec![
+                ("//Depot.Project/Release/branch_x/a/b.cpp".to_string(), 3, "edit".to_string()),
+                ("//Depot.Project/Release/branch_x/c/new.md".to_string(), 1, "add".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn where_maps_depot_to_client() {
+        // `p4 -ztag where <depot...>` maps depot paths to client paths (synthetic fixture).
+        let ztag = "\
+... depotFile //Depot.Project/Release/branch_x/a/b.cpp
+... clientFile //some_client_name/a/b.cpp
+... path E:\\Projects\\some_client_name\\a\\b.cpp
+
+... depotFile //Depot.Project/Release/branch_x/c/new.md
+... clientFile //some_client_name/c/new.md
+... path E:\\Projects\\some_client_name\\c\\new.md
+";
+        let map = parse_where(ztag);
+        assert_eq!(
+            map.get("//Depot.Project/Release/branch_x/a/b.cpp").map(String::as_str),
+            Some("//some_client_name/a/b.cpp")
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn oid_change_roundtrip() {
+        // A change number encodes into the leading bytes of a synthetic Oid and back.
+        let oid = change_to_oid(6596347);
+        assert_eq!(oid_to_change(&oid), 6596347);
+        assert_eq!(oid_to_change(&change_to_oid(1)), 1);
+    }
+
+    #[test]
+    fn filelog_parses_revisions_newest_first() {
+        // `p4 filelog -l -t <path>` text output: a depot-path header, then one `... #<rev>` record
+        // per revision with a tab-indented description. (Identifiers are synthetic fixtures.)
+        let output = "\
+//Depot.Project/Release/branch_x/a/b.cpp
+... #3 change 6596347 edit on 2023/11/14 18:30:00 by someuser@some_client_name (text)
+
+\tFix the thing
+\tsecond line
+
+... #2 change 6500000 add on 2023/06/01 09:00:00 by someuser@some_client_name (text)
+
+\tInitial work
+";
+        let revs = parse_filelog(output);
+        assert_eq!(revs.len(), 2);
+        assert_eq!(revs[0].rev, 3);
+        assert_eq!(revs[0].change, 6596347);
+        assert_eq!(revs[0].action, "edit");
+        assert_eq!(revs[0].user, "someuser");
+        assert_eq!(revs[0].desc, "Fix the thing\nsecond line");
+        assert!(revs[0].time.is_some());
+        assert_eq!(revs[1].rev, 2);
+        assert_eq!(revs[1].change, 6500000);
+        assert_eq!(revs[1].action, "add");
+        assert_eq!(revs[1].desc, "Initial work");
+    }
+
+    #[test]
+    fn filelog_ignores_integration_lines() {
+        // Integration records (`... ... copy/edit from //depot#n`) must not be parsed as revisions.
+        let output = "\
+//Depot.Project/Release/branch_x/a/b.cpp
+... #1 change 6400000 branch on 2023/01/01 00:00:00 by someuser@some_client_name (text)
+... ... branch from //Depot.Project/Main/a/b.cpp#4
+
+\tBranched in
+";
+        let revs = parse_filelog(output);
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].change, 6400000);
+        assert_eq!(revs[0].desc, "Branched in");
     }
 
     #[test]
