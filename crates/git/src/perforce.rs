@@ -1174,6 +1174,30 @@ pub fn swarm_changelist_url(host: &str, chnum: u32) -> String {
     format!("{}/changes/{}", host.trim_end_matches('/'), chnum)
 }
 
+/// Whether `dir` (the folder Zed opened) lies within `client_root` (the root reported by
+/// `p4 info`). The opened folder must be the client root or a subdirectory of it; otherwise the
+/// resolved client belongs to a *different* workspace — e.g. an ambient `P4CLIENT` (`p4 set`)
+/// leaked because the directory's `.p4config` was not applied — and Perforce integration must be
+/// refused rather than silently operate on the wrong client.
+///
+/// Paths are normalized for Windows: separators unified to `/`, comparison case-insensitive,
+/// trailing separators ignored. Containment is anchored on a path-component boundary so a client
+/// root `.../ws` does not spuriously contain `.../ws_other`.
+fn workspace_root_matches(client_root: &Path, dir: &Path) -> bool {
+    fn normalize(p: &Path) -> String {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_lowercase()
+    }
+    let root = normalize(client_root);
+    let dir = normalize(dir);
+    if root.is_empty() {
+        return false;
+    }
+    dir == root || dir.starts_with(&format!("{root}/"))
+}
+
 /// A discovered Perforce workspace: where it lives locally and its client name.
 #[derive(Clone, Debug)]
 pub struct PerforceWorkspace {
@@ -1277,11 +1301,26 @@ impl PerforceRepository {
         {
             return None;
         }
+        // Validate that the resolved client actually owns the opened folder. `p4 info` resolves the
+        // client from `.p4config` / env / `p4 set` (registry) in that precedence; if `.p4config`
+        // was not applied (wrong cwd, or none present) an ambient `P4CLIENT` from `p4 set` leaks a
+        // *different* workspace whose root does not contain this folder. Enabling it would operate
+        // on — and silently auto-checkout files in — the wrong client. Refuse instead.
+        let client_root_path = PathBuf::from(&client_root);
+        if !workspace_root_matches(&client_root_path, dir) {
+            log::error!(
+                "perforce: refusing integration — resolved client {client_name:?} has root \
+                 {client_root:?}, which does not contain the opened folder {dir:?}. The folder's \
+                 `.p4config` was likely not applied and an ambient `P4CLIENT` (`p4 set`) leaked a \
+                 different workspace. Perforce integration is disabled for this folder."
+            );
+            return None;
+        }
         log::info!(
             "perforce: detected workspace client={client_name} root={client_root} at {dir:?}"
         );
         Some(PerforceWorkspace {
-            client_root: PathBuf::from(client_root),
+            client_root: client_root_path,
             client_name,
         })
     }
@@ -2346,6 +2385,45 @@ impl PerforceRepository {
 mod tests {
     use super::*;
     use crate::status::FileStatus;
+
+    #[test]
+    fn workspace_root_match_accepts_dir_inside_client_root() {
+        // The opened folder is the client root itself, or a subdirectory of it.
+        assert!(workspace_root_matches(
+            Path::new("E:/Projects/ws_branch_a"),
+            Path::new("E:/Projects/ws_branch_a"),
+        ));
+        assert!(workspace_root_matches(
+            Path::new("E:/Projects/ws_branch_a"),
+            Path::new("E:/Projects/ws_branch_a/sub/dir"),
+        ));
+    }
+
+    #[test]
+    fn workspace_root_match_normalizes_slashes_and_case() {
+        // p4 reports clientRoot with mixed separators (`E:/Projects\ws`); Windows is case
+        // insensitive. Both must still match the opened path.
+        assert!(workspace_root_matches(
+            Path::new("E:/Projects\\ws_branch_a"),
+            Path::new("e:\\projects\\WS_BRANCH_A"),
+        ));
+    }
+
+    #[test]
+    fn workspace_root_match_rejects_mismatched_client() {
+        // The bug: opened folder is branch_b but p4 resolved a branch_a client (e.g. an ambient
+        // `p4 set P4CLIENT` leaked because `.p4config` was not applied). branch_b is NOT inside the
+        // branch_a client root, so the workspace must be rejected (no Perforce integration).
+        assert!(!workspace_root_matches(
+            Path::new("E:/Projects/ws_branch_a"),
+            Path::new("E:/Projects/ws_branch_b"),
+        ));
+        // A shared prefix that is not a path-component boundary must not count as containment.
+        assert!(!workspace_root_matches(
+            Path::new("E:/Projects/ws"),
+            Path::new("E:/Projects/ws_other"),
+        ));
+    }
 
     // Real `p4 -ztag info` output captured from a live server (client/server/user
     // identifiers are environment values, used here only as parser fixtures).
