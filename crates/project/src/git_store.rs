@@ -481,6 +481,7 @@ impl LocalRepositoryState {
             let workspace = PerforceRepository::detect(
                 p4_binary_path.clone(),
                 &work_directory_abs_path,
+                &dot_git_abs_path,
                 environment.clone(),
                 executor.clone(),
             )
@@ -493,6 +494,7 @@ impl LocalRepositoryState {
                 workspace,
                 environment.clone(),
                 max_history_count,
+                dot_git_abs_path.to_path_buf(),
                 executor,
             ))
         } else {

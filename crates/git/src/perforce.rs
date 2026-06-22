@@ -116,6 +116,9 @@ pub async fn resolve_p4_config_marker_names(
         working_directory,
         executor,
         envs,
+        // This bootstrap call only reads `p4 set P4CONFIG` to learn the marker name; there is no
+        // marker path to pin yet.
+        p4config_path: None,
     };
     match cli.run(false, &["set", "P4CONFIG"]).await {
         Ok(out) => match parse_p4_config_setting(&out) {
@@ -138,6 +141,12 @@ pub(crate) struct P4Cli {
     working_directory: PathBuf,
     executor: BackgroundExecutor,
     envs: Arc<HashMap<String, String>>,
+    /// Absolute path to this workspace's `P4CONFIG` marker file (the `.p4config` Zed discovered).
+    /// We pin `P4CONFIG` to it explicitly so the client always resolves from *this* workspace's
+    /// config, independent of the process's effective working directory. Without this, a `p4`
+    /// child whose cwd is not inside the workspace (observed in practice) silently falls back to
+    /// the ambient `P4CLIENT` from `p4 set` — a *different* client. `None` only in tests.
+    p4config_path: Option<PathBuf>,
 }
 
 impl P4Cli {
@@ -151,6 +160,12 @@ impl P4Cli {
         }
         command.args(args);
         command.envs(self.envs.as_ref());
+        // Pin P4CONFIG last so it overrides any inherited/captured value. An absolute path makes
+        // `p4` read exactly this workspace's config regardless of cwd (verified: resolves the
+        // correct client even from an unrelated working directory).
+        if let Some(p4config_path) = &self.p4config_path {
+            command.env("P4CONFIG", p4config_path);
+        }
         command
     }
 
@@ -1250,6 +1265,7 @@ impl PerforceRepository {
         workspace: PerforceWorkspace,
         envs: Arc<HashMap<String, String>>,
         max_history_count: usize,
+        p4config_path: PathBuf,
         executor: BackgroundExecutor,
     ) -> Self {
         let working_directory = workspace.client_root;
@@ -1258,6 +1274,7 @@ impl PerforceRepository {
             working_directory: working_directory.clone(),
             executor,
             envs,
+            p4config_path: Some(p4config_path),
         };
         Self {
             cli,
@@ -1272,12 +1289,14 @@ impl PerforceRepository {
 
     /// Detect whether `dir` lives inside a Perforce workspace by asking `p4 info`.
     ///
-    /// Runs with `cwd = dir` so connection settings resolve from `P4CONFIG`/`p4 set`.
-    /// Returns the workspace if `clientName` is set and `clientRoot` is a real path that
-    /// contains `dir`. Never hardcodes any connection value.
+    /// Runs `p4 info` with `P4CONFIG` pinned to `p4config_path` (the discovered marker file) so the
+    /// client resolves from *this* workspace's config, not an ambient `P4CLIENT`. Returns the
+    /// workspace only if `clientName` is set and `clientRoot` actually contains `dir` (see
+    /// [`workspace_root_matches`]). Never hardcodes any connection value.
     pub async fn detect(
         p4_binary_path: PathBuf,
         dir: &Path,
+        p4config_path: &Path,
         envs: Arc<HashMap<String, String>>,
         executor: BackgroundExecutor,
     ) -> Option<PerforceWorkspace> {
@@ -1286,7 +1305,9 @@ impl PerforceRepository {
             working_directory: dir.to_path_buf(),
             executor,
             envs,
+            p4config_path: Some(p4config_path.to_path_buf()),
         };
+        log::info!("perforce: probing with P4CONFIG={p4config_path:?} cwd={dir:?}");
         let (stdout, _stderr, ok) = probe.run_lenient(true, &["info"]).await.ok()?;
         if !ok {
             return None;
