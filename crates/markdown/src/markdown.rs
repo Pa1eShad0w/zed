@@ -267,7 +267,7 @@ impl MarkdownStyle {
                 font_features: Some(theme_settings.buffer_font.features.clone()),
                 font_size: Some(buffer_font_size.into()),
                 font_weight: Some(buffer_font_weight),
-                background_color: Some(colors.editor_foreground.opacity(0.08)),
+                background_color: Some(colors.editor_foreground.opacity(0.12)),
                 ..Default::default()
             },
             link: TextStyleRefinement {
@@ -308,6 +308,8 @@ impl MarkdownStyle {
                     }),
                 },
             ),
+            paragraph_line_height: rems(1.3).into(),
+            inline_code_padding: "\u{2009}".into(),
             ..Default::default()
         };
 
@@ -326,6 +328,10 @@ impl MarkdownStyle {
         self.base_text_style.color = colors.text_muted.blend(colors.text.opacity(0.25));
         self.inline_code.color = Some(colors.text);
         self.heading.text.color = Some(colors.text);
+
+        self.paragraph_line_height = rems(1.6).into();
+        self.inline_code.background_color = Some(colors.editor_foreground.opacity(0.16));
+        self.inline_code_padding = "\u{2002}".into();
 
         self.heading_level_styles = Some(HeadingLevelStyles {
             h1: Some(TextStyleRefinement {
