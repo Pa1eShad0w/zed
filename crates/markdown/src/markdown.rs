@@ -1328,7 +1328,9 @@ impl MarkdownElement {
             builder.push_text(text, range);
             builder.pop_text_style();
             builder.append_styled_no_source(&pad);
-            builder.current_source_index = pad_source_end;
+            if !pad.is_empty() {
+                builder.current_source_index = pad_source_end;
+            }
             builder.pop_text_style();
         } else {
             let mut code_style = self.style.inline_code.clone();
@@ -1339,7 +1341,9 @@ impl MarkdownElement {
             builder.append_styled_no_source(&pad);
             builder.push_text(text, range);
             builder.append_styled_no_source(&pad);
-            builder.current_source_index = pad_source_end;
+            if !pad.is_empty() {
+                builder.current_source_index = pad_source_end;
+            }
             builder.pop_text_style();
         }
     }
