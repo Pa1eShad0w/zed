@@ -26,7 +26,10 @@ use project::{
 use settings::Settings;
 use std::ops::Range;
 use util::ResultExt as _;
-use ui::{ContextMenu, Scrollbars, Tab, Tooltip, WithScrollbar, prelude::*, tooltip_container};
+use ui::{
+    ContextMenu, ContextMenuEntry, DocumentationSide, Scrollbars, Tab, Tooltip, WithScrollbar,
+    prelude::*, tooltip_container,
+};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -443,7 +446,89 @@ impl PerforcePanel {
             .on_drop(cx.listener(move |this, dragged: &DraggedPerforceFile, _window, cx| {
                 this.drop_on_changelist(dragged, id, cx);
             }))
+            // Right-click opens the changelist-level menu (scoped diff + swarm).
+            .on_mouse_down(MouseButton::Right, {
+                let changelist = changelist.clone();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_changelist_context_menu(
+                        event.position,
+                        changelist.clone(),
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                })
+            })
             .into_any_element()
+    }
+
+    /// Changelist-header context menu: a changelist-scoped diff of its pending files, and (for a
+    /// numbered changelist with a configured swarm host) a Swarm link.
+    fn deploy_changelist_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        changelist: PerforceChangelist,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        let numbered = match changelist.id {
+            ChangelistId::Numbered(n) => Some(n),
+            ChangelistId::Default => None,
+        };
+        let swarm = numbered.and_then(|n| self.swarm_url(n, cx));
+        let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            let mut menu = menu.context(self.focus_handle.clone());
+            {
+                let cl = changelist.clone();
+                let w = weak.clone();
+                menu = menu.entry("Open Changelist Diff", None, move |window, cx| {
+                    w.update(cx, |this, cx| this.open_changelist_diff(&cl, window, cx))
+                        .ok();
+                });
+            }
+            if let Some(url) = swarm.clone() {
+                menu = menu
+                    .separator()
+                    .entry("View in Swarm", None, move |_window, cx| {
+                        cx.open_url(&url);
+                    });
+            }
+            menu
+        });
+        self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// Open a diff scoped to a single changelist's pending files (`ProjectDiff::deploy_changelist`),
+    /// rather than the whole-repo "Uncommitted Changes" diff — bounding the remote `p4 print` cost.
+    fn open_changelist_diff(
+        &mut self,
+        changelist: &PerforceChangelist,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        // Only pending (non-shelved) files have a working-copy diff against `#have`.
+        let paths: HashSet<RepoPath> = changelist
+            .files
+            .iter()
+            .filter(|f| !f.shelved)
+            .map(|f| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let title: SharedString = match changelist.id {
+            ChangelistId::Default => "Default Changelist".into(),
+            ChangelistId::Numbered(n) => format!("Changelist #{n}").into(),
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                ProjectDiff::deploy_changelist(workspace, repo, title, paths, window, cx);
+            })
+            .ok();
     }
 
     /// The file's status icon, overlaid with a small warning triangle at the bottom-left when the
@@ -635,19 +720,14 @@ impl PerforcePanel {
                 });
             }
 
-            // Diff entries — only meaningful for an opened (pending) file.
+            // Single-file diff — only meaningful for an opened (pending) file. The whole-changelist
+            // diff lives in the changelist-header menu ("Open Changelist Diff").
             if is_pending {
-                let (f1, f2) = (file.clone(), file.clone());
-                let (w1, w2) = (weak.clone(), weak.clone());
-                menu = menu
-                    .entry("Open Diff", None, move |window, cx| {
-                        w1.update(cx, |this, cx| this.open_diff(&f1, false, window, cx))
-                            .ok();
-                    })
-                    .entry("Open Diff (File)", None, move |window, cx| {
-                        w2.update(cx, |this, cx| this.open_diff(&f2, true, window, cx))
-                            .ok();
-                    });
+                let f = file.clone();
+                let w = weak.clone();
+                menu = menu.entry("Open Diff", None, move |window, cx| {
+                    w.update(cx, |this, cx| this.open_diff(&f, window, cx)).ok();
+                });
             }
             // File history applies to any file (pending or shelved).
             {
@@ -682,6 +762,27 @@ impl PerforcePanel {
                             })
                             .ok();
                         });
+                } else {
+                    // Default changelist: p4 cannot shelve from it. Show the entries disabled (so
+                    // the action is discoverable) with an aside explaining the fix.
+                    let aside = |_: &mut App| {
+                        Label::new(
+                            "Perforce can't shelve from the default changelist. Move the file to a \
+                             numbered changelist first.",
+                        )
+                        .into_any_element()
+                    };
+                    menu = menu
+                        .item(
+                            ContextMenuEntry::new("Shelve")
+                                .disabled(true)
+                                .documentation_aside(DocumentationSide::Right, aside),
+                        )
+                        .item(
+                            ContextMenuEntry::new("Shelve and Revert")
+                                .disabled(true)
+                                .documentation_aside(DocumentationSide::Right, aside),
+                        );
                 }
                 let f = file.clone();
                 let w = weak.clone();
@@ -754,17 +855,10 @@ impl PerforcePanel {
             .ok();
     }
 
-    /// Open the file's diff. `solo` picks the single-file diff view ("Open Diff (File)"); otherwise
-    /// the project diff is deployed at this file ("Open Diff"). Reuses the git diff views, which are
+    /// Open the file's single-file diff (`SoloDiffView`). Reuses the git diff view, which is
     /// backend-agnostic — the Perforce backend supplies the diff base via `load_committed_text`
-    /// (`p4 print #have`).
-    fn open_diff(
-        &mut self,
-        file: &ChangelistFile,
-        solo: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// (`p4 print #have`). Whole-changelist diffs go through `open_changelist_diff` instead.
+    fn open_diff(&mut self, file: &ChangelistFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.active_repository.clone() else {
             return;
         };
@@ -774,16 +868,8 @@ impl PerforcePanel {
             staging: StageStatus::Unstaged,
             diff_stat: None,
         };
-        if solo {
-            SoloDiffView::open_or_focus(entry, repo, self.workspace.clone(), window, cx)
-                .detach_and_log_err(cx);
-        } else {
-            self.workspace
-                .update(cx, |workspace, cx| {
-                    ProjectDiff::deploy_at(workspace, Some(entry), window, cx);
-                })
-                .ok();
-        }
+        SoloDiffView::open_or_focus(entry, repo, self.workspace.clone(), window, cx)
+            .detach_and_log_err(cx);
     }
 
     /// `p4 revert <file>`. For a file opened for *add*, p4 leaves the local file on disk, so first

@@ -6,7 +6,7 @@ use crate::{
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
@@ -88,6 +88,12 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    /// When `Some`, this diff is scoped to a single Perforce changelist: `refresh` includes only
+    /// these repo paths (skipping the remote `p4 print` base-load for every other opened file),
+    /// and the tab shows `scope_title`. `None` for the normal whole-repo project diff — every git
+    /// code path leaves this unset, so their behavior is identical to before.
+    changelist_scope: Option<HashSet<RepoPath>>,
+    scope_title: Option<SharedString>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -342,9 +348,11 @@ impl ProjectDiff {
         );
         let intended_repo = workspace.project().read(cx).active_repository(cx);
 
-        let existing = workspace
-            .items_of_type::<Self>(cx)
-            .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let item = item.read(cx);
+            // Never reuse a changelist-scoped tab as the global "Uncommitted Changes" diff.
+            matches!(item.diff_base(cx), DiffBase::Head) && item.changelist_scope.is_none()
+        });
         let project_diff = if let Some(existing) = existing {
             existing.update(cx, |project_diff, cx| {
                 project_diff.move_to_beginning(window, cx);
@@ -418,6 +426,50 @@ impl ProjectDiff {
         project_diff.update(cx, |project_diff, cx| {
             project_diff.move_to_project_path(&project_path, window, cx);
         });
+    }
+
+    /// Open (or focus) a Perforce changelist-scoped diff: a `ProjectDiff` restricted to `paths`
+    /// and titled `title` (e.g. `Changelist #12345` / `Default Changelist`). Distinct from the
+    /// global "Uncommitted Changes" tab; reuses an existing tab with the same `title`.
+    pub fn deploy_changelist(
+        workspace: &mut Workspace,
+        repo: Entity<Repository>,
+        title: SharedString,
+        paths: HashSet<RepoPath>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let existing = workspace
+            .items_of_type::<Self>(cx)
+            .find(|item| item.read(cx).scope_title.as_ref() == Some(&title));
+        if let Some(existing) = existing {
+            existing.update(cx, |project_diff, cx| {
+                // The changelist's file set may have changed since last open; re-scope + refresh.
+                project_diff.changelist_scope = Some(paths);
+                project_diff._task = window.spawn(cx, {
+                    let this = cx.weak_entity();
+                    async move |cx| Self::refresh(this, cx).await
+                });
+            });
+            workspace.activate_item(&existing, true, true, window, cx);
+            return;
+        }
+
+        let workspace_handle = cx.entity();
+        // Set scope/title synchronously here: `new` spawns its first refresh as an async task that
+        // only polls after this closure returns, so the fields are in place before it runs.
+        let project_diff = cx.new(|cx| {
+            let mut diff = Self::new(workspace.project().clone(), workspace_handle, window, cx);
+            diff.changelist_scope = Some(paths);
+            diff.scope_title = Some(title);
+            diff
+        });
+        project_diff.update(cx, |project_diff, cx| {
+            project_diff.branch_diff.update(cx, |branch_diff, cx| {
+                branch_diff.set_repo(Some(repo), cx);
+            });
+        });
+        workspace.add_item_to_active_pane(Box::new(project_diff), None, true, window, cx);
     }
 
     pub fn autoscroll(&self, cx: &mut Context<Self>) {
@@ -612,6 +664,8 @@ impl ProjectDiff {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            changelist_scope: None,
+            scope_title: None,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -996,6 +1050,13 @@ impl ProjectDiff {
                 let repo = repo.read(cx);
 
                 for diff_buffer in buffers_to_load {
+                    // Changelist-scoped diff: skip files outside this changelist *before* their
+                    // base-load future is awaited, so we never pay the remote `p4 print` for them.
+                    if let Some(scope) = &this.changelist_scope
+                        && !scope.contains(&diff_buffer.repo_path)
+                    {
+                        continue;
+                    }
                     let sort_prefix =
                         sort_prefix(&repo, &diff_buffer.repo_path, diff_buffer.file_status, cx);
                     let path_key = PathKey::with_sort_prefix(
@@ -1161,6 +1222,9 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        if let Some(title) = &self.scope_title {
+            return title.clone();
+        }
         match self.branch_diff.read(cx).diff_base() {
             DiffBase::Head => "Uncommitted Changes".into(),
             DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
