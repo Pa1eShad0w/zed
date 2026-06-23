@@ -93,8 +93,13 @@ pub struct CommitData {
     pub message: SharedString,
     /// Human-facing identifier to show in place of the abbreviated `sha` hex. Used by the Perforce
     /// backend (whose `sha` is a synthetic Oid encoding a changelist number) to surface a readable
-    /// `#<rev> @<change>` instead of meaningless hex. `None` for git, which renders the short sha.
+    /// `@<change>` instead of meaningless hex. `None` for git, which renders the short sha.
     pub revision_label: Option<SharedString>,
+    /// Perforce file revision (`#<rev>`) for the file-history Revision column. `None` for git.
+    pub file_revision: Option<SharedString>,
+    /// Perforce integration source branch for the file-history Branch column. `None` for git and
+    /// for plain (non-integrated) Perforce revisions.
+    pub branch: Option<SharedString>,
 }
 
 #[derive(Debug)]
@@ -240,6 +245,8 @@ fn parse_cat_file_commit(sha: Oid, content: &str) -> Option<CommitData> {
         subject: subject.unwrap_or_default(),
         message: SharedString::from(message_lines.join("\n")),
         revision_label: None,
+        file_revision: None,
+        branch: None,
     })
 }
 

@@ -685,6 +685,24 @@ struct FilelogRev {
     time: Option<i64>,
     /// Full changelist description (tab-indented lines joined), from `-l`.
     desc: String,
+    /// Integration source branch for this revision, if it was branched/copied/merged/integrated
+    /// from elsewhere (parsed from the `... ... <op> from //depot/<branch>/...` line). `None` for a
+    /// plain edit on the file's own branch.
+    branch: Option<String>,
+}
+
+/// Extract the source branch from a filelog integration line body — the text after `... ... `,
+/// e.g. `branch from //Depot.Project/Main/a/b.cpp#4`. Only `from` records are sources (`into`
+/// records are targets). The branch is the second depot-path segment (`Main` above), which groups
+/// history by branch without assuming a stream depth.
+fn parse_integration_branch(line: &str) -> Option<String> {
+    let body = line.strip_prefix("... ... ")?;
+    let (_op, rest) = body.split_once(" from //")?;
+    // `rest` is now `<branch>/<path...>#rev`; the first segment is the depot, the second the branch.
+    let mut segments = rest.split('/');
+    let _depot = segments.next()?;
+    let branch = segments.next()?;
+    (!branch.is_empty()).then(|| branch.to_string())
 }
 
 /// Parse the text output of `p4 filelog -l -t <path>` into one [`FilelogRev`] per revision.
@@ -710,8 +728,16 @@ fn parse_filelog(output: &str) -> Vec<FilelogRev> {
             }
         } else if let Some(desc) = line.strip_prefix('\t') {
             desc_lines.push(desc.to_string());
+        } else if line.starts_with("... ... ") {
+            // Integration record: record the first source branch for the current revision.
+            if let Some(last) = revs.last_mut()
+                && last.branch.is_none()
+                && let Some(branch) = parse_integration_branch(line)
+            {
+                last.branch = Some(branch);
+            }
         }
-        // Everything else (depot-path header, `... ...` integration lines, blanks) is ignored.
+        // Everything else (depot-path header, blank lines) is ignored.
     }
     flush(&mut revs, &mut desc_lines);
     revs
@@ -736,6 +762,7 @@ fn parse_filelog_header(s: &str) -> Option<FilelogRev> {
         user,
         time: parse_p4_datetime(date_part.trim()),
         desc: String::new(),
+        branch: None,
     })
 }
 
@@ -810,8 +837,12 @@ fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitDa
         commit_timestamp: rev.time.unwrap_or(0),
         subject: rev.desc.lines().next().unwrap_or_default().to_string().into(),
         message: rev.desc.clone().into(),
-        // File rev + changelist, decimal (#16/#17) — shown instead of the synthetic-Oid hex.
-        revision_label: Some(format!("#{} @{}", rev.rev, rev.change).into()),
+        // Decimal changelist for the "Commit" column / detail header (not the synthetic-Oid hex).
+        revision_label: Some(format!("@{}", rev.change).into()),
+        // File revision (`#<rev>`) for the leading Revision column.
+        file_revision: Some(format!("#{}", rev.rev).into()),
+        // Integration source branch (Branch column), blank for a plain edit.
+        branch: rev.branch.clone().map(Into::into),
     }
 }
 
@@ -2159,9 +2190,11 @@ impl GitRepository for PerforceRepository {
                     commit_timestamp: meta.time.unwrap_or(0),
                     subject: meta.summary.clone().unwrap_or_default().into(),
                     message: meta.summary.unwrap_or_default().into(),
-                    // Describe-fallback (a change not in the filelog cache): no per-file rev here,
-                    // so show just the decimal changelist.
+                    // Describe-fallback (a change not in the filelog cache): no per-file rev or
+                    // integration branch here, so show just the decimal changelist.
                     revision_label: Some(format!("@{change}").into()),
+                    file_revision: None,
+                    branch: None,
                 })
             }
         }))
@@ -3084,18 +3117,46 @@ line two
     }
 
     #[test]
-    fn filelog_commit_data_uses_decimal_change_and_rev_label() {
-        // File history must show a readable `#<rev> @<change>` (decimal), not the synthetic-Oid hex.
-        let rev = FilelogRev {
+    fn filelog_commit_data_splits_rev_change_branch_columns() {
+        // File history columns (decimal, not synthetic-Oid hex): Revision `#<rev>`, Commit
+        // `@<change>`, Branch (integration source or none for a plain edit).
+        let plain = FilelogRev {
             rev: 3,
             change: 6596347,
             action: "edit".into(),
             user: "someuser".into(),
             time: Some(0),
             desc: "Fix the thing".into(),
+            branch: None,
         };
-        let data = filelog_rev_to_commit_data(&rev, Some(6500000));
-        assert_eq!(data.revision_label.as_deref(), Some("#3 @6596347"));
+        let data = filelog_rev_to_commit_data(&plain, Some(6500000));
+        assert_eq!(data.file_revision.as_deref(), Some("#3"));
+        assert_eq!(data.revision_label.as_deref(), Some("@6596347"));
+        assert_eq!(data.branch, None);
+
+        let integrated = FilelogRev {
+            branch: Some("Main".into()),
+            ..plain
+        };
+        let data = filelog_rev_to_commit_data(&integrated, None);
+        assert_eq!(data.branch.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn filelog_captures_integration_source_branch() {
+        // The `... ... <op> from //depot/<branch>/...` line supplies the source branch (2nd segment).
+        let output = "\
+//Depot.Project/Release/branch_x/a/b.cpp
+... #2 change 6400001 integrate on 2023/02/01 00:00:00 by someuser@some_client_name (text)
+... ... merge from //Depot.Project/Main/a/b.cpp#7
+\tMerged from main
+... #1 change 6400000 add on 2023/01/01 00:00:00 by someuser@some_client_name (text)
+\tInitial
+";
+        let revs = parse_filelog(output);
+        assert_eq!(revs.len(), 2);
+        assert_eq!(revs[0].branch.as_deref(), Some("Main"));
+        assert_eq!(revs[1].branch, None);
     }
 
     #[test]

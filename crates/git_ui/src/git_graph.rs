@@ -2317,11 +2317,28 @@ impl GitGraph {
         );
     }
 
+    /// The Perforce changelist label (`@<change>`) for a commit, if its data is loaded and the
+    /// backend supplied one (the synthetic-Oid backends). `None` for git or while data is loading —
+    /// callers then fall back to the real sha.
+    fn perforce_change_label(&self, sha: Oid, cx: &mut App) -> Option<SharedString> {
+        let repo = self.get_repository(cx)?;
+        let data = repo.update(cx, |repo, cx| repo.fetch_commit_data(sha, false, cx).clone());
+        match data {
+            CommitDataState::Loaded(data) => data.revision_label.clone(),
+            CommitDataState::Loading(_) => None,
+        }
+    }
+
     fn copy_commit_sha(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        let Some(commit) = self.graph_data.commits.get(entry_index) else {
+        let Some(sha) = self.graph_data.commits.get(entry_index).map(|c| c.data.sha) else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(commit.data.sha.to_string()));
+        // Perforce: copy the bare changelist number (not the synthetic-Oid hex).
+        let text = self
+            .perforce_change_label(sha, cx)
+            .map(|label| label.trim_start_matches('@').to_string())
+            .unwrap_or_else(|| sha.to_string());
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn copy_selected_commit_sha(
@@ -2478,9 +2495,18 @@ impl GitGraph {
             .map(|task_context| self.git_context_menu_tasks(&task_context, cx))
             .unwrap_or_default();
 
-        let header = match &ref_name {
-            Some(ref_name) => format!("Ref {ref_name}"),
-            None => format!("Commit {sha_short}"),
+        // Perforce: identify the commit by changelist (`@<change>`) rather than the synthetic hex.
+        let p4_change = self.perforce_change_label(sha, cx);
+        let copy_id_label = if p4_change.is_some() {
+            "Copy Changelist"
+        } else {
+            "Copy SHA"
+        };
+
+        let header = match (&ref_name, &p4_change) {
+            (Some(ref_name), _) => format!("Ref {ref_name}"),
+            (None, Some(change)) => format!("Changelist {}", change.trim_start_matches('@')),
+            (None, None) => format!("Commit {sha_short}"),
         };
 
         let focus_handle = self.focus_handle.clone();
@@ -2497,7 +2523,7 @@ impl GitGraph {
                     }),
                 )
                 .entry(
-                    "Copy SHA",
+                    copy_id_label,
                     Some(CopyCommitSha.boxed_clone()),
                     window.handler_for(&git_graph, move |this, _window, cx| {
                         this.copy_commit_sha(index, cx);
@@ -2825,6 +2851,21 @@ impl GitGraph {
             CommitDataState::Loading(_) => ("Loading…".into(), "".into(), None, "Loading…".into()),
         };
 
+        // Perforce: show the readable changelist label (`@<change>`) in place of the synthetic-Oid
+        // hex for the detail header. The permalink still uses the real sha; copy uses the bare
+        // changelist number.
+        let p4_change: Option<SharedString> = match &data {
+            CommitDataState::Loaded(data) => data.revision_label.clone(),
+            CommitDataState::Loading(_) => None,
+        };
+        let sha_label: SharedString = p4_change.clone().unwrap_or_else(|| full_sha.clone());
+        // What the copy button writes: the bare changelist number for Perforce, else the full sha.
+        let copy_text: SharedString = p4_change
+            .as_ref()
+            .map(|label| label.trim_start_matches('@').to_string().into())
+            .unwrap_or_else(|| full_sha.clone());
+        let is_perforce_commit = p4_change.is_some();
+
         let date_string = commit_timestamp
             .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
             .map(|datetime| {
@@ -3006,41 +3047,52 @@ impl GitGraph {
                                 )
                             })
                             .child({
-                                let copy_sha = full_sha.clone();
+                                let copy_text = copy_text.clone();
                                 let copied_state: Entity<CopiedState> =
                                     window.use_keyed_state("sha-copy", cx, CopiedState::new);
                                 let is_copied = copied_state.read(cx).is_copied();
 
+                                // Perforce shows the changelist (`@<change>`) with no leading `#`
+                                // hash glyph; git keeps the hash. Both show a check on copy.
                                 let (icon, icon_color, tooltip_label) = if is_copied {
-                                    (IconName::Check, Color::Success, "Commit SHA Copied!")
+                                    let copied = if is_perforce_commit {
+                                        "Changelist Copied!"
+                                    } else {
+                                        "Commit SHA Copied!"
+                                    };
+                                    (Some(IconName::Check), Color::Success, copied)
+                                } else if is_perforce_commit {
+                                    (None, Color::Muted, "Copy Changelist")
                                 } else {
-                                    (IconName::Hash, Color::Muted, "Copy Commit SHA")
+                                    (Some(IconName::Hash), Color::Muted, "Copy Commit SHA")
                                 };
+                                let tooltip_meta = sha_label.clone();
 
-                                Button::new("sha-button", &full_sha)
-                                    .start_icon(
-                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                    )
+                                Button::new("sha-button", sha_label.clone())
+                                    .when_some(icon, |button, icon| {
+                                        button.start_icon(
+                                            Icon::new(icon)
+                                                .size(IconSize::Small)
+                                                .color(icon_color),
+                                        )
+                                    })
                                     .label_size(LabelSize::Small)
                                     .truncate(true)
                                     .color(Color::Muted)
-                                    .tooltip({
-                                        let full_sha = full_sha.clone();
-                                        move |_, cx| {
-                                            Tooltip::with_meta(
-                                                tooltip_label,
-                                                None,
-                                                full_sha.clone(),
-                                                cx,
-                                            )
-                                        }
+                                    .tooltip(move |_, cx| {
+                                        Tooltip::with_meta(
+                                            tooltip_label,
+                                            None,
+                                            tooltip_meta.clone(),
+                                            cx,
+                                        )
                                     })
                                     .on_click(move |_, _, cx| {
                                         copied_state.update(cx, |state, _cx| {
                                             state.mark_copied();
                                         });
                                         cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_sha.to_string(),
+                                            copy_text.to_string(),
                                         ));
                                         let state_id = copied_state.entity_id();
                                         cx.spawn(async move |cx| {
