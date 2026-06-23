@@ -29,6 +29,7 @@ comm
 
 ### Changed
 
+- `31cdb27` (2026-06-23) Recent-projects 标题栏 popover 改为弹性宽度（min 20rem / max 48rem）：长项目名（含长 Perforce client 名）不再被截断，可在屏幕空间允许时按内容扩展，下限保持历史固定宽度故永远不会比之前更窄；Modal 风格仍为固定宽度（min == max），原 modal 布局不受影响。新增 `WidthConstraints` 内部抽象 + 3 个针对契约的单元测试。
 - `2de0bba` (2026-06-23) 统一 source-control dock 按钮：在 Perforce workspace 中 Git panel 隐藏 dock 图标（新增缓存 `active_is_perforce`，repo 变化时通过 `is_perforce_resolved` 异步解析；lazy `peek` 不可靠），Perforce 面板也改用与 Git 面板相同的 `IconName::GitBranch`——因为两者互斥，dock 上只呈现一个 source-control 按钮，tooltip 区分（"Git Panel" / "Perforce Changes"）。git / 无 repo 的 workspace 不受影响。
 - `a93f4dc` `300304b` `07275a7` (2026-06-23) 全面用 changelist 替换 synthetic-Oid 十六进制：graph commit detail header / 上下文菜单 / CommitView / file-history 列表 全部显示 `@<change>`（filelog 行额外带 `#<rev>`）；`Copy` 写入裸 changelist 数字而非 40 字符 hex；按钮 / 菜单文案改为 `Copy Changelist` / `Changelist <n>` / `Changelist`；Perforce commit 的 graph 上下文菜单在 `perforce.swarm_host` 配置时新增 `View in Swarm`。所有逻辑 gate 在 `CommitData.revision_label` 非空，git commit 仍显示 hex + `Copy SHA`，所有非 Perforce 的 `CommitData` 构造点 `revision_label: None`，行为完全不变。
 - `7aaeef6` (2026-06-23) 文件右键菜单的全仓库 `Open Diff` 入口移除，等价入口下沉到 changelist header；文件级 diff 入口仍叫 `Open Diff`（单文件 SoloDiffView，`open_diff` 的 `solo` 参数移除）。
