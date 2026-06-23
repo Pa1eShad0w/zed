@@ -1329,6 +1329,11 @@ pub struct GitGraph {
     context_menu: Option<GitGraphContextMenu>,
     table_interaction_state: Entity<TableInteractionState>,
     column_widths: Entity<RedistributableColumnsState>,
+    /// True only for a *Perforce* file history (`LogSource::Path` on a Perforce repo). Adds the
+    /// leading Revision (`#<rev>`) and trailing Branch columns to the otherwise-shared file-history
+    /// table. Resolved at construction (peek) with an async fallback (`is_perforce_resolved`) that
+    /// rebuilds `column_widths` if the repo wasn't resolved yet — git file history is unaffected.
+    perforce_file_history: bool,
     selected_entry_idx: Option<usize>,
     hovered_entry_idx: Option<usize>,
     graph_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -1410,6 +1415,22 @@ impl GitGraph {
     }
 
     fn table_column_width_config(&self, window: &Window, cx: &App) -> ColumnWidthConfig {
+        // Perforce file history has its own 6-column table (no graph column), so it bypasses the
+        // git 5-tuple normalization entirely and normalizes its 6 widths directly.
+        if self.perforce_file_history {
+            let fractions = self.column_widths.read(cx).preview_fractions(window.rem_size());
+            let raw: Vec<f32> = (0..6usize).map(|i| *fractions.expect_get(i)).collect();
+            let total: f32 = raw.iter().sum();
+            let widths = if total > 0.0 {
+                raw.iter()
+                    .map(|f| DefiniteLength::Fraction(f / total))
+                    .collect()
+            } else {
+                vec![DefiniteLength::Fraction(1.0 / 6.0); 6]
+            };
+            return ColumnWidthConfig::explicit(widths);
+        }
+
         let [_, description, date, author, commit] = self.preview_column_fractions(window, cx);
         let table_total = description + date + author + commit;
 
@@ -1437,6 +1458,26 @@ impl GitGraph {
             .read(cx)
             .preview_column_width(0, window)
             .unwrap_or_else(|| self.graph_canvas_content_width())
+    }
+
+    /// The 6-column width state for a Perforce file history: Revision, Description, Date, Author,
+    /// Change, Branch. Built here (not inline) so the async perforce-resolution fallback can rebuild
+    /// it identically.
+    fn perforce_history_column_widths(cx: &mut App) -> Entity<RedistributableColumnsState> {
+        cx.new(|_cx| {
+            RedistributableColumnsState::new(
+                6,
+                vec![
+                    DefiniteLength::Fraction(0.07), // Revision (#rev)
+                    DefiniteLength::Fraction(0.55), // Description
+                    DefiniteLength::Fraction(0.11), // Date
+                    DefiniteLength::Fraction(0.10), // Author
+                    DefiniteLength::Fraction(0.09), // Change (@change)
+                    DefiniteLength::Fraction(0.08), // Branch
+                ],
+                vec![TableResizeBehavior::Resizable; 6],
+            )
+        })
     }
 
     pub fn new(
@@ -1480,7 +1521,21 @@ impl GitGraph {
             state
         });
 
-        let column_widths = if matches!(log_source, LogSource::Path(_)) {
+        let is_path_history = matches!(log_source, LogSource::Path(_));
+        // Peek whether this file history is backed by Perforce. The repo is usually resolved by the
+        // time the user opens history, so this is normally accurate; the async fallback below covers
+        // the rare not-yet-resolved case (and never fires for git, keeping git file history at 4
+        // columns).
+        let perforce_now = is_path_history
+            && git_store
+                .read(cx)
+                .repositories()
+                .get(&repo_id)
+                .is_some_and(|repo| repo.read(cx).is_perforce());
+
+        let column_widths = if perforce_now {
+            Self::perforce_history_column_widths(cx)
+        } else if is_path_history {
             cx.new(|_cx| {
                 RedistributableColumnsState::new(
                     4,
@@ -1552,6 +1607,7 @@ impl GitGraph {
             context_menu: None,
             table_interaction_state,
             column_widths,
+            perforce_file_history: perforce_now,
             selected_entry_idx: None,
             hovered_entry_idx: None,
             graph_canvas_bounds: Rc::new(Cell::new(None)),
@@ -1566,6 +1622,28 @@ impl GitGraph {
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
         };
+
+        // Fallback: if this is a file history whose repo wasn't resolved yet at the peek above,
+        // resolve it asynchronously and, if Perforce, upgrade to the 6-column layout. Never fires
+        // for git (is_perforce_resolved stays false), so git file history keeps its 4 columns.
+        if is_path_history && !perforce_now {
+            if let Some(repo) = this.get_repository(cx) {
+                let resolve = repo.read(cx).is_perforce_resolved(cx);
+                cx.spawn(async move |this, cx| {
+                    if resolve.await {
+                        this.update(cx, |this, cx| {
+                            if !this.perforce_file_history {
+                                this.perforce_file_history = true;
+                                this.column_widths = Self::perforce_history_column_widths(cx);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            }
+        }
 
         this.fetch_initial_graph_data(cx);
         this
@@ -1799,12 +1877,10 @@ impl GitGraph {
                 let Some((commit, repository)) =
                     self.graph_data.commits.get(idx).zip(repository.as_ref())
                 else {
-                    return vec![
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                        div().h(row_height).into_any_element(),
-                    ];
+                    let cols = if self.perforce_file_history { 6 } else { 4 };
+                    return (0..cols)
+                        .map(|_| div().h(row_height).into_any_element())
+                        .collect();
                 };
 
                 let data = repository.update(cx, |repository, cx| {
@@ -1817,15 +1893,20 @@ impl GitGraph {
                 let mut formatted_time = String::new();
                 let subject: SharedString;
                 let author_name: SharedString;
+                // Perforce file-history extra columns (empty for git / while loading).
+                let mut file_revision: SharedString = SharedString::default();
+                let mut branch_name: SharedString = SharedString::default();
 
                 if let CommitDataState::Loaded(ref data) = data {
                     subject = data.subject.clone();
                     author_name = data.author_name.clone();
                     formatted_time = format_timestamp(data.commit_timestamp);
-                    // Perforce supplies a readable `#<rev> @<change>`; git leaves this None → hex.
+                    // Perforce supplies a readable `@<change>` here; git leaves this None → hex.
                     if let Some(label) = &data.revision_label {
                         short_sha = label.clone();
                     }
+                    file_revision = data.file_revision.clone().unwrap_or_default();
+                    branch_name = data.branch.clone().unwrap_or_default();
                 } else {
                     subject = "Loading…".into();
                     author_name = "".into();
@@ -1885,8 +1966,7 @@ impl GitGraph {
                     column_label(subject)
                 };
 
-                vec![
-                    div()
+                let subject_cell = div()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .overflow_hidden()
                         .when(!has_context_menu, |this| {
@@ -1952,11 +2032,20 @@ impl GitGraph {
                                 }))
                                 .child(subject_label),
                         )
-                        .into_any_element(),
+                        .into_any_element();
+
+                let mut cells = vec![
+                    subject_cell,
                     column_label(formatted_time.into()),
                     column_label(author_name),
                     column_label(short_sha.into()),
-                ]
+                ];
+                // Perforce file history: prepend the Revision (#rev) column and append Branch.
+                if self.perforce_file_history {
+                    cells.insert(0, column_label(file_revision));
+                    cells.push(column_label(branch_name));
+                }
+                cells
             })
             .collect()
     }
@@ -3836,15 +3925,15 @@ impl Render for GitGraph {
                 Some(self.column_widths.read(cx).widths_to_render()),
                 true,
             );
-            let [
-                graph_fraction,
-                description_fraction,
-                date_fraction,
-                author_fraction,
-                commit_fraction,
-            ] = self.preview_column_fractions(window, cx);
-            let table_fraction =
-                description_fraction + date_fraction + author_fraction + commit_fraction;
+            // Perforce file history is a plain 6-column table (no graph canvas): the table fills
+            // the full width. Git uses the 5-tuple [graph, desc, date, author, commit] split.
+            let (graph_fraction, table_fraction) = if self.perforce_file_history {
+                (0.0, 1.0)
+            } else {
+                let [graph, description, date, author, commit] =
+                    self.preview_column_fractions(window, cx);
+                (graph, description + date + author + commit)
+            };
             let table_width_config = self.table_column_width_config(window, cx);
 
             h_flex()
@@ -3857,7 +3946,23 @@ impl Render for GitGraph {
                         .flex()
                         .flex_col()
                         .child(render_table_header(
-                            if !is_path_history {
+                            if self.perforce_file_history {
+                                TableRow::from_vec(
+                                    vec![
+                                        Label::new("Revision")
+                                            .color(Color::Muted)
+                                            .into_any_element(),
+                                        Label::new("Description")
+                                            .color(Color::Muted)
+                                            .into_any_element(),
+                                        Label::new("Date").color(Color::Muted).into_any_element(),
+                                        Label::new("Author").color(Color::Muted).into_any_element(),
+                                        Label::new("Change").color(Color::Muted).into_any_element(),
+                                        Label::new("Branch").color(Color::Muted).into_any_element(),
+                                    ],
+                                    6,
+                                )
+                            } else if !is_path_history {
                                 TableRow::from_vec(
                                     vec![
                                         Label::new("Graph")
@@ -3926,7 +4031,7 @@ impl Render for GitGraph {
                                     }
                                 }));
 
-                            let commits_table = Table::new(4)
+                            let commits_table = Table::new(if self.perforce_file_history { 6 } else { 4 })
                                 .interactable(&self.table_interaction_state)
                                 .hide_row_borders()
                                 .hide_row_hover()
