@@ -727,6 +727,14 @@ impl Editor {
     }
 
     pub(super) fn restore_diff_hunks(&self, hunks: Vec<MultiBufferDiffHunk>, cx: &mut App) {
+        // Perforce has no staging index. Reverting a hunk there is purely a buffer edit back to
+        // the depot `#have` text; routing it through the stage/unstage machinery seeds a pending
+        // hunk that never reconciles (set_index_text is a no-op for p4), leaking a phantom diff
+        // hunk and a stale buffer anchor that later panics in the rope. So skip it for Perforce.
+        let is_perforce = self
+            .project()
+            .and_then(|project| project.read(cx).active_repository(cx))
+            .is_some_and(|repo| repo.read(cx).is_perforce());
         let mut revert_changes = HashMap::default();
         let chunk_by = hunks.into_iter().chunk_by(|hunk| hunk.buffer_id);
         for (buffer_id, hunks) in &chunk_by {
@@ -734,7 +742,9 @@ impl Editor {
             for hunk in &hunks {
                 self.prepare_restore_change(&mut revert_changes, hunk, cx);
             }
-            self.do_stage_or_unstage(false, buffer_id, hunks.into_iter(), cx);
+            if !is_perforce {
+                self.do_stage_or_unstage(false, buffer_id, hunks.into_iter(), cx);
+            }
         }
         if !revert_changes.is_empty() {
             self.buffer().update(cx, |multi_buffer, cx| {

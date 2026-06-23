@@ -311,7 +311,11 @@ impl Editor {
             return 0;
         };
 
-        let point = target_point.to_point(display_map);
+        // During a rapid edit in a diff multibuffer, `target_point` can map to a column past the
+        // (just-shrunk) singleton buffer line — the display row still reflects the longer base
+        // text. Clamp into bounds so the outline offset lookup can't run off the end of the rope
+        // (debug builds otherwise hit a `point extends beyond row` debug_panic here).
+        let point = buffer_snapshot.clip_point(target_point.to_point(display_map), Bias::Left);
         let mut item_ranges = buffer_snapshot
             .outline_ranges_containing(point..point)
             .collect::<Vec<_>>();
