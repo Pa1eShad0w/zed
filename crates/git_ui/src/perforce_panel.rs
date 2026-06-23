@@ -117,6 +117,9 @@ pub struct PerforcePanel {
     /// Opened files behind head revision (`have < head`), re-fetched on each reload. Drives the
     /// out-of-date badge on file rows. Empty for non-Perforce repos.
     out_of_date: HashSet<RepoPath>,
+    /// Opened files that still need resolving (`p4 fstat -Ru`), re-fetched on each reload. Drives
+    /// the merge-conflict badge on file rows. Empty for non-Perforce repos.
+    unresolved: HashSet<RepoPath>,
     focus_handle: FocusHandle,
     position: DockPosition,
     /// Whether the panel is the active (visible) one in its dock. We only query `p4` while the
@@ -191,6 +194,7 @@ impl PerforcePanel {
                 entries: Vec::new(),
                 expanded: HashSet::default(),
                 out_of_date: HashSet::default(),
+                unresolved: HashSet::default(),
                 focus_handle: cx.focus_handle(),
                 position: DockPosition::Left,
                 active: false,
@@ -277,12 +281,15 @@ impl PerforcePanel {
         // Out-of-date set runs on the background executor (`p4 fstat -Ro`), so it never blocks the
         // render thread; the rows just gain their badge once it resolves.
         let stale_task = repo.read(cx).perforce_out_of_date_paths(cx);
+        let unresolved_task = repo.read(cx).perforce_unresolved_paths(cx);
         self.reload_task = cx.spawn(async move |this, cx| {
             let stale = stale_task.await.unwrap_or_default();
+            let unresolved = unresolved_task.await.unwrap_or_default();
             if let Ok(groups) = task.await {
                 this.update(cx, |this, cx| {
                     this.changelists = groups;
                     this.out_of_date = stale;
+                    this.unresolved = unresolved;
                     this.rebuild_entries();
                     cx.notify();
                 })
@@ -531,25 +538,39 @@ impl PerforcePanel {
             .ok();
     }
 
-    /// The file's status icon, overlaid with a small warning triangle at the bottom-left when the
-    /// file is out of date (a newer head revision exists), reusing the diagnostic-triangle style.
+    /// The file's status icon, overlaid with small corner badges: a warning triangle at the
+    /// bottom-left when the file is out of date (a newer head revision exists), and a merge-conflict
+    /// glyph at the top-right when the file needs resolving (p4v-style corner placement). Both can
+    /// appear at once.
     fn render_file_icon(&self, file: &ChangelistFile) -> AnyElement {
         let icon = git_status_icon(file.status);
-        if self.out_of_date.contains(&file.path) {
-            div()
-                .relative()
-                .child(icon)
-                .child(
+        let out_of_date = self.out_of_date.contains(&file.path);
+        let unresolved = self.unresolved.contains(&file.path);
+        if !out_of_date && !unresolved {
+            return icon.into_any_element();
+        }
+        div()
+            .relative()
+            .child(icon)
+            .when(out_of_date, |this| {
+                this.child(
                     div().absolute().bottom(px(-2.)).left(px(-3.)).child(
                         Icon::new(IconName::Triangle)
                             .size(IconSize::Indicator)
                             .color(Color::Warning),
                     ),
                 )
-                .into_any_element()
-        } else {
-            icon.into_any_element()
-        }
+            })
+            .when(unresolved, |this| {
+                this.child(
+                    div().absolute().top(px(-3.)).right(px(-3.)).child(
+                        Icon::new(IconName::GitMergeConflict)
+                            .size(IconSize::Indicator)
+                            .color(Color::Error),
+                    ),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_file_row(

@@ -1186,6 +1186,12 @@ pub trait GitRepository: Send + Sync {
     fn perforce_out_of_date_paths(&self) -> Task<Result<collections::HashSet<RepoPath>>> {
         Task::ready(Ok(collections::HashSet::default()))
     }
+
+    /// The set of opened files that still need resolving, for the conflict badge. An empty set for
+    /// non-Perforce backends. Only the Perforce backend overrides it.
+    fn perforce_unresolved_paths(&self) -> Task<Result<collections::HashSet<RepoPath>>> {
+        Task::ready(Ok(collections::HashSet::default()))
+    }
 }
 
 pub enum DiffType {

@@ -5278,6 +5278,24 @@ impl Repository {
         })
     }
 
+    /// Perforce conflict badge: the set of opened files needing resolve. Empty for git/non-VCS
+    /// repos and for remote projects (a host-local concern in the MVP).
+    pub fn perforce_unresolved_paths(
+        &self,
+        cx: &App,
+    ) -> Task<Result<collections::HashSet<RepoPath>>> {
+        let repository_state = self.repository_state.clone();
+        cx.background_spawn(async move {
+            let state = repository_state.await.map_err(|err| anyhow::anyhow!(err))?;
+            match state {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.perforce_unresolved_paths().await
+                }
+                RepositoryState::Remote(_) => Ok(collections::HashSet::default()),
+            }
+        })
+    }
+
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }

@@ -804,6 +804,17 @@ fn parse_where(ztag_output: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Parse `p4 -ztag fstat -Ru //client/...` into the set of opened files that still need resolving
+/// (merge conflicts after an integrate/sync). `-Ru` already limits the records to unresolved files,
+/// so every returned record is flagged; we just map each `clientFile` (a local filesystem path) to
+/// a repo path. Used to badge files needing `p4 resolve` in the Changes panel.
+fn parse_unresolved(working_directory: &Path, fstat_output: &str) -> HashSet<RepoPath> {
+    parse_ztag(fstat_output)
+        .into_iter()
+        .filter_map(|record| local_path_to_repo_path(working_directory, record.get("clientFile")?))
+        .collect()
+}
+
 /// Parse `p4 -ztag fstat -Ro //client/...` into the set of *opened* files whose synced revision is
 /// behind the head revision (`haveRev < headRev`). `-Ro` restricts the scan to opened files, so
 /// this never walks the whole (potentially huge) workspace. Files with no head/have revision (e.g.
@@ -1565,6 +1576,11 @@ impl GitRepository for PerforceRepository {
     /// Out-of-date badge data: opened files behind head revision (see [`Self::out_of_date_paths`]).
     fn perforce_out_of_date_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
         self.out_of_date_paths()
+    }
+
+    /// Conflict badge data: opened files needing resolve (see [`Self::unresolved_paths`]).
+    fn perforce_unresolved_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
+        self.unresolved_paths()
     }
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
@@ -2476,6 +2492,24 @@ impl PerforceRepository {
             Ok(parse_out_of_date(&working_directory, &stdout))
         })
     }
+
+    /// The set of opened workspace files that still need resolving (`p4 fstat -Ru`). `-Ru` already
+    /// limits the scan to unresolved opened files, so it never walks the whole workspace. Used to
+    /// badge merge-conflict files in the Changes panel.
+    pub fn unresolved_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
+        let cli = self.cli.clone();
+        let client_name = self.client_name.clone();
+        let working_directory = self.working_directory.clone();
+        let glob = format!("//{client_name}/...");
+        self.cli.executor.clone().spawn(async move {
+            let (stdout, _stderr, ok) = cli.run_lenient(true, &["fstat", "-Ru", &glob]).await?;
+            if !ok {
+                // No unresolved files (or transient error) — nothing to flag.
+                return Ok(HashSet::default());
+            }
+            Ok(parse_unresolved(&working_directory, &stdout))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -3030,6 +3064,30 @@ line two
         assert!(stale.contains(&repo_path("Packages/stale.json")));
         assert!(!stale.contains(&repo_path("b/current.cpp")));
         assert!(!stale.contains(&repo_path("c/added.md")));
+    }
+
+    #[test]
+    fn unresolved_flags_files_needing_resolve() {
+        // `p4 -ztag fstat -Ru` only emits records for files that still need resolving; map each
+        // `clientFile` (local path) to a repo path.
+        let working_directory = Path::new("E:/Projects/some_client_name");
+        let ztag = "\
+... depotFile //Depot.Project/Release/branch_x/a/conflict.cpp
+... clientFile E:/Projects\\some_client_name\\a\\conflict.cpp
+... headRev 9
+... haveRev 8
+... action integrate
+... unresolved 1
+
+... depotFile //Depot.Project/Release/branch_x/b/also.cpp
+... clientFile E:/Projects\\some_client_name\\b\\also.cpp
+... action integrate
+... unresolved 1
+";
+        let unresolved = parse_unresolved(working_directory, ztag);
+        assert_eq!(unresolved.len(), 2);
+        assert!(unresolved.contains(&repo_path("a/conflict.cpp")));
+        assert!(unresolved.contains(&repo_path("b/also.cpp")));
     }
 
     #[test]
