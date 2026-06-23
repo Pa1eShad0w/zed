@@ -556,6 +556,24 @@ impl CommitView {
         let author_name = commit.author_name.clone();
         let author_email = commit.author_email.clone();
         let commit_sha = commit.sha.clone();
+        // Perforce: the header button copies/labels the changelist (`@<change>`); git keeps the sha.
+        let is_perforce_commit = commit.revision_label.is_some();
+        let id_copy_text: SharedString = commit
+            .revision_label
+            .as_ref()
+            .map(|label| label.trim_start_matches('@').to_string().into())
+            .unwrap_or_else(|| commit_sha.clone());
+        let id_button_label = if is_perforce_commit {
+            "Changelist"
+        } else {
+            "Commit SHA"
+        };
+        let id_tooltip_label = if is_perforce_commit {
+            "Copy Changelist"
+        } else {
+            "Copy Commit SHA"
+        };
+        let id_tooltip_meta = commit.revision_label.clone().unwrap_or_else(|| commit_sha.clone());
         let commit_date = time::OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
             .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
@@ -588,7 +606,7 @@ impl CommitView {
             .read_from_clipboard()
             .and_then(|entry| entry.text())
             .map_or(false, |clipboard_text| {
-                clipboard_text.trim() == commit_sha.as_ref()
+                clipboard_text.trim() == id_copy_text.as_ref()
             });
 
         let (copy_icon, copy_icon_color) = if clipboard_has_sha {
@@ -675,27 +693,22 @@ impl CommitView {
                     )
                     .when(self.stash.is_none(), |this| {
                         this.child(
-                            Button::new("sha", "Commit SHA")
+                            Button::new("sha", id_button_label)
                                 .start_icon(
                                     Icon::new(copy_icon)
                                         .size(IconSize::Small)
                                         .color(copy_icon_color),
                                 )
                                 .tooltip({
-                                    let commit_sha = commit_sha.clone();
+                                    let meta = id_tooltip_meta.clone();
                                     move |_, cx| {
-                                        Tooltip::with_meta(
-                                            "Copy Commit SHA",
-                                            None,
-                                            commit_sha.clone(),
-                                            cx,
-                                        )
+                                        Tooltip::with_meta(id_tooltip_label, None, meta.clone(), cx)
                                     }
                                 })
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
                                     cx.write_to_clipboard(ClipboardItem::new_string(
-                                        commit_sha.to_string(),
+                                        id_copy_text.to_string(),
                                     ));
                                 }),
                         )
@@ -1044,13 +1057,18 @@ impl Item for CommitView {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
+        // Perforce: identify by changelist (`@<change>`); git: abbreviated sha.
+        let id = self.commit.revision_label.clone().unwrap_or_else(|| {
+            self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha).into()
+        });
         let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
-        format!("{short_sha} — {subject}").into()
+        format!("{id} — {subject}").into()
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
-        let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
+        let short_sha: SharedString = self.commit.revision_label.clone().unwrap_or_else(|| {
+            self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha).into()
+        });
         let subject = self.commit.message.split('\n').next().unwrap();
 
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({

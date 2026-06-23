@@ -10,6 +10,7 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     commit::ParsedCommitMessage,
     parse_git_remote_url,
+    perforce::swarm_changelist_url,
     repository::{
         CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
         SearchCommitArgs,
@@ -33,11 +34,13 @@ use project::{
         CommitDataState, GitGraphEvent, GitStore, GitStoreEvent, GraphDataResponse, Repository,
         RepositoryEvent, RepositoryId,
     },
+    project_settings::ProjectSettings,
 };
 use search::{
     SearchOption, SearchOptions, SearchSource, SelectNextMatch, SelectPreviousMatch,
     ToggleCaseSensitive, buffer_search,
 };
+use settings::Settings;
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
@@ -2502,6 +2505,13 @@ impl GitGraph {
         } else {
             "Copy SHA"
         };
+        // Swarm link for the changelist, when this is a Perforce commit and a host is configured.
+        let swarm_url = p4_change.as_ref().and_then(|change| {
+            let host = ProjectSettings::get_global(cx).perforce.swarm_host.clone()?;
+            let host = host.trim();
+            let chnum: u32 = change.trim_start_matches('@').parse().ok()?;
+            (!host.is_empty()).then(|| swarm_changelist_url(host, chnum))
+        });
 
         let header = match (&ref_name, &p4_change) {
             (Some(ref_name), _) => format!("Ref {ref_name}"),
@@ -2529,6 +2539,11 @@ impl GitGraph {
                         this.copy_commit_sha(index, cx);
                     }),
                 )
+                .when_some(swarm_url, |menu, url| {
+                    menu.entry("View in Swarm", None, move |_window, cx| {
+                        cx.open_url(&url);
+                    })
+                })
                 .when_some(ref_name.clone(), |menu, ref_name| {
                     menu.entry("Copy Ref Name", None, move |_window, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));

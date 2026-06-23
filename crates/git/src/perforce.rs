@@ -1722,6 +1722,7 @@ impl GitRepository for PerforceRepository {
                         commit_timestamp: data.commit_timestamp,
                         author_email: data.author_email,
                         author_name: data.author_name,
+                        revision_label: Some(format!("@{change}").into()),
                     });
                 }
                 let change_str = change.to_string();
@@ -1736,6 +1737,7 @@ impl GitRepository for PerforceRepository {
                     commit_timestamp: meta.time.unwrap_or(0),
                     author_email: SharedString::default(),
                     author_name: meta.user.unwrap_or_default().into(),
+                    revision_label: Some(format!("@{change}").into()),
                 })
             })
             .boxed()

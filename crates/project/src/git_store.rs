@@ -5989,6 +5989,7 @@ impl Repository {
                         commit_timestamp: resp.commit_timestamp,
                         author_email: resp.author_email.into(),
                         author_name: resp.author_name.into(),
+                        revision_label: None,
                     })
                 }
             }
@@ -9713,6 +9714,7 @@ fn proto_to_commit_details(proto: &proto::GitCommitDetails) -> CommitDetails {
         commit_timestamp: proto.commit_timestamp,
         author_email: proto.author_email.clone().into(),
         author_name: proto.author_name.clone().into(),
+        revision_label: None,
     }
 }
 

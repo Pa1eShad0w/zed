@@ -545,6 +545,9 @@ pub struct CommitDetails {
     pub commit_timestamp: i64,
     pub author_email: SharedString,
     pub author_name: SharedString,
+    /// Readable id to show in place of the abbreviated `sha` hex. The Perforce backend sets
+    /// `@<change>` (its `sha` is a synthetic Oid); `None` for git, which renders the short sha.
+    pub revision_label: Option<SharedString>,
 }
 
 #[derive(Debug)]
@@ -1469,6 +1472,7 @@ impl GitRepository for RealGitRepository {
                     commit_timestamp,
                     author_email,
                     author_name,
+                    revision_label: None,
                 })
             })
             .boxed()
