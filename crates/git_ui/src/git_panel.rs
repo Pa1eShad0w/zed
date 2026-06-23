@@ -637,6 +637,11 @@ impl TruncatedPatch {
 
 pub struct GitPanel {
     pub(crate) active_repository: Option<Entity<Repository>>,
+    /// Cached: is the active repository Perforce-backed? When true the Git Panel hides its dock
+    /// icon, ceding the workspace to the dedicated Perforce panel (the perforce repo implements the
+    /// GitRepository trait, so without this the Git Panel would redundantly show perforce content).
+    /// Resolved asynchronously on repo change (the repository state is a lazily-polled `Shared`).
+    active_is_perforce: bool,
     pub(crate) commit_editor: Entity<Editor>,
     /// Whether the commit editor should fill the vertical height of the panel.
     commit_editor_expanded: bool,
@@ -838,6 +843,7 @@ impl GitPanel {
 
             let mut this = Self {
                 active_repository,
+                active_is_perforce: false,
                 commit_editor,
                 commit_editor_expanded: false,
                 conflicted_count: 0,
@@ -3614,6 +3620,32 @@ impl GitPanel {
         message.push('\n');
     }
 
+    /// Re-resolve whether the active repository is Perforce-backed (driving its lazily-polled state
+    /// to completion), cache it, and notify so the dock re-evaluates `icon()`. Mirrors the Perforce
+    /// panel's resolver; a synchronous peek returns `None` until the state is driven.
+    fn refresh_is_perforce(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            if self.active_is_perforce {
+                self.active_is_perforce = false;
+                cx.notify();
+            }
+            return;
+        };
+        let task = repo.read(cx).is_perforce_resolved(cx);
+        cx.spawn(async move |this, cx| {
+            let is_perforce = task.await;
+            this.update(cx, |this, cx| {
+                if this.active_is_perforce != is_perforce {
+                    this.active_is_perforce = is_perforce;
+                    // Notify so the dock re-evaluates the Git Panel icon (hidden for Perforce).
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn schedule_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = cx.entity().downgrade();
         self.reopen_commit_buffer(window, cx);
@@ -3700,7 +3732,14 @@ impl GitPanel {
             .as_ref()
             .and_then(|op| self.entry_by_path(&op.anchor));
 
+        let prev_repo_id = self.active_repository.as_ref().map(|repo| repo.read(cx).id);
         self.active_repository = self.project.read(cx).active_repository(cx);
+        let new_repo_id = self.active_repository.as_ref().map(|repo| repo.read(cx).id);
+        if prev_repo_id != new_repo_id {
+            // Only re-resolve perforce-ness when the active repo actually changes (schedule_update
+            // runs on every status tick), to avoid spawning a resolution task per update.
+            self.refresh_is_perforce(cx);
+        }
         self.entries.clear();
         self.entries_indices.clear();
         self.single_staged_entry.take();
@@ -6912,7 +6951,11 @@ impl Panel for GitPanel {
     }
 
     fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {
-        Some(ui::IconName::GitBranch).filter(|_| GitPanelSettings::get_global(cx).button)
+        // Hide the Git Panel dock icon when the active repo is Perforce — the dedicated Perforce
+        // panel owns that workspace (the perforce repo implements GitRepository, so the Git Panel
+        // would otherwise redundantly show perforce content and route history to perforce).
+        Some(ui::IconName::GitBranch)
+            .filter(|_| GitPanelSettings::get_global(cx).button && !self.active_is_perforce)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

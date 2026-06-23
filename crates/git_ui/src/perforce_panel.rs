@@ -1180,9 +1180,11 @@ impl Panel for PerforcePanel {
     }
 
     fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {
-        // Only surface the dock button in a Perforce workspace, so git users never see it.
+        // Same icon as the Git panel: the two panels are mutually exclusive (Git hides when the
+        // active repo is Perforce, this one shows only then), so the dock presents a single
+        // consistent "source control" button that swaps backend per workspace.
         self.is_active_perforce(cx)
-            .then_some(ui::IconName::ListTree)
+            .then_some(ui::IconName::GitBranch)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
