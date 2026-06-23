@@ -602,10 +602,49 @@ pub fn add_wsl_distro(
     });
 }
 
+/// Upper bound for the recent-projects popover width, in rems.
+///
+/// Wide enough to comfortably display long Perforce-style project names without
+/// taking over a typical-sized window. The lower bound is the historical fixed
+/// width passed by the call site (20rem today).
+const POPOVER_MAX_WIDTH_REMS: f32 = 48.;
+
 pub struct RecentProjects {
     pub picker: Entity<Picker<RecentProjectsDelegate>>,
-    rem_width: f32,
+    width: WidthConstraints,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Width bounds for a `RecentProjects` view, in rems.
+///
+/// `Modal` style uses a fixed width (min == max) so its layout is unchanged.
+/// `Popover` style uses `min < max` so long entries can grow the popover up to
+/// a sensible cap instead of being truncated at the historical fixed width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WidthConstraints {
+    min_rems: f32,
+    max_rems: f32,
+}
+
+impl WidthConstraints {
+    fn fixed(rems: f32) -> Self {
+        Self {
+            min_rems: rems,
+            max_rems: rems,
+        }
+    }
+
+    fn flexible(min_rems: f32, max_rems: f32) -> Self {
+        debug_assert!(
+            max_rems >= min_rems,
+            "WidthConstraints::flexible requires max_rems ({max_rems}) >= min_rems ({min_rems})"
+        );
+        Self { min_rems, max_rems }
+    }
+
+    fn is_fixed(self) -> bool {
+        self.min_rems == self.max_rems
+    }
 }
 
 impl ModalView for RecentProjects {
@@ -622,6 +661,16 @@ impl ModalView for RecentProjects {
 }
 
 impl RecentProjects {
+    #[cfg(test)]
+    fn min_width_rems(&self) -> f32 {
+        self.width.min_rems
+    }
+
+    #[cfg(test)]
+    fn max_width_rems(&self) -> f32 {
+        self.width.max_rems
+    }
+
     fn new(
         delegate: RecentProjectsDelegate,
         fs: Option<Arc<dyn Fs>>,
@@ -630,6 +679,16 @@ impl RecentProjects {
         cx: &mut Context<Self>,
     ) -> Self {
         let style = delegate.style;
+        // Popovers (opened from the title bar) should be able to grow when entries
+        // are long; modals keep the historical fixed width so their layout is
+        // untouched. `rem_width` is the historical width and is preserved as the
+        // popover's minimum.
+        let width = match style {
+            ProjectPickerStyle::Modal => WidthConstraints::fixed(rem_width),
+            ProjectPickerStyle::Popover => {
+                WidthConstraints::flexible(rem_width, POPOVER_MAX_WIDTH_REMS)
+            }
+        };
         let picker = cx.new(|cx| {
             Picker::list(delegate, window, cx)
                 .list_measure_all()
@@ -677,7 +736,7 @@ impl RecentProjects {
         .detach();
         Self {
             picker,
-            rem_width,
+            width,
             _subscriptions: subscriptions,
         }
     }
@@ -847,13 +906,20 @@ impl Focusable for RecentProjects {
 
 impl Render for RecentProjects {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
+        let base = v_flex()
             .key_context("RecentProjects")
             .on_action(cx.listener(Self::handle_toggle_open_menu))
             .on_action(cx.listener(Self::handle_remove_selected))
-            .on_action(cx.listener(Self::handle_add_to_workspace))
-            .w(rems(self.rem_width))
-            .child(self.picker.clone())
+            .on_action(cx.listener(Self::handle_add_to_workspace));
+        // Modal: keep historical fixed width. Popover: allow the container to grow
+        // with its content between [min, max] so long entries don't get truncated.
+        let sized = if self.width.is_fixed() {
+            base.w(rems(self.width.min_rems))
+        } else {
+            base.min_w(rems(self.width.min_rems))
+                .max_w(rems(self.width.max_rems))
+        };
+        sized.child(self.picker.clone())
     }
 }
 
@@ -3142,5 +3208,87 @@ mod tests {
             !has_local,
             "remote project group confirm should not create a local workspace"
         );
+    }
+
+    // ---------- Popover width: flexible min/max so long entries can expand ----------
+    //
+    // Issue: the recent-projects popover (opened from the title bar) was rendered
+    // with a fixed width (`.w(rems(20.))`). Long project names (e.g. long Perforce
+    // client names) were always truncated even when there was room on screen.
+    //
+    // Contract:
+    //   - Popover style: min_width preserves the historical width (so we never
+    //     render *narrower* than before), max_width is larger so long entries can
+    //     expand the popover up to a sensible cap.
+    //   - Modal style: width is fixed (min == max == historical width) so the
+    //     existing modal layout is untouched.
+    //
+    // These tests are intentionally narrow: they pin the *API contract* of the
+    // width values that `Render` consumes, not the rendered pixel width (which is
+    // GPUI-layout-dependent and brittle to assert on).
+
+    fn build_recent_projects(
+        cx: &mut TestAppContext,
+        style: ProjectPickerStyle,
+    ) -> Entity<RecentProjects> {
+        init_test(cx);
+        let (recent, _cx) = cx.add_window_view(|window, cx| {
+            let delegate = RecentProjectsDelegate::new(
+                WeakEntity::new_invalid(),
+                false,
+                cx.focus_handle(),
+                Vec::new(),
+                Vec::new(),
+                style,
+            );
+            // `fs = None` skips the async DB load; we only care about width here.
+            match style {
+                ProjectPickerStyle::Modal => RecentProjects::new(delegate, None, 34., window, cx),
+                ProjectPickerStyle::Popover => RecentProjects::new(delegate, None, 20., window, cx),
+            }
+        });
+        recent
+    }
+
+    #[gpui::test]
+    fn popover_width_preserves_historical_minimum(cx: &mut TestAppContext) {
+        let recent = build_recent_projects(cx, ProjectPickerStyle::Popover);
+        recent.read_with(cx, |recent, _| {
+            assert_eq!(
+                recent.min_width_rems(),
+                20.0,
+                "popover must never render narrower than its previous fixed width"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn popover_width_allows_expansion_for_long_entries(cx: &mut TestAppContext) {
+        let recent = build_recent_projects(cx, ProjectPickerStyle::Popover);
+        recent.read_with(cx, |recent, _| {
+            assert!(
+                recent.max_width_rems() > recent.min_width_rems(),
+                "popover max_width ({}) must exceed min_width ({}) so long entries can grow it",
+                recent.max_width_rems(),
+                recent.min_width_rems(),
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn modal_width_is_unchanged_and_fixed(cx: &mut TestAppContext) {
+        let recent = build_recent_projects(cx, ProjectPickerStyle::Modal);
+        recent.read_with(cx, |recent, _| {
+            assert_eq!(
+                recent.min_width_rems(),
+                34.0,
+                "modal min_width must match the historical fixed width"
+            );
+            assert_eq!(
+                recent.min_width_rems(),
+                recent.max_width_rems(),
+                "modal must remain a fixed width (min == max) so its layout is unchanged"
+            );
+        });
     }
 }
