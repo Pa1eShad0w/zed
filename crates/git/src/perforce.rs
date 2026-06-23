@@ -781,7 +781,11 @@ fn parse_where(ztag_output: &str) -> HashMap<String, String> {
 /// behind the head revision (`haveRev < headRev`). `-Ro` restricts the scan to opened files, so
 /// this never walks the whole (potentially huge) workspace. Files with no head/have revision (e.g.
 /// opened for add) are not out of date.
-fn parse_out_of_date(client_name: &str, fstat_output: &str) -> HashSet<RepoPath> {
+///
+/// `fstat`'s `clientFile` is a **local filesystem path** (e.g. `E:/Projects\client\Packages\x`),
+/// *not* the `//client/...` client-syntax path that `opened` reports — so we strip the workspace
+/// root with [`local_path_to_repo_path`], not [`client_path_to_repo_path`].
+fn parse_out_of_date(working_directory: &Path, fstat_output: &str) -> HashSet<RepoPath> {
     parse_ztag(fstat_output)
         .into_iter()
         .filter_map(|record| {
@@ -790,7 +794,7 @@ fn parse_out_of_date(client_name: &str, fstat_output: &str) -> HashSet<RepoPath>
             if have >= head {
                 return None;
             }
-            client_path_to_repo_path(client_name, record.get("clientFile")?)
+            local_path_to_repo_path(working_directory, record.get("clientFile")?)
         })
         .collect()
 }
@@ -1453,7 +1457,11 @@ impl GitRepository for PerforceRepository {
         let cli = self.cli.clone();
         let arg = format!("{}#have", self.client_syntax_path(&path));
         async move {
-            let out = cli.run(false, &["print", "-q", &arg]).await.ok()?;
+            let mut out = cli.run(false, &["print", "-q", &arg]).await.ok()?;
+            // `p4 print` returns CRLF on Windows text files, but Zed buffers are stored internally
+            // as LF. A CRLF diff base would make every line diff as "removed + identical added"
+            // (and a hunk revert could never clear it), so normalize to LF to match the buffer.
+            LineEnding::normalize(&mut out);
             Some(out)
         }
         .boxed()
@@ -2419,6 +2427,7 @@ impl PerforceRepository {
     pub fn out_of_date_paths(&self) -> Task<Result<HashSet<RepoPath>>> {
         let cli = self.cli.clone();
         let client_name = self.client_name.clone();
+        let working_directory = self.working_directory.clone();
         let glob = format!("//{client_name}/...");
         self.cli.executor.clone().spawn(async move {
             let (stdout, _stderr, ok) = cli.run_lenient(true, &["fstat", "-Ro", &glob]).await?;
@@ -2426,7 +2435,7 @@ impl PerforceRepository {
                 // No opened files (or transient error) — nothing to flag.
                 return Ok(HashSet::default());
             }
-            Ok(parse_out_of_date(&client_name, &stdout))
+            Ok(parse_out_of_date(&working_directory, &stdout))
         })
     }
 }
@@ -2952,28 +2961,35 @@ line two
 
     #[test]
     fn out_of_date_flags_only_stale_opened_files() {
-        // `p4 -ztag fstat -Ro //client/...` reports opened files with haveRev/headRev. A file is
-        // out of date when haveRev < headRev. Added files (no revs) and up-to-date files are not.
+        // Real `p4 -ztag fstat -Ro` shape (captured from a live server, identifiers synthesized):
+        // `clientFile` is a LOCAL filesystem path with mixed `/`+`\` separators (NOT client
+        // syntax), `headRev` precedes `haveRev`, and other-user opens appear as `... ...`
+        // continuation lines. A file is out of date when haveRev < headRev. Added files (no revs)
+        // and up-to-date files are not.
+        let working_directory = Path::new("E:/Projects/some_client_name");
         let ztag = "\
-... depotFile //Depot.Project/Release/branch_x/a/stale.cpp
-... clientFile //some_client_name/a/stale.cpp
-... headRev 5
+... depotFile //Depot.Project/Release/branch_x/Packages/stale.json
+... clientFile E:/Projects\\some_client_name\\Packages\\stale.json
+... headRev 4
+... headChange 7442295
 ... haveRev 3
 ... action edit
+... ... otherOpen0 someuser@some_other_client
+... ... otherAction0 edit
 
 ... depotFile //Depot.Project/Release/branch_x/b/current.cpp
-... clientFile //some_client_name/b/current.cpp
+... clientFile E:/Projects\\some_client_name\\b\\current.cpp
 ... headRev 7
 ... haveRev 7
 ... action edit
 
 ... depotFile //Depot.Project/Release/branch_x/c/added.md
-... clientFile //some_client_name/c/added.md
+... clientFile E:/Projects\\some_client_name\\c\\added.md
 ... action add
 ";
-        let stale = parse_out_of_date("some_client_name", ztag);
+        let stale = parse_out_of_date(working_directory, ztag);
         assert_eq!(stale.len(), 1);
-        assert!(stale.contains(&repo_path("a/stale.cpp")));
+        assert!(stale.contains(&repo_path("Packages/stale.json")));
         assert!(!stale.contains(&repo_path("b/current.cpp")));
         assert!(!stale.contains(&repo_path("c/added.md")));
     }
