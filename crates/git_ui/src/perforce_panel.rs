@@ -625,6 +625,16 @@ impl PerforcePanel {
         let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
             let mut menu = menu.context(self.focus_handle.clone());
 
+            // Open the local file in the editor (applies to any file).
+            {
+                let f = file.clone();
+                let w = weak.clone();
+                menu = menu.entry("Open File", None, move |window, cx| {
+                    w.update(cx, |this, cx| this.open_file(f.path.clone(), window, cx))
+                        .ok();
+                });
+            }
+
             // Diff entries — only meaningful for an opened (pending) file.
             if is_pending {
                 let (f1, f2) = (file.clone(), file.clone());
@@ -702,6 +712,23 @@ impl PerforcePanel {
             menu
         });
         self.set_context_menu(context_menu, position, window, cx);
+    }
+
+    /// Open the file's local working copy in the editor (mirrors GitPanel's "View File").
+    fn open_file(&mut self, path: RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(project_path) = repo.read(cx).repo_path_to_project_path(&path, cx) else {
+            return;
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_path_preview(project_path, None, false, false, true, window, cx)
+                    .detach_and_log_err(cx);
+            })
+            .ok();
     }
 
     /// Open the file's revision history in the commit-graph view (reusing git's GitGraph via

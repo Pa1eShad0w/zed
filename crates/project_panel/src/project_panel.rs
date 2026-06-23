@@ -1055,12 +1055,11 @@ impl ProjectPanel {
     /// clears the set and runs no `p4`, so git workspaces are completely unaffected. The query
     /// (`p4 fstat -Ro`) runs on the background executor and only scans opened files.
     fn update_perforce_out_of_date(&mut self, cx: &mut Context<Self>) {
-        let perforce_repo = self
-            .project
-            .read(cx)
-            .active_repository(cx)
-            .filter(|repo| repo.read(cx).is_perforce());
-        let Some(repo) = perforce_repo else {
+        // Don't gate on the synchronous `is_perforce()` — that peeks a lazily-polled `Shared` that
+        // is usually still `None`, so the set would never populate. `perforce_out_of_date_paths`
+        // awaits the repository state (driving it) and returns an empty set for non-Perforce repos,
+        // so it is safe to call unconditionally.
+        let Some(repo) = self.project.read(cx).active_repository(cx) else {
             if !self.perforce_out_of_date.is_empty() {
                 self.perforce_out_of_date.clear();
                 cx.notify();
@@ -1071,12 +1070,7 @@ impl ProjectPanel {
         self.perforce_out_of_date_task = cx.spawn(async move |this, cx| {
             let Ok(paths) = task.await else { return };
             this.update(cx, |this, cx| {
-                let Some(repo) = this
-                    .project
-                    .read(cx)
-                    .active_repository(cx)
-                    .filter(|repo| repo.read(cx).is_perforce())
-                else {
+                let Some(repo) = this.project.read(cx).active_repository(cx) else {
                     return;
                 };
                 let mapped: HashSet<(WorktreeId, Arc<RelPath>)> = paths
@@ -1087,8 +1081,10 @@ impl ProjectPanel {
                         Some((project_path.worktree_id, project_path.path))
                     })
                     .collect();
-                this.perforce_out_of_date = mapped;
-                cx.notify();
+                if this.perforce_out_of_date != mapped {
+                    this.perforce_out_of_date = mapped;
+                    cx.notify();
+                }
             })
             .ok();
         });

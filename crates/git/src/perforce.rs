@@ -1015,6 +1015,23 @@ fn remap_annotation_to_content(
     let buffer_text = content.to_string();
     let buffer_lines: Vec<&str> = split_lines(&buffer_text);
 
+    // Fast path: an unedited buffer matches the depot text exactly, so the mapping is the identity.
+    // This is the common case (the file is open but not modified) and skips the O(n*m) LCS on every
+    // blame call — critical for large files, where the LCS table would otherwise burn CPU and
+    // allocate gigabytes on each cursor move.
+    if buffer_lines == depot_lines {
+        return depot.iter().cloned().map(Some).collect();
+    }
+
+    // Guard the LCS against pathological size: its DP table is O(n*m) in both time and memory, so a
+    // large dirty file (e.g. a 50k-line JSON) would spin the CPU and allocate gigabytes. Above the
+    // cap, fall back to the depot-aligned annotation — blame may be slightly misaligned while the
+    // buffer is dirty, but we never hang.
+    const LCS_CELL_CAP: usize = 4_000_000;
+    if depot_lines.len().saturating_mul(buffer_lines.len()) > LCS_CELL_CAP {
+        return depot.iter().cloned().map(Some).collect();
+    }
+
     // Longest-common-subsequence between depot and buffer line texts. `matches[b] = Some(d)`
     // means buffer line `b` is unchanged and corresponds to depot line `d`.
     let matches = lcs_line_match(&depot_lines, &buffer_lines);
@@ -1526,7 +1543,10 @@ impl GitRepository for PerforceRepository {
         _env: Arc<HashMap<String, String>>,
         _is_executable: bool,
     ) -> BoxFuture<'_, Result<()>> {
-        unsupported_result!()
+        // Perforce has no staging index. "Restore hunk" reverts the buffer text and then unstages
+        // (`set_index_text`); since there is nothing to stage, this is a no-op success. Returning an
+        // error here instead surfaced a spurious "operation not supported" toast on every revert.
+        async { Ok(()) }.boxed()
     }
 
     fn remote_urls(&self) -> BoxFuture<'_, HashMap<String, String>> {
@@ -2054,8 +2074,9 @@ impl GitRepository for PerforceRepository {
             let max_arg = max.to_string();
             let args = [
                 "filelog",
-                "-l",
-                "-t",
+                "-l", // long output: full changelist descriptions
+                "-t", // include timestamps
+                "-h", // follow history through renames/integrations (matches P4V's filelog -h)
                 "-m",
                 max_arg.as_str(),
                 client_path.as_str(),
