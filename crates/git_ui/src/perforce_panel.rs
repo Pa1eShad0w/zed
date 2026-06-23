@@ -36,7 +36,7 @@ use workspace::{
 };
 
 use crate::git_graph::open_or_reuse_graph;
-use crate::git_panel::{GitPanel, GitStatusEntry};
+use crate::git_panel::GitStatusEntry;
 use crate::git_panel_settings::{GitPanelScrollbarAccessor, GitPanelSettings};
 use crate::git_status_icon;
 use crate::project_diff::ProjectDiff;
@@ -1148,20 +1148,14 @@ impl Panel for PerforcePanel {
         }
     }
 
-    fn default_size(&self, window: &Window, cx: &App) -> Pixels {
-        // Mirror the git panel's *effective* width (its persisted size, or its default) so the
-        // Perforce panel lines up exactly with its SCM sibling on first open — not just with the
-        // git default, which the user may have resized away from.
-        self.workspace
-            .upgrade()
-            .and_then(|ws| {
-                let ws = ws.read(cx);
-                let git_panel = ws.panel::<GitPanel>(cx)?;
-                ws.dock_at_position(self.position)
-                    .read(cx)
-                    .stored_panel_size(&git_panel, window, cx)
-            })
-            .unwrap_or_else(|| GitPanelSettings::get_global(cx).default_width)
+    fn default_size(&self, _window: &Window, cx: &App) -> Pixels {
+        // Match the git panel's default width so the Perforce panel lines up with its SCM sibling.
+        //
+        // NOTE: must not read the `Workspace` entity here. `default_size` is invoked from dock
+        // layout (`clamp_panel_size`) which can run while the `Workspace` is already leased (e.g.
+        // opening a new window) — re-reading it then double-leases and panics. The persisted-size
+        // mirror that used to live here did exactly that, so we use the setting default instead.
+        GitPanelSettings::get_global(cx).default_width
     }
 
     fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {

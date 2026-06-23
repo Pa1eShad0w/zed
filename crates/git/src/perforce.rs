@@ -810,6 +810,8 @@ fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitDa
         commit_timestamp: rev.time.unwrap_or(0),
         subject: rev.desc.lines().next().unwrap_or_default().to_string().into(),
         message: rev.desc.clone().into(),
+        // File rev + changelist, decimal (#16/#17) — shown instead of the synthetic-Oid hex.
+        revision_label: Some(format!("#{} @{}", rev.rev, rev.change).into()),
     }
 }
 
@@ -2157,6 +2159,9 @@ impl GitRepository for PerforceRepository {
                     commit_timestamp: meta.time.unwrap_or(0),
                     subject: meta.summary.clone().unwrap_or_default().into(),
                     message: meta.summary.unwrap_or_default().into(),
+                    // Describe-fallback (a change not in the filelog cache): no per-file rev here,
+                    // so show just the decimal changelist.
+                    revision_label: Some(format!("@{change}").into()),
                 })
             }
         }))
@@ -3076,6 +3081,21 @@ line two
         assert_eq!(revs[1].change, 6500000);
         assert_eq!(revs[1].action, "add");
         assert_eq!(revs[1].desc, "Initial work");
+    }
+
+    #[test]
+    fn filelog_commit_data_uses_decimal_change_and_rev_label() {
+        // File history must show a readable `#<rev> @<change>` (decimal), not the synthetic-Oid hex.
+        let rev = FilelogRev {
+            rev: 3,
+            change: 6596347,
+            action: "edit".into(),
+            user: "someuser".into(),
+            time: Some(0),
+            desc: "Fix the thing".into(),
+        };
+        let data = filelog_rev_to_commit_data(&rev, Some(6500000));
+        assert_eq!(data.revision_label.as_deref(), Some("#3 @6596347"));
     }
 
     #[test]

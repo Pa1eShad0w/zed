@@ -9581,6 +9581,8 @@ fn commit_data_from_proto(commit: proto::CommitData) -> Result<CommitData> {
         commit_timestamp: commit.commit_timestamp,
         subject: SharedString::from(commit.subject),
         message: SharedString::from(commit.message),
+        // Not carried over the wire (collab is git-only; the Perforce backend runs locally).
+        revision_label: None,
     })
 }
 
@@ -10158,6 +10160,7 @@ mod tests {
                         commit_timestamp: rng.random_range(0..10_000),
                         subject: SharedString::from(format!("Subject {sha}")),
                         message: SharedString::from(format!("Subject {sha}\n\nBody for {sha}")),
+                        revision_label: None,
                     },
                     failing_shas.contains(sha),
                 )

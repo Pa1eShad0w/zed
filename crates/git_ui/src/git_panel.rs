@@ -5415,8 +5415,14 @@ impl GitPanel {
                                     let index = range.start + ix;
                                     let sha_string = sha.to_string();
                                     let sha_shared: SharedString = sha_string.clone().into();
-                                    let short_sha: SharedString =
-                                        sha_string[..7.min(sha_string.len())].to_string().into();
+                                    // Perforce supplies a readable `#<rev> @<change>` via
+                                    // revision_label; git leaves it None → abbreviated hex.
+                                    let short_sha: SharedString = data
+                                        .as_ref()
+                                        .and_then(|d| d.revision_label.clone())
+                                        .unwrap_or_else(|| {
+                                            sha_string[..7.min(sha_string.len())].to_string().into()
+                                        });
 
                                     let (subject, author_name, author_email, timestamp): (
                                         SharedString,

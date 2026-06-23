@@ -694,6 +694,7 @@ async fn test_remote_git_commit_data_batches(
                     commit_timestamp: 1_700_000_000 + index as i64,
                     subject: SharedString::from(format!("Subject {index}")),
                     message: SharedString::from(format!("Subject {index}\n\nBody {index}")),
+                    revision_label: None,
                 },
                 false,
             )
@@ -799,6 +800,7 @@ async fn test_remote_git_graph_data_and_search(
                     } else {
                         format!("Subject {index}\n\nPlain message {index}")
                     }),
+                    revision_label: None,
                 },
                 false,
             )

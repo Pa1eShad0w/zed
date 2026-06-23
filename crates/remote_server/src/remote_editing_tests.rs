@@ -1668,6 +1668,7 @@ async fn test_remote_search_commits_streams_proto_chunks(
                     commit_timestamp: index as i64,
                     subject: SharedString::from(format!("Subject {index}")),
                     message: SharedString::from(format!("needle commit {index}")),
+                    revision_label: None,
                 },
                 false,
             )

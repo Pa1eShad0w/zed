@@ -1810,7 +1810,7 @@ impl GitGraph {
                         .clone()
                 });
 
-                let short_sha = commit.data.sha.display_short();
+                let mut short_sha: SharedString = commit.data.sha.display_short().into();
                 let mut formatted_time = String::new();
                 let subject: SharedString;
                 let author_name: SharedString;
@@ -1819,6 +1819,10 @@ impl GitGraph {
                     subject = data.subject.clone();
                     author_name = data.author_name.clone();
                     formatted_time = format_timestamp(data.commit_timestamp);
+                    // Perforce supplies a readable `#<rev> @<change>`; git leaves this None → hex.
+                    if let Some(label) = &data.revision_label {
+                        short_sha = label.clone();
+                    }
                 } else {
                     subject = "Loading…".into();
                     author_name = "".into();
