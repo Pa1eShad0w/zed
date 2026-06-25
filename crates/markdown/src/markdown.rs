@@ -3255,6 +3255,19 @@ impl MarkdownElementBuilder {
         if text.is_empty() {
             return;
         }
+        // Preserve the invariant that a line's first SourceMapping sits at
+        // rendered_index 0. When rendered-only content (e.g. inline-code padding)
+        // is the first thing on a line, there is no push_text yet to anchor it, so
+        // seed a mapping here. Without this, a lookup for a rendered index inside
+        // the leading pad gap hits binary_search `Err(0)` and underflows (`ix - 1`
+        // == usize::MAX), panicking. Empty padding returns above, so the no-pad /
+        // upstream path never seeds and stays byte-identical.
+        if self.pending_line.source_mappings.is_empty() {
+            self.pending_line.source_mappings.push(SourceMapping {
+                rendered_index: 0,
+                source_index: self.current_source_index,
+            });
+        }
         let text_style = self.text_style();
         self.pending_line.text.push_str(text);
         self.pending_line.runs.push(text_style.to_run(text.len()));
@@ -4587,6 +4600,29 @@ mod tests {
         // Code is the last thing on the line — exercises the source_end clamp edge.
         let rendered = render_markdown_with_style("use `blah`", style, cx);
         assert_eq!(rendered.text_for_range(5..9), "blah");
+    }
+
+    #[gpui::test]
+    fn test_inline_code_padding_at_line_start_maps_rendered_zero(cx: &mut TestAppContext) {
+        // Regression: when inline code is the FIRST thing on a line, the leading
+        // rendered-only pad pushed the first SourceMapping off rendered_index 0,
+        // breaking the `mappings[0].rendered_index == 0` invariant. A lookup for a
+        // rendered index inside the leading pad gap then hit `binary_search` Err(0)
+        // and underflowed (`ix - 1` == usize::MAX), panicking. Crash signature:
+        // "index out of bounds: the len is N but the index is 18446744073709551615".
+        let style = MarkdownStyle {
+            inline_code_padding: "\u{2009}".into(),
+            ..MarkdownStyle::default()
+        };
+        let rendered = render_markdown_with_style("`blah` here", style, cx);
+        let line = rendered.lines.first().unwrap();
+
+        // Invariant restored: the first mapping covers rendered index 0.
+        assert_eq!(line.source_mappings.first().unwrap().rendered_index, 0);
+
+        // The query that used to panic: rendered index 0 sits in the leading pad
+        // gap. It must resolve (not underflow) to the line's source start.
+        assert_eq!(line.source_index_for_rendered_index(0), 0);
     }
 
     #[gpui::test]
