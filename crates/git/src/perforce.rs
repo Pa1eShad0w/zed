@@ -1659,6 +1659,13 @@ impl GitRepository for PerforceRepository {
         async { Ok(Vec::new()) }.boxed()
     }
 
+    fn worktree_created_at(
+        &self,
+        _worktree_path: PathBuf,
+    ) -> BoxFuture<'_, Result<Option<SystemTime>>> {
+        unsupported_result!()
+    }
+
     fn create_worktree(
         &self,
         _target: CreateWorktreeTarget,
