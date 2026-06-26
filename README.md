@@ -1,7 +1,14 @@
-# Zed
+# Zed (Perforce Integration Fork)
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+> [!NOTE]
+> **This is a modified fork of [Zed](https://github.com/zed-industries/zed), not the official release.**
+> It adds native Perforce (p4) backend support. For the official editor, visit [zed.dev](https://zed.dev).
+>
+> **Fork maintained by [@Pa1eShad0w](https://github.com/Pa1eShad0w).**
+> **License:** GPL-3.0-or-later (same as upstream), with Apache-2.0 components where marked.
+> See [LICENSE-GPL](LICENSE-GPL) and [LICENSE-APACHE](LICENSE-APACHE).
+
+---
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
@@ -9,7 +16,9 @@ Welcome to Zed, a high-performance, multiplayer code editor from the creators of
 
 ### Installation
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+**This fork:** distributed via internal update server. Source code is available here on GitHub.
+
+**Official Zed:** [download from zed.dev](https://zed.dev/download) or install via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
 
 Other platforms are not yet available:
 
