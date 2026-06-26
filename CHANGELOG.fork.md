@@ -9,7 +9,7 @@
 > 文件名说明：规范要求 `CHANGELOG.md`，但本 fork 选用 `CHANGELOG.fork.md` 以避免与 upstream 未来可能新增的 `CHANGELOG.md` 在 rebase / merge 时冲突。这是有意识地偏离规范的唯一一处。
 
 ## [Unreleased]
-comm
+
 ### Added
 
 - `ef1ac27` (2026-06-23) Perforce file history 表格新增两列：行首 `Revision` (`#<rev>`)、行尾 `Branch`（integration 来源 stream 第 2 段路径），整体布局 `[Revision, Description, Date, Author, Change, Branch]`。仅在 Perforce repo 的 `LogSource::Path` 下开启；git file history 与全仓 graph 的 5-tuple 列归一化、`Table::new(4)`、4-cell 行渲染等都保留不变。数据来源 `CommitData.file_revision` / `.branch`（filelog 解析时填入）。
@@ -37,6 +37,7 @@ comm
 - `fdbe70e` (2026-06-22) Perforce buffer 中的 inline diff hunk 控件隐藏 `Stage` / `Unstage`（Perforce 没有 index），并将 `Restore` 重命名为 `Revert`（语义是回到 `#have`）。
 - `4483f95` (2026-06-22) Markdown 渲染采用分级主题值：agent 上下文用偏保守的间距，preview 上下文用完整可读性值（line-height 1.6 + inline-code padding + 深色背景）。
 - `af2d5ea` (2026-06-16) Perforce scoped status 启动优化：调 `p4 opened` 前先按磁盘只读位预筛（同步且未 open 的文件一定只读），全部只读时跳过 `p4 opened` round-trip——实测消除启动时约 50 次零结果 `p4 opened` 调用；任何可写/缺失/目录/无法 stat 的路径保守 fallback 到 `p4 opened` 权威查询。
+- `e4e530b` (2026-06-26) README 添加 fork 声明（维护者 @Pa1eShad0w、GPL 许可证信息），About 对话框标题与版本行标注 "Perforce fork"，满足 GPL v3 Section 5(a) 修改标记要求。
 
 ### Fixed
 
