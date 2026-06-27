@@ -172,6 +172,32 @@ pub struct AutoUpdater {
     update_check_type: UpdateCheckType,
 }
 
+/// Streams `path` through SHA-256 and returns the lowercase hex digest.
+///
+/// Used by the Fork channel update flow to verify the downloaded installer
+/// against the `sha256` field of the `ReleaseAsset` returned by the intranet
+/// update server (spec fork-update-system.spec.md §6.4.2). The 64 KiB buffer
+/// keeps peak memory bounded for multi-hundred-MB installers; do not collapse
+/// this to `std::fs::read` + one-shot hash.
+fn sha256_hex_of_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("sha256_hex_of_file: open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("sha256_hex_of_file: read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ReleaseAsset {
     pub version: String,
@@ -350,16 +376,22 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
-        // TODO(Phase E): Fork release notes URL per spec §6 (point at intranet update server).
+        // Fork channel: route release notes at the intranet update server.
+        // Preserves the `-fork.N` prerelease segment because intranet builds
+        // are distinguished by it (unlike upstream Stable/Preview, which
+        // strip `pre`). `build` metadata is stripped so the URL is stable
+        // across rebuilds of the same logical fork release. Per spec C4,
+        // we use `current_version` like upstream; pointing at the *newer*
+        // available version after "Update Ready" is deferred future work.
         ReleaseChannel::Fork => {
+            let setting_url = client::AutoUpdateSettings::get_global(cx).server_url.clone();
+            let base = client::normalize_update_server_url(setting_url.as_deref())?;
             let auto_updater = AutoUpdater::get(cx)?;
             let auto_updater = auto_updater.read(cx);
             let mut current_version = auto_updater.current_version.clone();
-            current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            let path = format!("/releases/fork/{current_version}");
+            format!("{base}{path}")
         }
     };
     Some(url)
@@ -659,17 +691,44 @@ impl AutoUpdater {
         let http_client = client.http_client();
 
         let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
-        let url = http_client.build_zed_cloud_url_with_query(
-            &path,
-            AssetQuery {
-                os,
-                arch,
-                asset,
-                metrics_id: metrics_id.as_deref(),
-                system_id: system_id.as_deref(),
-                is_staff,
-            },
-        )?;
+        let url = if release_channel == ReleaseChannel::Fork {
+            // Fork channel: route the asset request at the intranet update
+            // server configured by `auto_update.server_url`, and strip ALL
+            // telemetry-correlated query fields. Per spec §7.5 / Round-2
+            // review fix DA6/CA6, the field NAMES `metrics_id`, `system_id`,
+            // and `is_staff` are themselves fork-client fingerprints in the
+            // upstream server's access logs — sending them with empty/null
+            // values would still leak the fact that this is a fork build.
+            // Only `os`, `arch`, `asset` cross the wire on Fork.
+            // `AsyncApp::update` returns the closure result directly (not a
+            // Result), so this cannot fail at the gpui layer; the only way
+            // for Fork to fail here is the user-actionable "no server_url"
+            // case, which the `context(...)` below makes diagnosable.
+            let setting_url: Option<String> = cx.update(|cx| {
+                client::AutoUpdateSettings::get_global(cx)
+                    .server_url
+                    .clone()
+            });
+            let base = client::normalize_update_server_url(setting_url.as_deref())
+                .context("Fork channel: auto_update.server_url is not configured")?;
+            let full = format!("{base}{path}");
+            http_client::Url::parse_with_params(
+                &full,
+                &[("os", os), ("arch", arch), ("asset", asset)],
+            )?
+        } else {
+            http_client.build_zed_cloud_url_with_query(
+                &path,
+                AssetQuery {
+                    os,
+                    arch,
+                    asset,
+                    metrics_id: metrics_id.as_deref(),
+                    system_id: system_id.as_deref(),
+                    is_staff,
+                },
+            )?
+        };
 
         let mut response = http_client
             .get(url.as_str(), Default::default(), true)
@@ -745,9 +804,35 @@ impl AutoUpdater {
             .await
             .context("Failed to create installer dir")?;
         let target_path = Self::target_path(&installer_dir).await?;
+        // Capture sha256 BEFORE `download_release` consumes `fetched_release_data`.
+        // Cloning first is required because the move into `download_release`
+        // happens unconditionally on all channels (Fork verifies; others ignore).
+        let expected_sha256: Option<String> = fetched_release_data.sha256.clone();
         download_release(&target_path, fetched_release_data, client)
             .await
             .with_context(|| format!("Failed to download update to {}", target_path.display()))?;
+
+        // Fork channel: verify the downloaded installer's SHA-256 against the
+        // value the intranet update server returned in `ReleaseAsset.sha256`.
+        // Per spec fork-update-system.spec.md §6.4.2, a missing/empty sha256
+        // on the Fork channel is a hard failure: we will not install an
+        // unverified binary on a corporate network. Other channels keep
+        // upstream behavior (no verify, no error if sha256 absent).
+        if release_channel == ReleaseChannel::Fork {
+            let expected = expected_sha256
+                .as_deref()
+                .context("Fork channel requires sha256 in ReleaseAsset")?;
+            let target_for_hash = target_path.clone();
+            let actual = cx
+                .background_executor()
+                .spawn(async move { sha256_hex_of_file(&target_for_hash) })
+                .await?;
+            anyhow::ensure!(
+                actual.eq_ignore_ascii_case(expected),
+                "sha256 mismatch for {}: expected {expected}, got {actual}",
+                target_path.display(),
+            );
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Installing {
@@ -1815,6 +1900,75 @@ mod tests {
         )
         .unwrap();
         assert!(result.is_none());
+    }
+
+    /// Phase E E1: `sha256_hex_of_file` is the gate the Fork-channel update
+    /// flow runs against the downloaded installer. The 64 KiB streaming
+    /// buffer must produce the same digest as a one-shot hash of the bytes
+    /// — verify with a payload >> the buffer (here: 200 KiB) so we exercise
+    /// at least three reads through the loop.
+    #[test]
+    fn test_sha256_hex_of_file_streams_correctly() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let bytes: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let actual = super::sha256_hex_of_file(&path).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(actual, expected);
+    }
+
+    /// Phase E E1: an empty file is a well-defined input (sha256 of empty
+    /// string), not an error. Guards against a regression where someone
+    /// "fixes" the read loop to error on EOF without bytes.
+    #[test]
+    fn test_sha256_hex_of_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, b"").unwrap();
+        let actual = super::sha256_hex_of_file(&path).unwrap();
+        assert_eq!(
+            actual,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+    }
+
+    /// Phase E E2 / spec §7.5 / Round-2 fix DA6/CA6: the Fork-channel asset
+    /// URL must contain ONLY `os`, `arch`, `asset`. The names `metrics_id`,
+    /// `system_id`, and `is_staff` are fork-client fingerprints in upstream
+    /// access logs — sending them as empty/null still leaks the fact that
+    /// this is a fork build. This test pins the exact query-key set on
+    /// `Url::parse_with_params` with the same triple used in
+    /// `get_release_asset`, so a future edit that re-adds telemetry keys
+    /// fails loudly.
+    #[test]
+    fn test_fork_asset_url_omits_telemetry_keys() {
+        let base = "http://intra.update.corp";
+        let path = "/releases/fork/latest/asset";
+        let full = format!("{base}{path}");
+        let url = http_client::Url::parse_with_params(
+            &full,
+            &[("os", "windows"), ("arch", "x86_64"), ("asset", "zed")],
+        )
+        .unwrap();
+
+        let keys: std::collections::HashSet<String> = url
+            .query_pairs()
+            .map(|(k, _)| k.into_owned())
+            .collect();
+        let expected: std::collections::HashSet<String> =
+            ["os", "arch", "asset"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            keys, expected,
+            "Fork asset URL must carry only os/arch/asset; \
+             field names metrics_id/system_id/is_staff are themselves \
+             fork-client fingerprints (spec §7.5)",
+        );
+        assert!(!url.query().unwrap().contains("metrics_id"));
+        assert!(!url.query().unwrap().contains("system_id"));
+        assert!(!url.query().unwrap().contains("is_staff"));
     }
 
     #[cfg(test)]
