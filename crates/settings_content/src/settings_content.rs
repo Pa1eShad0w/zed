@@ -154,6 +154,18 @@ pub struct SettingsContent {
     /// Default: true
     pub auto_update: Option<bool>,
 
+    /// URL of the auto-update server.
+    ///
+    /// `null`, empty, whitespace-only, or non-`http(s)` values disable
+    /// auto-update polling on the Fork release channel. The value is
+    /// normalised at read time (whitespace trimmed, trailing slashes
+    /// stripped) before being used as a base URL.
+    ///
+    /// On non-Fork channels this setting is ignored.
+    ///
+    /// Default: null
+    pub auto_update_server_url: Option<String>,
+
     /// This base keymap settings adjusts the default keybindings in Zed to be similar
     /// to other common code editors. By default, Zed's keymap closely follows VSCode's
     /// keymap, with minor adjustments, this corresponds to the "VSCode" setting.

@@ -1499,9 +1499,9 @@
   // Control what info is collected by Zed.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
-    "metrics": true,
+    "metrics": false,
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,
@@ -1513,6 +1513,13 @@
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
   "auto_update": true,
+  // Base URL of the update server used to discover and download Zed releases
+  // when running on the Fork release channel. When set to `null` (default),
+  // automatic updates are disabled on the Fork channel. On non-Fork channels
+  // this setting is ignored. The trailing slash is optional.
+  //
+  // Example: "https://updates.example.internal"
+  "auto_update_server_url": null,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:

@@ -1,11 +1,14 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
+pub mod auto_update_url;
 mod llm_token;
 mod proxy;
 pub mod telemetry;
 pub mod user;
 pub mod zed_urls;
+
+pub use auto_update_url::normalize_update_server_url;
 
 use anyhow::{Context as _, Result, anyhow};
 use async_tungstenite::tungstenite::{
@@ -126,6 +129,40 @@ impl Settings for ClientSettings {
             server_url: content.server_url.clone().unwrap(),
             credentials_url: content.credentials_url.clone(),
         }
+    }
+}
+
+/// Settings for the Fork-channel auto-update path.
+///
+/// `server_url` is the base URL of the intranet auto-update server. `None`
+/// (or empty / whitespace / a non-`http(s)` value) disables fork-channel
+/// polling outright; on non-fork channels the field is ignored. Read at use
+/// site through [`normalize_update_server_url`] for the canonical
+/// trim / scheme-check / strip-trailing-slash normalisation.
+#[derive(Clone, Deserialize, RegisterSetting)]
+pub struct AutoUpdateSettings {
+    pub server_url: Option<String>,
+}
+
+impl Settings for AutoUpdateSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            server_url: content.auto_update_server_url.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl AutoUpdateSettings {
+    /// Test-only entry point: replace the global `AutoUpdateSettings` value
+    /// directly without going through SettingsStore JSON.
+    ///
+    /// Mirrors the closure-mutation shape downstream callers (e.g. the
+    /// release_channel poll-gating tests in plan Task C1) consume.
+    pub fn override_for_test(cx: &mut gpui::App, f: impl FnOnce(&mut Self)) {
+        let mut settings = AutoUpdateSettings::get_global(cx).clone();
+        f(&mut settings);
+        AutoUpdateSettings::override_global(settings, cx);
     }
 }
 
