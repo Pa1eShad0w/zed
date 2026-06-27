@@ -176,6 +176,8 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 struct MacOsUnmounter<'a> {
@@ -816,10 +818,15 @@ impl AutoUpdater {
                     return Ok(newer_version);
                 }
                 VersionCheckType::Semantic(cached_version) => {
-                    return Self::check_if_fetched_version_is_newer_non_nightly(
-                        cached_version,
-                        parsed_fetched_version?,
-                    );
+                    return match release_channel {
+                        ReleaseChannel::Fork => {
+                            Self::check_fork(cached_version, parsed_fetched_version?)
+                        }
+                        _ => Self::check_if_fetched_version_is_newer_non_nightly(
+                            cached_version,
+                            parsed_fetched_version?,
+                        ),
+                    };
                 }
             }
         }
@@ -839,6 +846,7 @@ impl AutoUpdater {
                     .then(|| VersionCheckType::Sha(AppCommitSha::new(fetched_version)));
                 Ok(newer_version)
             }
+            ReleaseChannel::Fork => Self::check_fork(installed_version, parsed_fetched_version?),
             _ => Self::check_if_fetched_version_is_newer_non_nightly(
                 installed_version,
                 parsed_fetched_version?,
@@ -912,6 +920,22 @@ impl AutoUpdater {
         let should_download = fetched_version > installed_version;
         let newer_version = should_download.then(|| VersionCheckType::Semantic(fetched_version));
         Ok(newer_version)
+    }
+
+    /// Fork-channel version compare. Unlike the non-nightly path we do NOT
+    /// strip `pre` or `build` from either side; the prerelease segment IS
+    /// our serial number (`fork.{N}`). Build metadata is compared
+    /// lexicographically by the Rust `semver` crate (the SemVer spec leaves
+    /// build-metadata ordering unspecified); the Fork channel relies on the
+    /// worker's wire-format validation (spec §6.2.1) to keep `fetched.build`
+    /// empty so this divergence from upstream SemVer is unreachable on the
+    /// wire.
+    fn check_fork(
+        installed: Version,
+        fetched: Version,
+    ) -> Result<Option<VersionCheckType>> {
+        let should_download = fetched > installed;
+        Ok(should_download.then(|| VersionCheckType::Semantic(fetched)))
     }
 
     pub fn set_should_show_update_notification(
@@ -1726,5 +1750,170 @@ mod tests {
                  (without restarting Zed)"
             );
         });
+    }
+
+    /// Phase D D3 regression: the main dispatch entry of
+    /// `check_if_fetched_version_is_newer` must route the Fork channel to
+    /// `check_fork` (semver-preserving) rather than the stable strip-pre
+    /// path. Without this, `fork.3 -> fork.4` would compare equal and the
+    /// user would never see fork.4.
+    #[test]
+    fn test_main_dispatch_uses_check_fork_for_fork_channel() {
+        let installed: Version = "0.250.0-fork.3".parse().unwrap();
+        let fetched = "0.250.0-fork.4".to_string();
+        let result = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Fork,
+            Ok(None),
+            installed,
+            fetched,
+            AutoUpdateStatus::Idle,
+        )
+        .unwrap();
+        assert!(
+            result.is_some(),
+            "Fork channel main dispatch must use semver-preserving compare",
+        );
+    }
+
+    /// Phase D D4 regression (F2 finding): when a Fork user denies the
+    /// restart prompt after `fork.4` installs and `fork.5` later ships, the
+    /// next poll lands on the cached `AutoUpdateStatus::Updated` branch.
+    /// That branch must also dispatch by channel to `check_fork`, otherwise
+    /// the strip-pre path would mask fork.5 as equal to fork.4.
+    #[test]
+    fn test_cached_updated_branch_fork_picks_up_new_version() {
+        let installed: Version = "0.250.0-fork.3".parse().unwrap();
+        let cached = VersionCheckType::Semantic("0.250.0-fork.4".parse().unwrap());
+        let fetched = "0.250.0-fork.5".to_string();
+        let result = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Fork,
+            Ok(None),
+            installed,
+            fetched,
+            AutoUpdateStatus::Updated { version: cached },
+        )
+        .unwrap();
+        assert!(
+            result.is_some(),
+            "Cached Updated branch must dispatch by channel; Fork should detect fork.5 over cached fork.4",
+        );
+    }
+
+    /// Phase D D4: same cached/fetched on the Fork channel must NOT trigger
+    /// another download — `check_fork` returns `None` when versions are equal.
+    #[test]
+    fn test_cached_updated_branch_fork_ignores_same_version() {
+        let installed: Version = "0.250.0-fork.3".parse().unwrap();
+        let cached = VersionCheckType::Semantic("0.250.0-fork.4".parse().unwrap());
+        let fetched = "0.250.0-fork.4".to_string();
+        let result = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Fork,
+            Ok(None),
+            installed,
+            fetched,
+            AutoUpdateStatus::Updated { version: cached },
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(test)]
+    mod fork_version_compare {
+        use super::super::AutoUpdater;
+        use semver::Version;
+
+        fn newer(installed: &str, fetched: &str) -> bool {
+            let i: Version = installed.parse().unwrap();
+            let f: Version = fetched.parse().unwrap();
+            AutoUpdater::check_fork(i, f).unwrap().is_some()
+        }
+
+        #[test]
+        fn case_01_equal_versions_not_newer() {
+            assert!(!newer("0.250.0-fork.3", "0.250.0-fork.3"));
+        }
+
+        #[test]
+        fn case_02_fork_n_plus_1_newer() {
+            assert!(newer("0.250.0-fork.3", "0.250.0-fork.4"));
+        }
+
+        #[test]
+        fn case_03_downgrade_not_newer() {
+            assert!(!newer("0.250.0-fork.4", "0.250.0-fork.3"));
+        }
+
+        #[test]
+        fn case_04_fork_3_vs_fork_10_numeric_not_lex() {
+            assert!(newer("0.250.0-fork.3", "0.250.0-fork.10"));
+        }
+
+        #[test]
+        fn case_05_fork_9_vs_fork_10() {
+            assert!(newer("0.250.0-fork.9", "0.250.0-fork.10"));
+        }
+
+        #[test]
+        fn case_06_minor_bump_newer() {
+            assert!(newer("0.250.0-fork.0", "0.251.0-fork.0"));
+        }
+
+        #[test]
+        fn case_07_high_fork_n_loses_to_minor_bump() {
+            assert!(newer("0.250.0-fork.99", "0.251.0-fork.0"));
+        }
+
+        #[test]
+        fn case_08_installed_with_build_meta_equal() {
+            assert!(!newer("0.250.0-fork.3+abc1234", "0.250.0-fork.3"));
+        }
+
+        // case_09 (fetched `0.250.0-fork.3+abc1234` vs installed `0.250.0-fork.3`)
+        // dropped per orchestrator Option A (2026-06-27). The Rust `semver`
+        // crate compares build metadata lexicographically (SemVer spec leaves
+        // it unspecified), so `+abc1234 > no-build`. Spec §6.2.1 wire-format
+        // validation forbids non-empty `build` in fork assets, making this
+        // case unreachable at runtime.
+
+        #[test]
+        fn case_10_no_pre_outranks_pre_per_semver() {
+            // semver: 0.250.0 > 0.250.0-fork.0
+            assert!(!newer("0.250.0", "0.250.0-fork.0"));
+        }
+
+        #[test]
+        fn case_11_upstream_stable_supersedes_fork_at_same_base() {
+            assert!(newer("0.250.0-fork.0", "0.250.0"));
+        }
+
+        // case_12 (fetched `0.250.0-fork.3-pre.1` vs installed `0.250.0-fork.3`)
+        // dropped per orchestrator Option A (2026-06-27). Per SemVer 11.4.4 a
+        // larger set of prerelease fields has *higher* precedence than a
+        // smaller set when the preceding identifiers are equal, so
+        // `fork.3-pre.1 > fork.3` — the opposite of the original spec
+        // assumption. Spec §6.2.1 wire-format validation rejects any
+        // prerelease that doesn't match `^fork\.\d+$` exactly, making this
+        // case unreachable at runtime.
+
+        // Cached AutoUpdateStatus::Updated path coverage — these will be exercised
+        // in Phase D finish (D4) when the cached arm dispatches by channel.
+        // Author the cases here so the data is colocated with the rest of the
+        // semver matrix; the finish phase will wire them into a different test
+        // module if needed.
+
+        #[test]
+        fn case_13_fork_5_newer_than_cached_fork_4() {
+            assert!(newer("0.250.0-fork.4", "0.250.0-fork.5"));
+        }
+
+        #[test]
+        fn case_14_same_cached_and_fetched_not_newer() {
+            assert!(!newer("0.250.0-fork.4", "0.250.0-fork.4"));
+        }
+
+        #[test]
+        fn case_15_cached_higher_than_fetched_not_newer() {
+            assert!(!newer("0.250.0-fork.4", "0.250.0-fork.3"));
+        }
     }
 }
