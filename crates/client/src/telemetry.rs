@@ -725,7 +725,20 @@ mod tests {
     use util::rel_path::RelPath;
     use worktree::{PathChange, ProjectEntryId, WorktreeId};
 
+    // FORK FIXME (DD-F-pre-existing-telemetry-tests / F-40):
+    // This test fails on the perforce-integration fork because Phase B's
+    // default.json sets telemetry.metrics=false; init_test(cx) inherits that
+    // default, so report_event() returns early at line 520-522 and the queue
+    // never gets the single event the test asserts on (events_queue.len()==1).
+    // Fork orchestration documented this as pre-existing on baseline
+    // ddf4ff8259. User explicitly approved #[ignore] until full plan
+    // (Phases A–N) completes; revisit and properly fix (likely by enabling
+    // metrics inside init_test for this specific test) before merging the
+    // fork-update-system branch.
+    // See docs/agent-review-state.md §3 DD-F-pre-existing-telemetry-tests
+    // and §4 landmines for full context.
     #[gpui::test]
+    #[ignore = "fork: pre-existing failure under default.json metrics=false; see DD-F-pre-existing-telemetry-tests"]
     async fn test_telemetry_flush_on_max_queue_size(
         executor: BackgroundExecutor,
         cx: &mut TestAppContext,
@@ -802,7 +815,11 @@ mod tests {
         });
     }
 
+    // FORK FIXME (DD-F-pre-existing-telemetry-tests / F-40): same root cause as
+    // test_telemetry_flush_on_max_queue_size above. Ignored until full plan
+    // completes; revisit before merging.
     #[gpui::test]
+    #[ignore = "fork: pre-existing failure under default.json metrics=false; see DD-F-pre-existing-telemetry-tests"]
     async fn test_telemetry_flush_on_flush_interval(
         executor: BackgroundExecutor,
         cx: &mut TestAppContext,
