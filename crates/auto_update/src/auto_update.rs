@@ -324,6 +324,17 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        // TODO(Phase E): Fork release notes URL per spec §6 (point at intranet update server).
+        ReleaseChannel::Fork => {
+            let auto_updater = AutoUpdater::get(cx)?;
+            let auto_updater = auto_updater.read(cx);
+            let mut current_version = auto_updater.current_version.clone();
+            current_version.pre = semver::Prerelease::EMPTY;
+            current_version.build = semver::BuildMetadata::EMPTY;
+            let release_channel = release_channel.dev_name();
+            let path = format!("/releases/{release_channel}/{current_version}");
+            auto_updater.client.http_client().build_url(&path)
+        }
     };
     Some(url)
 }

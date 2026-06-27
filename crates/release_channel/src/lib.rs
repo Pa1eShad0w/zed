@@ -34,6 +34,7 @@ pub fn app_identifier() -> &'static str {
         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
         ReleaseChannel::Preview => "Zed-Editor-Preview",
         ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Fork => "Zed-Editor-Perforce-Fork",
     }
 }
 
@@ -137,6 +138,9 @@ pub enum ReleaseChannel {
 
     /// The Stable release channel.
     Stable,
+
+    /// The intranet-distributed Perforce Fork release channel.
+    Fork,
 }
 
 struct GlobalReleaseChannel(ReleaseChannel);
@@ -165,11 +169,12 @@ pub fn docs_url(slug: &str, cx: &App) -> String {
 
 impl ReleaseChannel {
     /// All release channels.
-    pub const ALL: [ReleaseChannel; 4] = [
+    pub const ALL: [ReleaseChannel; 5] = [
         ReleaseChannel::Dev,
         ReleaseChannel::Nightly,
         ReleaseChannel::Preview,
         ReleaseChannel::Stable,
+        ReleaseChannel::Fork,
     ];
 
     /// Returns the global [`ReleaseChannel`].
@@ -195,6 +200,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Fork => "Zed Fork",
         }
     }
 
@@ -205,6 +211,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "nightly",
             ReleaseChannel::Preview => "preview",
             ReleaseChannel::Stable => "stable",
+            ReleaseChannel::Fork => "fork",
         }
     }
 
@@ -217,6 +224,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
             ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Fork => "dev.zed.Zed-Perforce",
         }
     }
 
@@ -227,6 +235,7 @@ impl ReleaseChannel {
             Self::Nightly => Some("nightly=1"),
             Self::Preview => Some("preview=1"),
             Self::Stable => None,
+            Self::Fork => None,
         }
     }
 
@@ -237,6 +246,7 @@ impl ReleaseChannel {
             Self::Dev | Self::Nightly => Some("nightly"),
             Self::Preview => Some("preview"),
             Self::Stable => None,
+            Self::Fork => Some("fork"),
         };
 
         match channel_path_segment {
@@ -261,6 +271,7 @@ impl FromStr for ReleaseChannel {
             "nightly" => ReleaseChannel::Nightly,
             "preview" => ReleaseChannel::Preview,
             "stable" => ReleaseChannel::Stable,
+            "fork" => ReleaseChannel::Fork,
             _ => return Err(InvalidReleaseChannel),
         })
     }
@@ -269,6 +280,7 @@ impl FromStr for ReleaseChannel {
 #[cfg(test)]
 mod tests {
     use super::ReleaseChannel;
+    use std::str::FromStr;
 
     #[test]
     fn test_docs_url_for_release_channel() {
@@ -288,5 +300,19 @@ mod tests {
             ReleaseChannel::Stable.docs_url("settings"),
             "https://zed.dev/docs/settings"
         );
+    }
+
+    #[test]
+    fn test_fork_channel_names() {
+        let c = ReleaseChannel::Fork;
+        assert_eq!(c.display_name(), "Zed Fork");
+        assert_eq!(c.dev_name(), "fork");
+        assert_eq!(c.app_id(), "dev.zed.Zed-Perforce");
+        assert_eq!(ReleaseChannel::from_str("fork").unwrap(), ReleaseChannel::Fork);
+    }
+
+    #[test]
+    fn test_fork_channel_release_query_param_is_none() {
+        assert_eq!(ReleaseChannel::Fork.release_query_param(), None);
     }
 }

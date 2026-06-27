@@ -26,6 +26,10 @@ fn docs_url(cx: &App) -> String {
         ReleaseChannel::Dev | ReleaseChannel::Nightly => {
             format!("{server_url}/docs/nightly")
         }
+        // TODO(Phase E): Fork-specific docs URL per spec §4.1 (channel = "fork").
+        ReleaseChannel::Fork => {
+            format!("{server_url}/docs")
+        }
     }
 }
 

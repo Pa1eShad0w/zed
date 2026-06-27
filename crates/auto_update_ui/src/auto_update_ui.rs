@@ -209,9 +209,10 @@ impl Dismissable for SkillsAnnouncement {
 fn announcement_for_version(version: &Version, cx: &App) -> Option<AnnouncementContent> {
     let version_with_skills = match ReleaseChannel::global(cx) {
         ReleaseChannel::Stable => Version::new(1, 4, 0),
-        ReleaseChannel::Dev | ReleaseChannel::Nightly | ReleaseChannel::Preview => {
-            Version::new(1, 4, 0)
-        }
+        ReleaseChannel::Dev
+        | ReleaseChannel::Nightly
+        | ReleaseChannel::Preview
+        | ReleaseChannel::Fork => Version::new(1, 4, 0),
     };
 
     if *version >= version_with_skills && !SkillsAnnouncement::dismissed(cx) {

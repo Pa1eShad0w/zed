@@ -1436,6 +1436,8 @@ fn open_about_window(cx: &mut App) {
                 include_bytes!("../resources/app-icon-preview.png").as_slice()
             }
             ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png").as_slice(),
+            // TODO(Phase ?): Fork-specific About-window icon. Reusing Stable icon for now.
+            ReleaseChannel::Fork => include_bytes!("../resources/app-icon.png").as_slice(),
         };
 
         Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
