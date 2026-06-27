@@ -454,7 +454,7 @@ fn general_page(cx: &App) -> SettingsPage {
         ]
     }
 
-    fn auto_update_section() -> [SettingsPageItem; 2] {
+    fn auto_update_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Auto Update"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -469,6 +469,24 @@ fn general_page(cx: &App) -> SettingsPage {
                     },
                 }),
                 metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Update server URL",
+                description: "Fork channel only. Leave empty to disable auto-update. \
+                              Must be http or https. Trailing slash is stripped automatically.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("auto_update_server_url"),
+                    pick: |settings_content| settings_content.auto_update_server_url.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.auto_update_server_url = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("http://intra.update.corp"),
+                    ..Default::default()
+                })),
                 files: USER,
             }),
         ]
