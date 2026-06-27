@@ -40,7 +40,22 @@ function Get-VSArch {
 }
 
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+# Probe VS 2022 editions in preference order: Enterprise (stock github windows-latest),
+# Professional, Community, then BuildTools. The first existing Launch-VsDevShell.ps1 wins.
+$vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+$vsEditions = @("Enterprise", "Professional", "Community", "BuildTools")
+$vsLaunchScript = $null
+foreach ($edition in $vsEditions) {
+    $candidate = Join-Path $vsRoot "$edition\Common7\Tools\Launch-VsDevShell.ps1"
+    if (Test-Path -LiteralPath $candidate) {
+        $vsLaunchScript = $candidate
+        break
+    }
+}
+if (-not $vsLaunchScript) {
+    throw "Cannot find Launch-VsDevShell.ps1 under '$vsRoot' for any of: $($vsEditions -join ', '). Install Visual Studio 2022 (any edition) with the desktop C++ workload."
+}
+& $vsLaunchScript -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"

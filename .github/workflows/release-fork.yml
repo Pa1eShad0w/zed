@@ -1,0 +1,137 @@
+name: Release (Fork)
+
+# Spec: docs/fork-update-system.spec.md §9 (GitHub Actions release pipeline)
+# Plan: docs/fork-update-system.plan.md Phase K
+#
+# Trigger: pushing a tag of the form vX.Y.Z-fork.N (created by script/bump-fork-version.{ps1,sh}).
+# Produces: a GitHub Release with the Windows x64 installer + SHA256SUMS.txt; body
+# is the bump commit body extracted via `git show -s --format=%b`.
+#
+# No code signing. Spec §6 row 6: 'SHA256 hash 校验（信任内网服务器；不上 minisign/code-signing）'.
+# Because script/bundle-windows.ps1 enters its signing / Azure / Sentry branches
+# whenever $env:CI is truthy, the bundle step explicitly clears CI before
+# invoking the script — see the comment on that step.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*-fork.*'
+
+concurrency:
+  # Spec §9.1: same-tag re-push queues; never cancel a half-uploaded release.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      # Required by softprops/action-gh-release to create the GH Release.
+      contents: write
+    timeout-minutes: 90
+    steps:
+      - name: Checkout (full history for `git show <tag>`)
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is required so `git show -s --format=%b <tag>` can
+          # read the bump commit body (which is the release-notes source per
+          # spec §9 / §10).
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        # `rustup show` triggers rustup to install the channel + targets +
+        # components declared in rust-toolchain.toml. No version pinning here —
+        # rust-toolchain.toml is the single source of truth.
+        run: rustup show
+        shell: pwsh
+
+      - name: Cache cargo build artefacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Build installer (cargo + Inno Setup)
+        # bundle-windows.ps1 does:
+        #   - cargo build --release --target x86_64-pc-windows-msvc for
+        #     zed, cli, auto_update_helper, explorer_command_injector, remote_server
+        #   - makeAppx, Inno Setup compile
+        #   - writes `SETUP_PATH=target/Zed-Fork-x86_64.exe` to $GITHUB_ENV
+        #
+        # We deliberately clear $env:CI before invoking the script. With CI
+        # set, bundle-windows.ps1 demands Azure Trusted Signing secrets
+        # (AZURE_TENANT_ID, CERT_PROFILE_NAME, etc.) and calls sign.ps1 +
+        # sentry-cli. Per spec §6 row 6, fork releases are unsigned (trust is
+        # rooted in the intranet server + client-side SHA256 verification);
+        # we have no Azure secrets and no Sentry project for this fork.
+        # GITHUB_ENV is a separate env var and is still honoured by the
+        # `Write-Output ... >> $env:GITHUB_ENV` line in BuildInstaller.
+        shell: pwsh
+        env:
+          RELEASE_CHANNEL: fork
+        run: |
+          $env:CI = ''
+          ./script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Stage artefacts and compute SHA256SUMS
+        # Spec §6 / §9: emit SHA256SUMS.txt with `sha256sum -b` (binary mode,
+        # `<hex> *<file>` format) so the worker's parser (§6) accepts it.
+        # fail_on_unmatched_files in the release step catches a missing installer,
+        # but we still guard here so we fail fast with a clearer message.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ -z "${SETUP_PATH:-}" ]; then
+            echo "bundle-windows.ps1 did not export SETUP_PATH to GITHUB_ENV" >&2
+            exit 1
+          fi
+          if [ ! -f "${SETUP_PATH}" ]; then
+            echo "SETUP_PATH (${SETUP_PATH}) does not point to a file" >&2
+            exit 1
+          fi
+          cp "${SETUP_PATH}" dist/
+          cd dist
+          # `sha256sum -b *.exe` — spec §6 mandates binary mode. The worker
+          # validates `^[0-9a-fA-F]{64}\s+\*?<file>$` per line.
+          sha256sum -b *.exe > SHA256SUMS.txt
+          echo "--- SHA256SUMS.txt ---"
+          cat SHA256SUMS.txt
+          echo "--- end ---"
+
+      - name: Extract release notes from bump commit body
+        # Spec §9 / row 9 of §2: release notes live in the bump commit message
+        # body (English ASCII-only, enforced both locally by bump scripts and
+        # here by CI). `git show -s --format=%b <tag>` is the canonical extractor.
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show -s --format=%b "${GITHUB_REF_NAME}" > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "release notes are empty for tag ${GITHUB_REF_NAME}" >&2
+            echo "(bump scripts should have refused to commit an empty body)" >&2
+            exit 1
+          fi
+          # ASCII-only guard. Anything outside 0x00-0x7F means the bump scripts'
+          # local guard failed or the commit was created by hand.
+          if LC_ALL=C grep -P '[^\x00-\x7F]' release-notes.md >/dev/null 2>&1; then
+            echo "release notes contain non-ASCII characters" >&2
+            echo "spec §2 row 9 + §10: release notes MUST be English ASCII-only" >&2
+            exit 1
+          fi
+          echo "--- release-notes.md ---"
+          cat release-notes.md
+          echo "--- end ---"
+
+      - name: Publish GitHub Release
+        # softprops/action-gh-release@v2 creates (or updates, if the workflow
+        # is re-run for the same tag) the GH Release. fail_on_unmatched_files
+        # turns a missing installer / SHA256SUMS into a hard failure so the
+        # worker never sees a partial release (spec §9.2 / §13).
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
