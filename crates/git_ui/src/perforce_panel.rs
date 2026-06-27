@@ -19,12 +19,13 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, actions, anchored, deferred, rems, uniform_list,
 };
 use project::{
-    Project,
+    Fs, Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
     project_settings::ProjectSettings,
 };
 use settings::Settings;
 use std::ops::Range;
+use std::sync::Arc;
 use util::ResultExt as _;
 use ui::{
     ContextMenu, ContextMenuEntry, DocumentationSide, Scrollbars, Tab, Tooltip, WithScrollbar,
@@ -121,7 +122,7 @@ pub struct PerforcePanel {
     /// the merge-conflict badge on file rows. Empty for non-Perforce repos.
     unresolved: HashSet<RepoPath>,
     focus_handle: FocusHandle,
-    position: DockPosition,
+    fs: Arc<dyn Fs>,
     /// Whether the panel is the active (visible) one in its dock. We only query `p4` while the
     /// panel is actually shown — otherwise a Perforce user with the panel closed would spawn two
     /// `p4` processes on every status change.
@@ -196,7 +197,7 @@ impl PerforcePanel {
                 out_of_date: HashSet::default(),
                 unresolved: HashSet::default(),
                 focus_handle: cx.focus_handle(),
-                position: DockPosition::Left,
+                fs: workspace.app_state().fs.clone(),
                 active: false,
                 scroll_handle: UniformListScrollHandle::new(),
                 workspace: workspace_handle,
@@ -1148,8 +1149,8 @@ impl Panel for PerforcePanel {
         PERFORCE_PANEL_KEY
     }
 
-    fn position(&self, _: &Window, _cx: &App) -> DockPosition {
-        self.position
+    fn position(&self, _: &Window, cx: &App) -> DockPosition {
+        GitPanelSettings::get_global(cx).dock
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
@@ -1157,8 +1158,9 @@ impl Panel for PerforcePanel {
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-        self.position = position;
-        cx.notify();
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            settings.git_panel.get_or_insert_default().dock = Some(position.into())
+        });
     }
 
     fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
