@@ -606,7 +606,39 @@ impl Telemetry {
             .body(json_bytes.into())?)
     }
 
+    /// Fork-channel runtime guard: returns `true` when this telemetry instance
+    /// is running on the intranet-distributed Perforce Fork channel. Used to
+    /// short-circuit `flush_events_inner` so the Fork never emits events to
+    /// the upstream `/telemetry/events` endpoint, even if a user manually flips
+    /// `telemetry.metrics` back to `true` in settings.json.
+    ///
+    /// See `docs/fork-update-system.spec.md` section 7.4 (telemetry isolation,
+    /// runtime double-safety). The other two layers are:
+    /// 1. Compile-time: `ZED_MINIDUMP_ENDPOINT` is unset on Fork builds, so
+    ///    crash reports cannot be uploaded.
+    /// 2. Settings default: `assets/settings/default.json` ships
+    ///    `telemetry.metrics=false` and `telemetry.diagnostics=false` on Fork.
+    fn release_channel_is_fork(&self) -> bool {
+        self.state
+            .lock()
+            .release_channel
+            .map(|c| matches!(c, ReleaseChannel::Fork))
+            .unwrap_or(false)
+    }
+
     pub async fn flush_events_inner(self: &Arc<Self>) -> Result<()> {
+        // Fork-channel double-safety per spec section 7.4: drain the queue
+        // without sending. Do NOT remove this guard without re-reading the
+        // spec — the upstream Zed telemetry endpoint is shared infrastructure
+        // and Fork events must never reach it. See `release_channel_is_fork`.
+        if self.release_channel_is_fork() {
+            let mut state = self.state.lock();
+            state.first_event_date_time = None;
+            state.events_queue.clear();
+            state.flush_events_task.take();
+            return Ok(());
+        }
+
         let (json_bytes, request_body) = {
             let mut state = self.state.lock();
             state.first_event_date_time = None;
@@ -974,5 +1006,84 @@ mod tests {
             expected_project_types.map(|types| types.iter().map(|&t| t.to_string()).collect());
 
         assert_eq!(detected_project_types, expected_project_types);
+    }
+
+    /// Spec section 7.4 (`docs/fork-update-system.spec.md`): even if the user
+    /// flips `telemetry.metrics` to true in settings.json, the Fork channel
+    /// must never POST events to the upstream `/telemetry/events` endpoint.
+    /// This test simulates a queued event on a Fork-channel telemetry instance
+    /// and verifies that `flush_events_inner` drains the queue without making
+    /// any HTTP request.
+    #[gpui::test]
+    async fn test_fork_channel_short_circuits_event_flush(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        init_test(cx);
+        let clock = Arc::new(FakeSystemClock::new());
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_handler = request_count.clone();
+        let http = http_client::FakeHttpClient::create(move |_req| {
+            let request_count = request_count_handler.clone();
+            async move {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                Ok(http_client::http::Response::builder()
+                    .status(200)
+                    .body(Default::default())
+                    .unwrap())
+            }
+        });
+
+        let telemetry = cx.update(|cx| Telemetry::new(clock.clone(), http, cx));
+
+        // Simulate the Fork channel being active and a queued event waiting to
+        // be flushed. (In production, the channel comes from
+        // `ReleaseChannel::try_global(cx)` at construction time; in tests
+        // `try_global` returns the default Dev, so we override it directly.)
+        {
+            let mut state = telemetry.state.lock();
+            state.release_channel = Some(ReleaseChannel::Fork);
+            state.first_event_date_time = Some(clock.utc_now());
+            state.events_queue.push(EventWrapper {
+                signed_in: false,
+                milliseconds_since_first_event: 0,
+                event: Event::Flexible(telemetry_events::FlexibleEvent {
+                    event_type: "should_not_be_sent".to_string(),
+                    event_properties: HashMap::new(),
+                }),
+            });
+        }
+
+        telemetry
+            .flush_events_inner()
+            .await
+            .expect("flush should succeed");
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            0,
+            "Fork channel must not POST telemetry events to the upstream endpoint"
+        );
+        assert!(
+            is_empty_state(&telemetry),
+            "Fork-channel flush must still drain the queue and clear flush_events_task"
+        );
+    }
+
+    /// Unit-cover the helper directly: None / Some(Fork) / Some(Stable).
+    #[gpui::test]
+    fn test_release_channel_is_fork(cx: &mut TestAppContext) {
+        init_test(cx);
+        let clock = Arc::new(FakeSystemClock::new());
+        let http = FakeHttpClient::with_200_response();
+        let telemetry = cx.update(|cx| Telemetry::new(clock, http, cx));
+
+        telemetry.state.lock().release_channel = None;
+        assert!(!telemetry.release_channel_is_fork());
+
+        telemetry.state.lock().release_channel = Some(ReleaseChannel::Stable);
+        assert!(!telemetry.release_channel_is_fork());
+
+        telemetry.state.lock().release_channel = Some(ReleaseChannel::Fork);
+        assert!(telemetry.release_channel_is_fork());
     }
 }
