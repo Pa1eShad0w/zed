@@ -1,8 +1,11 @@
 [Setup]
+#ifndef AppPublisher
+  #define AppPublisher "Zed Industries"
+#endif
 AppId={#AppId}
 AppName={#AppName}
 AppVerName={#AppDisplayName}
-AppPublisher=Zed Industries
+AppPublisher={#AppPublisher}
 AppPublisherURL=https://www.zed.dev/
 AppSupportURL=https://www.zed.dev/
 AppUpdatesURL=https://www.zed.dev/

@@ -114,6 +114,11 @@ function BuildZedAndItsFriends {
         "preview" {
             cargo build --release --features preview --no-default-features --package explorer_command_injector --target $target
         }
+        "fork" {
+            # Fork installs replace upstream stable (same AppId per spec §7 P2),
+            # so the explorer integration must use stable's resources and appx identity.
+            cargo build --release --features stable --no-default-features --package explorer_command_injector --target $target
+        }
         default {
             cargo build --release --package explorer_command_injector --target $target
         }
@@ -187,6 +192,10 @@ function MakeAppx {
         }
         "preview" {
             $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest-Preview.xml"
+        }
+        "fork" {
+            # Replace-install with upstream stable (spec §7 P2): same appx identity.
+            $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest.xml"
         }
         default {
             $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest-Nightly.xml"
@@ -305,6 +314,25 @@ function BuildInstaller {
             $appShellNameShort = "Z&ed Dev"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
+        "fork" {
+            # Fork channel: replace-install with upstream stable (spec §7 P2).
+            # AppId, AppExeName, mutex, regValueName, appx identity all match stable
+            # so installing fork removes upstream stable and vice versa.
+            # Only the user-visible branding and the AppUserModelID change.
+            $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
+            $appIconName = "app-icon"
+            $appName = "Zed Fork"
+            $appDisplayName = "Zed Fork"
+            $appPublisher = "Beyond Internal"
+            $appSetupName = "Zed-Fork-$Architecture"
+            # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
+            $appMutex = "Zed-Stable-Instance-Mutex"
+            $appExeName = "Zed"
+            $regValueName = "Zed"
+            $appUserId = "dev.zed.Zed-Perforce"
+            $appShellNameShort = "Z&ed"
+            $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
+        }
         default {
             Write-Error "can't bundle installer for $channel."
             exit 1
@@ -332,6 +360,16 @@ function BuildInstaller {
         "Version"        = "$env:RELEASE_VERSION"
         "SourceDir"      = "$env:ZED_WORKSPACE"
         "AppxFullName"   = $appAppxFullName
+    }
+    # Fork channel overrides the publisher (spec §7). Other channels keep the
+    # value hardcoded in zed.iss. Passed through as `#AppPublisher` only when
+    # set so non-fork builds remain bit-identical to before this change.
+    # NOTE: zed.iss currently hardcodes `AppPublisher=Zed Industries` and does
+    # not yet read `{#AppPublisher}`. Until the .iss is parameterized (tracked
+    # as deferred work for Phase I), passing `/dAppPublisher` is a no-op and
+    # the installer "Publisher" field will still read "Zed Industries".
+    if ($appPublisher) {
+        $definitions["AppPublisher"] = $appPublisher
     }
 
     $defs = @()
