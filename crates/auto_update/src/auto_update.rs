@@ -229,6 +229,33 @@ struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
 impl Global for GlobalAutoUpdate {}
 
+/// Returns whether the auto-updater should poll for updates right now,
+/// combining release-channel policy with Fork-channel server URL gating.
+///
+/// On the Fork channel we additionally require a valid configured
+/// `auto_update.server_url` (per spec fork-update-system.spec.md §4.3).
+/// Without this gate, a public Fork build with no server configured would
+/// fall through to upstream cloud.zed.dev every hour and expose the fork
+/// to upstream's nginx access logs (Round-2 finding F1).
+///
+/// The dependency arrow goes `auto_update -> client -> release_channel`,
+/// so this combined check lives here in `auto_update` rather than in
+/// `release_channel`, which cannot depend on `client` without forming a
+/// cargo dependency cycle.
+pub(crate) fn should_poll(cx: &App) -> bool {
+    let Some(channel) = ReleaseChannel::try_global(cx) else {
+        return false;
+    };
+    if !channel.poll_for_updates() {
+        return false;
+    }
+    if channel == ReleaseChannel::Fork {
+        let settings = client::AutoUpdateSettings::get_global(cx);
+        return client::normalize_update_server_url(settings.server_url.as_deref()).is_some();
+    }
+    true
+}
+
 pub fn init(client: Arc<Client>, cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|_, action, window, cx| check(action, window, cx));
@@ -243,20 +270,20 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
-
+        // The SettingsStore observer is registered unconditionally (outside the
+        // poll-gate) so the Fork channel can start polling as soon as a user
+        // pastes `auto_update.server_url` at runtime, without restarting Zed.
         if option_env!("ZED_UPDATE_EXPLANATION").is_none()
             && env::var("ZED_UPDATE_EXPLANATION").is_err()
-            && poll_for_updates
         {
-            let mut update_subscription = AutoUpdateSetting::get_global(cx)
-                .0
-                .then(|| updater.start_polling(cx));
+            let mut update_subscription: Option<Task<Result<()>>> =
+                (should_poll(cx) && AutoUpdateSetting::get_global(cx).0)
+                    .then(|| updater.start_polling(cx));
 
             cx.observe_global::<SettingsStore>(move |updater: &mut AutoUpdater, cx| {
-                if AutoUpdateSetting::get_global(cx).0 {
+                let poll_now = should_poll(cx);
+                let setting_on = AutoUpdateSetting::get_global(cx).0;
+                if poll_now && setting_on {
                     if update_subscription.is_none() {
                         update_subscription = Some(updater.start_polling(cx))
                     }
@@ -287,10 +314,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         return;
     }
 
-    if !ReleaseChannel::try_global(cx)
-        .map(|channel| channel.poll_for_updates())
-        .unwrap_or(false)
-    {
+    if !should_poll(cx) {
         return;
     }
 
@@ -1590,5 +1614,117 @@ mod tests {
             newer_version.unwrap(),
             Some(VersionCheckType::Sha(AppCommitSha::new(fetched_sha)))
         );
+    }
+
+    /// Round-2 finding CA1 regression test: on the Fork channel, pasting a
+    /// valid `auto_update_server_url` into settings at runtime must start
+    /// polling without restarting Zed.
+    ///
+    /// This proves the observer hoist + `should_poll` re-evaluation work
+    /// end-to-end:
+    ///   1. Init with Fork channel + `server_url = None` -> gate is closed,
+    ///      `pending_poll` stays `None`.
+    ///   2. Mutate `AutoUpdateSettings.server_url` to a valid URL via
+    ///      `override_for_test` (which goes through `Settings::override_global`
+    ///      -> `cx.global_mut::<SettingsStore>()` -> pushes a
+    ///      `NotifyGlobalObservers` effect).
+    ///   3. The hoisted `SettingsStore` observer fires, re-evaluates
+    ///      `should_poll`, and calls `start_polling` -> `pending_poll`
+    ///      becomes `Some(..)` without any restart.
+    #[gpui::test]
+    async fn test_fork_channel_starts_polling_when_server_url_set_at_runtime(
+        cx: &mut TestAppContext,
+    ) {
+        // `start_polling` does `smol::fs::remove_dir(...).await` on Windows
+        // (see `cleanup_windows`); without parking the gpui test executor
+        // would never tick those file ops and `poll()` would never run.
+        cx.background_executor.allow_parking();
+
+        cx.update(|cx| {
+            settings::init(cx);
+
+            let current_version = semver::Version::new(0, 100, 0);
+            release_channel::init_test(current_version, ReleaseChannel::Fork, cx);
+
+            // FakeHttpClient that never resolves -> once `start_polling`'s
+            // inner update task fires, it parks awaiting the response and
+            // `pending_poll` stays `Some(..)` long enough for us to observe.
+            let fake_http = FakeHttpClient::create(|_req| async move {
+                std::future::pending::<Result<Response<_>, _>>().await
+            });
+            let clock = Arc::new(FakeSystemClock::new());
+            let client = Client::new(clock, fake_http, cx);
+
+            // Upstream toggle = on; Fork-channel-specific server_url = None.
+            // `should_poll` must therefore return false right now (gate closed
+            // by the Fork-channel branch in `should_poll`).
+            assert!(
+                AutoUpdateSetting::get_global(cx).0,
+                "upstream auto-update setting should default to true"
+            );
+            assert!(
+                client::AutoUpdateSettings::get_global(cx)
+                    .server_url
+                    .is_none(),
+                "fork server_url should start unset"
+            );
+            assert!(
+                !should_poll(cx),
+                "fork channel without server_url must be gated off",
+            );
+
+            crate::init(client, cx);
+        });
+
+        cx.run_until_parked();
+
+        let auto_updater =
+            cx.update(|cx| AutoUpdater::get(cx).expect("auto updater should be installed"));
+
+        auto_updater.read_with(cx, |updater, _| {
+            assert!(
+                updater.pending_poll.is_none(),
+                "fork channel without server_url must NOT be polling at startup"
+            );
+        });
+
+        // Paste a valid intranet update server URL at runtime. This goes
+        // through `Settings::override_global` -> `cx.global_mut::<SettingsStore>`,
+        // which schedules a `NotifyGlobalObservers` effect for the next park.
+        cx.update(|cx| {
+            client::AutoUpdateSettings::override_for_test(cx, |s| {
+                s.server_url = Some("http://intra.update.corp".into());
+            });
+            // Sanity: the gate must now be open from the perspective of
+            // `should_poll`. If THIS fires, but the assertion below fails,
+            // the bug is in the observer wiring, not the gate logic.
+            assert!(
+                should_poll(cx),
+                "after override, gate must be open (fork + valid server_url)"
+            );
+        });
+
+        // Pump the executor enough to let the observer fire, `start_polling`'s
+        // spawned task tick past `cleanup_windows`, and run the first `poll()`
+        // (which is what actually sets `pending_poll = Some(..)`).
+        for _ in 0..20 {
+            cx.background_executor
+                .timer(Duration::from_millis(1))
+                .await;
+            cx.run_until_parked();
+            let started =
+                auto_updater.read_with(cx, |updater, _| updater.pending_poll.is_some());
+            if started {
+                break;
+            }
+        }
+
+        auto_updater.read_with(cx, |updater, _| {
+            assert!(
+                updater.pending_poll.is_some(),
+                "fork channel must start polling once a valid server_url is configured \
+                 (without restarting Zed)"
+            );
+        });
     }
 }
