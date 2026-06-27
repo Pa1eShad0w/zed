@@ -58,3 +58,11 @@ crates/docs_preprocessor/actions.json
 
 # NixOS integration test state
 .nixos-test-history
+
+# Windows installer bundle artifacts (script/bundle-windows.ps1):
+# downloaded SDKs + extracted runtimes + Inno staging dir.
+/AGS_SDK-*/
+/AGS_SDK_*.zip
+/Microsoft.Windows.Console.ConPTY.*.nupkg
+/conpty/
+/inno/
