@@ -71,6 +71,33 @@ jobs:
           # spec §9 / §10).
           fetch-depth: 0
 
+      - name: Enable Windows long paths (cargo git checkout workaround)
+        # Some upstream deps (e.g. microsoft/python-environment-tools via the
+        # `pet` crate) ship test fixtures with file paths whose absolute form
+        # under cargo's checkout dir exceeds the legacy 260-char MAX_PATH.
+        # cargo's bundled libgit2 errors with "path too long" on Windows
+        # unless long-path support is enabled.
+        #
+        # Three layers, all required:
+        #   1. Filesystem-level: HKLM\SYSTEM\CurrentControlSet\Control\FileSystem
+        #      LongPathsEnabled=1 (already set on recent GH images; force).
+        #   2. Git: core.longpaths=true (libgit2 honours this via the global
+        #      config since libgit2 1.6+).
+        #   3. cargo: CARGO_NET_GIT_FETCH_WITH_CLI=true so cargo shells out to
+        #      the system git CLI for fetches (which respects long paths
+        #      more reliably than libgit2 in edge cases).
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+              -Name "LongPathsEnabled" -PropertyType DWORD -Value 1 -Force | Out-Null
+            Write-Host "LongPathsEnabled = 1"
+          } catch {
+            Write-Host "Could not set LongPathsEnabled (may already be set or not admin): $_"
+          }
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         # `rustup show` triggers rustup to install the channel + targets +
         # components declared in rust-toolchain.toml. No version pinning here —
