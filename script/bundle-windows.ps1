@@ -60,17 +60,26 @@ if (Test-Path -LiteralPath $vswhere) {
     }
 }
 if (-not $vsLaunchScript) {
-    $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
-    foreach ($edition in @("Enterprise", "Professional", "Community", "BuildTools")) {
-        $candidate = Join-Path $vsRoot "$edition\Common7\Tools\Launch-VsDevShell.ps1"
-        if (Test-Path -LiteralPath $candidate) {
-            $vsLaunchScript = $candidate
-            break
+    # Manual probe across known parent paths. The internal layout uses the
+    # major version as the directory name: `2022` for VS 2022, `18` for
+    # VS 2026 (the version on stock `windows-latest` GitHub runners as of
+    # June 2026). Add new majors at the front when newer images ship.
+    $vsParents = @(
+        "C:\Program Files\Microsoft Visual Studio\18",
+        "C:\Program Files\Microsoft Visual Studio\2022"
+    )
+    :probe foreach ($parent in $vsParents) {
+        foreach ($edition in @("Enterprise", "Professional", "Community", "BuildTools")) {
+            $candidate = Join-Path $parent "$edition\Common7\Tools\Launch-VsDevShell.ps1"
+            if (Test-Path -LiteralPath $candidate) {
+                $vsLaunchScript = $candidate
+                break probe
+            }
         }
     }
 }
 if (-not $vsLaunchScript) {
-    throw "Cannot find Launch-VsDevShell.ps1 via vswhere or under C:\Program Files\Microsoft Visual Studio\2022\{Enterprise,Professional,Community,BuildTools}. Install Visual Studio 2022 (any edition) with the Desktop C++ workload."
+    throw "Cannot find Launch-VsDevShell.ps1 via vswhere or under any of {C:\Program Files\Microsoft Visual Studio\18, ...\2022}\{Enterprise,Professional,Community,BuildTools}. Install Visual Studio with the Desktop C++ workload."
 }
 Write-Host "Using VS Dev Shell: $vsLaunchScript"
 & $vsLaunchScript -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
