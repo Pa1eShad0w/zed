@@ -17,6 +17,39 @@ on:
     tags:
       - 'v*.*.*-fork.*'
 
+  # Manual trigger for testing / re-running a published tag without forcing a
+  # delete-and-recreate of the tag. Defaults to dry_run=true so an accidental
+  # "Run workflow" click does NOT overwrite a real release. Set dry_run=false
+  # to actually publish.
+  #
+  # When invoked from the UI:
+  #   - Select branch / tag via the standard "Use workflow from" dropdown.
+  #     The job uses GITHUB_REF_NAME for everything (checkout + release notes
+  #     extraction + Release creation), so if you want to publish for a tag,
+  #     pick that tag in the dropdown.
+  #   - Tag input is required ONLY when invoked from a branch ref (the workflow
+  #     needs to know which tag's commit body holds the release notes; see
+  #     release notes step). When invoked from a tag ref, leave tag blank.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: |
+          Tag to publish (e.g. v1.8.2-fork.0). REQUIRED when the workflow is
+          run from a branch ref; LEAVE BLANK when run from a tag ref (the ref
+          itself is the tag). Must already exist as a git tag in the repo.
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: |
+          If true (default), build the installer + compute SHA256SUMS +
+          extract release notes, but SKIP the GitHub Release publish step.
+          Use this for end-to-end smoke testing of the build pipeline without
+          shadowing a real release. Set false to actually publish.
+        required: true
+        type: boolean
+        default: true
+
 concurrency:
   # Spec §9.1: same-tag re-push queues; never cancel a half-uploaded release.
   group: release-${{ github.ref }}
@@ -98,6 +131,31 @@ jobs:
           cat SHA256SUMS.txt
           echo "--- end ---"
 
+      - name: Resolve target tag
+        # workflow_dispatch from a branch ref needs an explicit tag input.
+        # tag push uses GITHUB_REF_NAME directly. Sets $TAG_NAME in env for
+        # the next steps.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            # validate the supplied tag actually exists locally (fetched via depth 0)
+            if ! git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+              echo "supplied tag '${TAG}' does not exist in the repo" >&2
+              exit 1
+            fi
+            # validate it matches our spec §3.5 fork-tag pattern
+            if ! echo "${TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$'; then
+              echo "tag '${TAG}' does not match the fork-tag pattern v<semver>-fork.<N>" >&2
+              exit 1
+            fi
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "TAG_NAME=${TAG}" >> "$GITHUB_ENV"
+          echo "Resolved release tag: ${TAG}"
+
       - name: Extract release notes from bump commit body
         # Spec §9 / row 9 of §2: release notes live in the bump commit message
         # body (English ASCII-only, enforced both locally by bump scripts and
@@ -105,9 +163,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show -s --format=%b "${GITHUB_REF_NAME}" > release-notes.md
+          git show -s --format=%b "${TAG_NAME}" > release-notes.md
           if [ ! -s release-notes.md ]; then
-            echo "release notes are empty for tag ${GITHUB_REF_NAME}" >&2
+            echo "release notes are empty for tag ${TAG_NAME}" >&2
             echo "(bump scripts should have refused to commit an empty body)" >&2
             exit 1
           fi
@@ -127,11 +185,29 @@ jobs:
         # is re-run for the same tag) the GH Release. fail_on_unmatched_files
         # turns a missing installer / SHA256SUMS into a hard failure so the
         # worker never sees a partial release (spec §9.2 / §13).
+        #
+        # workflow_dispatch dry_run=true skips this step so the build path
+        # can be smoke-tested without overwriting an existing Release.
+        if: github.event_name == 'push' || github.event.inputs.dry_run != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.TAG_NAME }}
           body_path: release-notes.md
           files: |
             dist/*.exe
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
+
+      - name: Dry-run summary
+        # When skipping the publish step, print the artefacts + release notes
+        # to the workflow log so the operator can review what would have been
+        # published.
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true'
+        shell: bash
+        run: |
+          echo "::notice title=Dry-run::Skipping GitHub Release publish for ${TAG_NAME}."
+          echo "--- Artefacts that WOULD have been uploaded ---"
+          ls -la dist/
+          echo "--- Release notes body ---"
+          cat release-notes.md
+          echo "--- end dry-run summary ---"
