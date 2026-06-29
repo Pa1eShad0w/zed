@@ -40,21 +40,39 @@ function Get-VSArch {
 }
 
 Push-Location
-# Probe VS 2022 editions in preference order: Enterprise (stock github windows-latest),
-# Professional, Community, then BuildTools. The first existing Launch-VsDevShell.ps1 wins.
-$vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
-$vsEditions = @("Enterprise", "Professional", "Community", "BuildTools")
+# Resolve Visual Studio 2022 install path via Microsoft's official discovery
+# tool `vswhere.exe`, which lives at a fixed path on every box that has any
+# VS 2022 edition (Enterprise / Professional / Community / BuildTools) AND
+# on stock GitHub `windows-latest` runners. Falls back to a manual probe of
+# the conventional `C:\Program Files\Microsoft Visual Studio\2022\<edition>\`
+# layout if vswhere is missing (some custom dev boxes).
 $vsLaunchScript = $null
-foreach ($edition in $vsEditions) {
-    $candidate = Join-Path $vsRoot "$edition\Common7\Tools\Launch-VsDevShell.ps1"
-    if (Test-Path -LiteralPath $candidate) {
-        $vsLaunchScript = $candidate
-        break
+$vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path -LiteralPath $vswhere) {
+    $vsInstallPath = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath 2>$null | Select-Object -First 1
+    if ($vsInstallPath) {
+        $candidate = Join-Path $vsInstallPath "Common7\Tools\Launch-VsDevShell.ps1"
+        if (Test-Path -LiteralPath $candidate) {
+            $vsLaunchScript = $candidate
+        }
     }
 }
 if (-not $vsLaunchScript) {
-    throw "Cannot find Launch-VsDevShell.ps1 under '$vsRoot' for any of: $($vsEditions -join ', '). Install Visual Studio 2022 (any edition) with the desktop C++ workload."
+    $vsRoot = "C:\Program Files\Microsoft Visual Studio\2022"
+    foreach ($edition in @("Enterprise", "Professional", "Community", "BuildTools")) {
+        $candidate = Join-Path $vsRoot "$edition\Common7\Tools\Launch-VsDevShell.ps1"
+        if (Test-Path -LiteralPath $candidate) {
+            $vsLaunchScript = $candidate
+            break
+        }
+    }
 }
+if (-not $vsLaunchScript) {
+    throw "Cannot find Launch-VsDevShell.ps1 via vswhere or under C:\Program Files\Microsoft Visual Studio\2022\{Enterprise,Professional,Community,BuildTools}. Install Visual Studio 2022 (any edition) with the Desktop C++ workload."
+}
+Write-Host "Using VS Dev Shell: $vsLaunchScript"
 & $vsLaunchScript -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
