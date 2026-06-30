@@ -26,10 +26,12 @@
 #                            ->  intranet worker (gh api .body)  ->  notes.md
 #     Any non-ASCII char risks getting mangled at one of those hops. We refuse
 #     non-ASCII rather than chase an encoding bug 6 months later.
-#   - Branch acceptance: the script currently lives on `fork-update-system`
-#     and will eventually merge into `perforce-integration`. Until that merge
-#     we accept either branch name so the script is usable during migration.
-#     After the merge, drop the `fork-update-system` arm.
+#   - Branch acceptance: `main` is the only long-lived branch (CLAUDE.md
+#     Rule 5). Releases always tag a commit on `main`. The old landing-zone
+#     branches `perforce-integration` and `fork-update-system` are still
+#     accepted for now as a transitional escape hatch in case someone is
+#     still working on a worktree against an old checkout; once those branch
+#     refs are deleted from the remote, drop those two arms.
 
 set -euo pipefail
 
@@ -45,8 +47,8 @@ git diff --quiet || fail "Working tree has unstaged changes."
 git diff --cached --quiet || fail "Staged changes present."
 
 branch=$(git rev-parse --abbrev-ref HEAD)
-if [ "$branch" != "perforce-integration" ] && [ "$branch" != "fork-update-system" ]; then
-    fail "Must run on perforce-integration or fork-update-system (current: $branch)."
+if [ "$branch" != "main" ] && [ "$branch" != "perforce-integration" ] && [ "$branch" != "fork-update-system" ]; then
+    fail "Must run on main (CLAUDE.md Rule 5) or one of the legacy branches perforce-integration / fork-update-system (current: $branch)."
 fi
 
 git fetch origin "$branch" >/dev/null || fail "git fetch origin $branch failed."
