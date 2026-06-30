@@ -61,7 +61,13 @@ jobs:
     permissions:
       # Required by softprops/action-gh-release to create the GH Release.
       contents: write
-    timeout-minutes: 90
+    # 12h cap (was 90 min). A cold cargo+LLVM compile of the full Zed workspace
+    # on stock 4-vCPU/16GB windows-latest is the bottleneck — local 8-core box
+    # takes ~30 min, CI 4-core is roughly 2x, plus first-run cache misses.
+    # The 90-min cap fired before the build even reached the final `zed` crate
+    # (was still in wide-fanout phase at cancellation). 12h gives generous
+    # headroom for cold runs + Inno + makeAppx + GH Release upload.
+    timeout-minutes: 720
     steps:
       - name: Checkout (full history for `git show <tag>`)
         uses: actions/checkout@v4
@@ -110,6 +116,54 @@ jobs:
         with:
           workspaces: .
 
+      - name: Start memory + disk monitor (background)
+        # Local measurement shows the final `zed` crate's single rustc process
+        # peaks at ~16.2 GB working set under stock cargo settings
+        # (codegen-units=16 + lto=thin), right at the stock GH runner's 16 GB
+        # RAM cap. We need the live timeline from CI to know whether the
+        # process actually OOMs, swaps, or somehow squeezes through, AND to
+        # see disk water-mark on the runner's small SSD.
+        #
+        # Approach: spawn a hidden PowerShell process that samples every 15s
+        # and appends to a CSV under $RUNNER_TEMP. The build step proceeds
+        # uninterrupted. A teardown step (with if: always()) reads the CSV,
+        # prints peak/min summaries, and uploads the raw CSV as an artifact
+        # for later analysis.
+        shell: pwsh
+        run: |
+          $monitorScript = Join-Path $env:RUNNER_TEMP 'monitor.ps1'
+          $monitorLog    = Join-Path $env:RUNNER_TEMP 'build-mem.csv'
+          $monitorPidF   = Join-Path $env:RUNNER_TEMP 'monitor.pid'
+
+          @'
+          $ErrorActionPreference = 'Continue'
+          $logCsv = $args[0]
+          "timestamp,rustc_count,link_count,total_ws_mb,peak_proc,peak_ws_mb,avail_mb,disk_free_gb" | Out-File $logCsv -Encoding ASCII
+          while ($true) {
+              $now = Get-Date -Format 'HH:mm:ss'
+              $procs = Get-Process rustc, link, lld-link, cargo, cl, cmd, ISCC, makeappx -ErrorAction SilentlyContinue
+              $rustcCount = @($procs | Where-Object Name -EQ 'rustc').Count
+              $linkCount  = @($procs | Where-Object { $_.Name -in 'link','lld-link' }).Count
+              $totalWsMB  = if ($procs) { [math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB, 1) } else { 0 }
+              $peakProc   = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+              $peakName   = if ($peakProc) { $peakProc.Name } else { 'none' }
+              $peakWs     = if ($peakProc) { [math]::Round($peakProc.WorkingSet64 / 1MB, 1) } else { 0 }
+              $avail      = (Get-Counter '\Memory\Available MBytes' -ErrorAction SilentlyContinue).CounterSamples.CookedValue
+              $avail      = if ($avail) { [math]::Round($avail, 0) } else { 0 }
+              $diskGB     = try { [math]::Round((Get-PSDrive C -ErrorAction Stop).Free / 1GB, 1) } catch { 0 }
+              "$now,$rustcCount,$linkCount,$totalWsMB,$peakName,$peakWs,$avail,$diskGB" | Out-File $logCsv -Append -Encoding ASCII
+              Start-Sleep -Seconds 15
+          }
+          '@ | Out-File $monitorScript -Encoding ASCII
+
+          $proc = Start-Process pwsh `
+                    -ArgumentList '-NoProfile','-WindowStyle','Hidden','-File',$monitorScript,$monitorLog `
+                    -WindowStyle Hidden -PassThru
+          $proc.Id | Out-File $monitorPidF -Encoding ASCII
+          "MONITOR_PID=$($proc.Id)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "MONITOR_LOG=$monitorLog" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "monitor started, pid=$($proc.Id), log=$monitorLog"
+
       - name: Build installer (cargo + Inno Setup)
         # bundle-windows.ps1 does:
         #   - cargo build --release --target x86_64-pc-windows-msvc for
@@ -131,6 +185,60 @@ jobs:
         run: |
           $env:CI = ''
           ./script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Stop monitor + print resource summary
+        # Always runs (even on build failure) so the resource timeline survives
+        # an OOM or timeout. Kills the background sampler, parses the CSV, and
+        # echos peaks + the last 20 samples (the post-mortem window).
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:MONITOR_PID) {
+              try {
+                  Stop-Process -Id $env:MONITOR_PID -Force -ErrorAction Stop
+                  Write-Host "monitor pid=$($env:MONITOR_PID) stopped"
+              } catch {
+                  Write-Host "monitor pid=$($env:MONITOR_PID) was already gone: $_"
+              }
+          } else {
+              Write-Host "no MONITOR_PID in env — monitor was not started or env was clobbered"
+          }
+          if (-not $env:MONITOR_LOG -or -not (Test-Path $env:MONITOR_LOG)) {
+              Write-Host "no monitor log to summarise"
+              exit 0
+          }
+          $rows = Import-Csv $env:MONITOR_LOG
+          if (-not $rows) {
+              Write-Host "monitor log is empty"
+              exit 0
+          }
+          $peakTotal  = ($rows | Measure-Object {[double]$_.total_ws_mb} -Max).Maximum
+          $singlePeak = $rows | Sort-Object {[double]$_.peak_ws_mb} -Descending | Select-Object -First 1
+          $maxRustc   = ($rows | Measure-Object {[int]$_.rustc_count} -Max).Maximum
+          $minAvail   = ($rows | Measure-Object {[double]$_.avail_mb} -Min).Minimum
+          $minDisk    = ($rows | Measure-Object {[double]$_.disk_free_gb} -Min).Minimum
+          $samples    = $rows.Count
+          Write-Host "===== resource summary ====="
+          Write-Host ("samples (15s each): {0}  (~{1:N1} min observed)" -f $samples, ($samples * 15 / 60))
+          Write-Host ("peak combined WS (all rustc + link + cargo + cl + iscc): {0} MB" -f $peakTotal)
+          Write-Host ("single-process peak: {0} MB ({1}) at {2}" -f $singlePeak.peak_ws_mb, $singlePeak.peak_proc, $singlePeak.timestamp)
+          Write-Host ("max concurrent rustc: {0}" -f $maxRustc)
+          Write-Host ("min available system RAM: {0} MB" -f $minAvail)
+          Write-Host ("min disk free (C:): {0} GB" -f $minDisk)
+          Write-Host ""
+          Write-Host "===== last 20 samples (post-mortem window) ====="
+          $rows | Select-Object -Last 20 | Format-Table -AutoSize
+
+      - name: Upload monitor CSV (artefact)
+        # Keeps the raw timeline available for download for ~14 days even
+        # after the workflow run is gone from the UI active-runs list.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-mem-monitor
+          path: ${{ env.MONITOR_LOG }}
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Stage artefacts and compute SHA256SUMS
         # Spec §6 / §9: emit SHA256SUMS.txt with `sha256sum -b` (binary mode,
