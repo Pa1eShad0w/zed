@@ -28,7 +28,14 @@ ChangesAssociations=true
 MinVersion=10.0.16299
 SourceDir={#SourceDir}
 AppVersion={#Version}
-VersionInfoVersion={#Version}
+; VersionInfoVersion must be a Win32 4-part numeric (a.b.c.d). Fork channel
+; passes a sanitized value via /dVersionInfoVersion=... because its tags carry
+; a `-fork.N` suffix that Inno rejects. Other channels still use Version so
+; non-fork output is byte-identical to before this change.
+#ifndef VersionInfoVersion
+  #define VersionInfoVersion Version
+#endif
+VersionInfoVersion={#VersionInfoVersion}
 ShowLanguageDialog=auto
 WizardStyle=modern
 

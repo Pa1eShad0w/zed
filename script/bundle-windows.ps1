@@ -414,6 +414,20 @@ function BuildInstaller {
         $definitions["AppPublisher"] = $appPublisher
     }
 
+    # Inno's VersionInfoVersion requires a Win32 4-part numeric (a.b.c.d) and
+    # rejects pre-release suffixes like "-fork.0". AppVersion accepts any
+    # string, so we keep the pretty `1.8.2-fork.0` for the UI/Product version
+    # and derive a sanitized 4-part value for the file metadata only.
+    # Channels without a fork suffix get the same value as Version, so the
+    # generated installer stays bit-identical to before this change.
+    if ($env:RELEASE_VERSION -match '^(\d+)\.(\d+)\.(\d+)(?:-fork\.(\d+))?') {
+        $forkPart = if ($matches[4]) { $matches[4] } else { '0' }
+        $definitions["VersionInfoVersion"] = "$($matches[1]).$($matches[2]).$($matches[3]).$forkPart"
+    } else {
+        Write-Error "RELEASE_VERSION '$env:RELEASE_VERSION' is not in the expected MAJOR.MINOR.PATCH[-fork.N] form."
+        exit 1
+    }
+
     $defs = @()
     foreach ($key in $definitions.Keys) {
         $defs += "/d$key=`"$($definitions[$key])`""
