@@ -39,6 +39,7 @@
 
 ### Changed
 
+- `0807d9521d` (2026-07-06) 合并 upstream 稳定版 v1.9.0（自 v1.8.2 基线起 118 个上游提交），fork 版本号升为 `1.9.0-fork.1`。适配要点：changelist 范围 diff 的按范围跳过逻辑与 upstream 新的 `project_diff_path_key` 排序重构（group_by / tree_view / sort_by 三设置拆分）合成，changelist tab 现在同样响应这些排序设置变化；git 仓库可访问性探针从全量 `status()` 换成 upstream 新增的轻量 `check_access()`，Perforce 后端继承默认实现——p4 连接故障不再误触发 git 专用的 "unsafe repository" 修复界面，也省去面板加载时一次多余的 p4 调用。
 - `da8647d7da` (2026-06-27) `assets/settings/default.json`：`telemetry.metrics` 与 `telemetry.diagnostics` 默认翻为 `false`（spec §7.2 telemetry 默认关）；新增 `auto_update_server_url: null`（公开 GitHub 二进制不能 baked 内网 URL，内网用户主动配置开启）。
 - `c157371abd` (2026-06-27) `crates/zed/RELEASE_CHANNEL` 由 `preview` 改为 `fork`，使 `perforce-integration` 分支 binary 在 `ReleaseChannel::try_global` 返回 `Fork`；`crates/zed/Cargo.toml [package].version` 由 `1.8.2` 改为 `1.8.2-fork.0` 作为 fork 版本起点（`{upstream-base}-fork.{N}` scheme），同步 `Cargo.lock` 内 `zed` 条目。
 - `81042739d9` (2026-06-27) Windows 安装包 fork 分支：`script/bundle-windows.ps1` 新增 `"fork"` arm（保留上游 stable 的 AppId/AppMutex/appx 标识 → 替换式安装；保留 `AppExeName="Zed"` → 进程名/CLI/快捷方式不变；改 `AppName="Zed Fork"`、`AppPublisher="Beyond Internal"`、`AppUserModelID="dev.zed.Zed-Perforce"`、产物名 `Zed-Fork-$Architecture.exe`）；同步 `crates/zed/resources/windows/zed.iss` 增加 `#ifndef AppPublisher` 默认块 + 将 `AppPublisher` 改读 `{#AppPublisher}`，非 fork 通道未传 `/dAppPublisher` 时回退到原字面量 `Zed Industries`，bit-identical。
@@ -52,6 +53,10 @@
 - `af2d5ea` (2026-06-16) Perforce scoped status 启动优化：调 `p4 opened` 前先按磁盘只读位预筛（同步且未 open 的文件一定只读），全部只读时跳过 `p4 opened` round-trip——实测消除启动时约 50 次零结果 `p4 opened` 调用；任何可写/缺失/目录/无法 stat 的路径保守 fallback 到 `p4 opened` 权威查询。
 - `e4e530b` (2026-06-26) README 添加 fork 声明（维护者 @Pa1eShad0w、GPL 许可证信息），About 对话框标题与版本行标注 "Perforce fork"，满足 GPL v3 Section 5(a) 修改标记要求。
 
+### Removed
+
+- `0807d9521d` (2026-07-06) 移除 recent-projects 标题栏 popover 的弹性宽度特性（`31cdb27`，min 20rem / max 48rem）：upstream v1.9.0 重写了 picker 尺寸系统，宽度所有权从外层容器移入 `Picker` 本身（构造期 `initial_width` + 持久化 shape，popover 形态固定宽度且不可拖拽调整），容器级 min/max 约束物理失效，无法保留。`WidthConstraints` 抽象及其 3 个契约测试一并删除，该文件恢复为与 upstream 逐字节一致。影响：popover 回到固定 20rem，超长 Perforce client 名会再次被截断；如需恢复可读性，最小改法是在 popover 构造点把 `initial_width` 调宽一行。
+
 ### Security
 
 - `316d99b469` (2026-06-27) Fork 频道 telemetry 运行期短路：见 Added 中的 `316d99b469` 条目；这是「fork 用户绝不向上游 `api.zed.dev` 发送 telemetry」契约的运行期最后一道防线，与编译期 `ZED_MINIDUMP_ENDPOINT` 不设、`default.json` 默认 `metrics=false`/`diagnostics=false` 组成三层防御。
@@ -59,6 +64,7 @@
 
 ### Fixed
 
+- `653b12c361` (2026-07-06) 修复 `crates/git` 三个 blame golden 测试（`blame_incremental_simple/complex/not_committed`）持续失败：fork 引入 `BlameEntry.revision_label`（`87a390d`）时只加了 `#[serde(default)]` 未加 `skip_serializing_if`，导致所有 git blame 条目序列化 JSON 多出一个 `"revision_label": null` 字段，与 checked-in golden 文件不匹配（当时漏跑了该 crate 测试）。修法：None 时省略该字段——git 条目的 JSON 线格式恢复与 upstream 逐字节一致，Perforce 条目（Some）不受影响，反序列化仍由 `default` 兜底兼容新旧两种格式。fork 自引入的 bug，非 upstream 问题。
 - `3045bba83a` (2026-06-30) `release-fork.yml` 在成功跑完 38 分钟 cargo build 之后于 Inno Setup 一步失败：`Error on line 31 in zed.iss: Value of [Setup] section directive "VersionInfoVersion" is invalid. Compile aborted.`。根因：fork tag 形如 `1.8.2-fork.0`，被一并灌给 `AppVersion`（接受字符串）和 `VersionInfoVersion`（要求 Win32 4-part 数字 `a.b.c.d`，`-fork.0` 后缀非法）。修法：`bundle-windows.ps1` 用正则解析 `RELEASE_VERSION = MAJOR.MINOR.PATCH(-fork.N)?`，派生 `MAJOR.MINOR.PATCH.N`（缺 fork 段补 0），新增 `/dVersionInfoVersion` 透传；`zed.iss` 第 31 行套用既有 `AppPublisher` 的 `#ifndef ... #define X Version #endif` fallback 模式——不传 `/dVersionInfoVersion` 的渠道继续用 `{#Version}`，非 fork 产物字节一致。安装器 UI 与 Add/Remove Programs 显示的 Product Version 仍保留完整 `1.8.2-fork.0`，仅 Windows 文件元数据 File Version 字段切到 4-part 形式。本次 CI 数据另证 stock `windows-latest`（4-vCPU/16GB）内存够用：peak combined WS 9.9 GB / single rustc peak 9.9 GB / min available RAM 3.2 GB，无需 Larger Runners 或 self-hosted。
 - `f550fc8361` (2026-06-27) 临时 `#[ignore]` 两个上游 telemetry 测试（`test_telemetry_flush_on_max_queue_size`、`test_telemetry_flush_on_flush_interval`），它们在 fork baseline `ddf4ff8259` 之前就已断（验证方式：`git stash` 后 baseline 还原跑也同样断；根因 `init_test(cx)` 默认下 `state.settings.metrics=false`，`report_event` 早返）。CLAUDE.md Rule 2 不动现有测试，已记 `zed-src/FORK-MERGE-BLOCKERS.md` BLOCKER-1（commit `4543cce840`），merge fork-update-system 前需用户明示后修复并 un-ignore。
 - `f4a75cb` (2026-06-27) Perforce 面板 dock 切换失效：右键 dock 图标选 Dock Left/Right 后面板不动，菜单仍显示旧选项，只有再切换 sibling 面板（project / outline / collab）才"补刀"生效。根因：`set_position` 只改私有 `self.position` 字段并 `cx.notify()`，而 dock 物理 re-place 由 `SettingsStore` observer (`workspace/src/dock.rs:589`) 驱动，panel notify 不进入这条路径；sibling 面板的 `set_position` 写 settings 后才间接触发 observer 把 perforce 面板也搬走。修法：与 Git 面板一致——`position()` 读 `GitPanelSettings.dock`，`set_position` 走 `update_settings_file` 写 `git_panel.dock`，删除私有 `position` 字段，新增 `Arc<dyn Fs>` 字段（取自 `workspace.app_state().fs`）。两个 SCM 面板在 dock 上互斥（icon 一次只显一个），共享同一 dock 偏好语义自洽，强化了 `2de0bba` 的"统一 source-control 按钮"契约。顺带修两个潜在 bug：原 `self.position` 无 serialization 路径，重启 Zed 后 dock side 会复位到硬编码 Left；用户若已设 `git_panel.dock = right`，打开 Perforce repo 时面板原本仍出现在 left，现在尊重设置。
