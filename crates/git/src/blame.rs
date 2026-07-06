@@ -170,7 +170,7 @@ pub struct BlameEntry {
 
     /// Optional VCS-specific revision label to display instead of the abbreviated `sha`
     /// (e.g. a Perforce change number like `@7328353`). `None` for git, which uses `sha`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_label: Option<String>,
 }
 
