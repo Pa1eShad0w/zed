@@ -365,7 +365,7 @@ function BuildInstaller {
             $appIconName = "app-icon"
             $appName = "Zed Fork"
             $appDisplayName = "Zed Fork"
-            $appPublisher = "Beyond Internal"
+            $appPublisher = "Zed Perforce Fork"
             $appSetupName = "Zed-Fork-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Stable-Instance-Mutex"
