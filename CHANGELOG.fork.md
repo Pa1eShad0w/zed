@@ -39,6 +39,7 @@
 
 ### Changed
 
+- `2e413e1ce6` (2026-07-07) Windows 安装包的发布者字段（AppPublisher）由占位名改为 "Zed Perforce Fork"：仅安装器元数据与"添加/删除程序"里显示的发布者名变化，AppId / 互斥量 / 进程名 / appx 标识不动，与 upstream stable 的替换式安装行为完全不受影响。随 `v1.9.0-fork.2` 发布（取代从未发布成功的 `v1.9.0-fork.1`，其 CI 构建在发布前已取消）。
 - `0807d9521d` (2026-07-06) 合并 upstream 稳定版 v1.9.0（自 v1.8.2 基线起 118 个上游提交），fork 版本号升为 `1.9.0-fork.1`。适配要点：changelist 范围 diff 的按范围跳过逻辑与 upstream 新的 `project_diff_path_key` 排序重构（group_by / tree_view / sort_by 三设置拆分）合成，changelist tab 现在同样响应这些排序设置变化；git 仓库可访问性探针从全量 `status()` 换成 upstream 新增的轻量 `check_access()`，Perforce 后端继承默认实现——p4 连接故障不再误触发 git 专用的 "unsafe repository" 修复界面，也省去面板加载时一次多余的 p4 调用。
 - `da8647d7da` (2026-06-27) `assets/settings/default.json`：`telemetry.metrics` 与 `telemetry.diagnostics` 默认翻为 `false`（spec §7.2 telemetry 默认关）；新增 `auto_update_server_url: null`（公开 GitHub 二进制不能 baked 内网 URL，内网用户主动配置开启）。
 - `c157371abd` (2026-06-27) `crates/zed/RELEASE_CHANNEL` 由 `preview` 改为 `fork`，使 `perforce-integration` 分支 binary 在 `ReleaseChannel::try_global` 返回 `Fork`；`crates/zed/Cargo.toml [package].version` 由 `1.8.2` 改为 `1.8.2-fork.0` 作为 fork 版本起点（`{upstream-base}-fork.{N}` scheme），同步 `Cargo.lock` 内 `zed` 条目。
