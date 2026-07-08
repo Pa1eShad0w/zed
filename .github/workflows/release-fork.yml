@@ -258,10 +258,26 @@ jobs:
             exit 1
           fi
           cp "${SETUP_PATH}" dist/
+          # bundle-windows.ps1 -> ZipZedAndItsFriendsDebug produces
+          # target/x86_64-pc-windows-msvc/release/zed-<version>-<channel>.dbg.zip
+          # containing zed.pdb + cli.pdb + auto_update_helper.pdb +
+          # explorer_command_injector.pdb + remote_server.pdb. Ship it with the
+          # release so future native crash dumps against a shipped fork build
+          # can be symbolicated (WER dump + matching pdb -> !analyze -v walks
+          # the real stack instead of collapsing to `Zed+0x…`).
+          shopt -s nullglob
+          dbg_zips=(target/*-pc-windows-msvc/release/zed-*-fork.dbg.zip)
+          if [ "${#dbg_zips[@]}" -ne 1 ]; then
+            echo "expected exactly one fork dbg zip under target/*-pc-windows-msvc/release/, found ${#dbg_zips[@]}: ${dbg_zips[*]:-<none>}" >&2
+            exit 1
+          fi
+          cp "${dbg_zips[0]}" dist/
           cd dist
-          # `sha256sum -b *.exe` — spec §6 mandates binary mode. The worker
-          # validates `^[0-9a-fA-F]{64}\s+\*?<file>$` per line.
-          sha256sum -b *.exe > SHA256SUMS.txt
+          # `sha256sum -b` — spec §6 mandates binary mode. The worker
+          # validates `^[0-9a-fA-F]{64}\s+\*?<file>$` per line. Hash both the
+          # installer and the debug-symbols archive so intranet mirrors can
+          # verify either artefact end-to-end.
+          sha256sum -b *.exe *.dbg.zip > SHA256SUMS.txt
           echo "--- SHA256SUMS.txt ---"
           cat SHA256SUMS.txt
           echo "--- end ---"
@@ -330,6 +346,7 @@ jobs:
           body_path: release-notes.md
           files: |
             dist/*.exe
+            dist/*.dbg.zip
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
 
