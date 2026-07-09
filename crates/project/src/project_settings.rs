@@ -510,6 +510,10 @@ pub struct GitSettings {
 pub struct PerforceSettings {
     /// Whether Perforce integration is enabled. Default: true.
     pub enabled: bool,
+    /// When both `.git` and `.p4config` live in the same folder, choose the
+    /// Perforce backend instead of git. Default: false (git wins on collision,
+    /// preserving pre-existing behavior). Read once when a worktree is opened.
+    pub prefer_perforce_over_git: bool,
     /// Path to the `p4` executable, or `None` to resolve from `PATH`.
     pub executable_path: Option<String>,
     /// Base URL of the Helix Swarm server, or `None` to hide "View in Swarm".
@@ -532,6 +536,7 @@ impl Default for PerforceSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            prefer_perforce_over_git: false,
             executable_path: None,
             swarm_host: None,
             edit_on_file_save: true,
@@ -742,6 +747,9 @@ impl Settings for ProjectSettings {
             let default = PerforceSettings::default();
             PerforceSettings {
                 enabled: p4.and_then(|p| p.enabled).unwrap_or(default.enabled),
+                prefer_perforce_over_git: p4
+                    .and_then(|p| p.prefer_perforce_over_git)
+                    .unwrap_or(default.prefer_perforce_over_git),
                 executable_path: p4
                     .and_then(|p| p.executable_path.clone())
                     .or(default.executable_path),

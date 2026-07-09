@@ -21,6 +21,11 @@ pub struct WorktreeSettings {
     pub private_files: PathMatcher,
     pub hidden_files: PathMatcher,
     pub read_only_files: PathMatcher,
+    /// When both `.git` and `.p4config` live in the same folder, choose the
+    /// Perforce backend instead of git during worktree scanning. Read from
+    /// the top-level `perforce.prefer_perforce_over_git` setting. Default:
+    /// false (git wins on collision).
+    pub prefer_perforce_over_git: bool,
 }
 
 impl WorktreeSettings {
@@ -98,6 +103,11 @@ impl Settings for WorktreeSettings {
                 .log_err()
                 .unwrap_or_default(),
             scan_symlinks,
+            prefer_perforce_over_git: content
+                .perforce
+                .as_ref()
+                .and_then(|p| p.prefer_perforce_over_git)
+                .unwrap_or(false),
         }
     }
 }
