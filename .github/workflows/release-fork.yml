@@ -363,3 +363,24 @@ jobs:
           echo "--- Release notes body ---"
           cat release-notes.md
           echo "--- end dry-run summary ---"
+
+      - name: Upload dry-run artefacts (installer + pdb archive + SHA256SUMS)
+        # Companion to the Dry-run summary step above. Without this the built
+        # installer, zed-<version>-fork.dbg.zip (with pdb) and SHA256SUMS.txt
+        # live only on the CI runner's filesystem for the duration of the job
+        # and are discarded when the runner is torn down. Uploading them as a
+        # workflow artefact lets an operator pull matching pdbs for local
+        # crash-dump symbolication (e.g. WER dumps in C:\ZedDumps) without
+        # publishing a real GitHub Release, which would be picked up by the
+        # intranet update worker and shipped to every fork client.
+        #
+        # Retention is deliberately short: these are throwaway test builds and
+        # the real publish path (softprops/action-gh-release) keeps the same
+        # files permanently attached to the Release when dry_run=false.
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-dryrun-${{ env.TAG_NAME }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
