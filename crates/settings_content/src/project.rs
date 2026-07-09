@@ -598,6 +598,24 @@ pub struct PerforceSettings {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// When both a `.git` directory and a `.p4config` marker live in the same
+    /// folder, choose the Perforce backend instead of git.
+    ///
+    /// Default behavior (this setting `false` or absent): git wins on collision
+    /// — matches how the fork has behaved since the Perforce backend was
+    /// introduced. Set to `true` if you routinely open Perforce workspaces
+    /// that also contain a `.git` directory (subrepo, IDE-generated,
+    /// docker-mounted, etc.) and want the Perforce backend to take over.
+    ///
+    /// Read once when a worktree is opened. Change requires re-opening the
+    /// project (or restarting Zed) to take effect.
+    ///
+    /// Note: remote peers without `p4` installed will lose the VCS backend
+    /// for such workspaces after a backend switch, since the Perforce
+    /// backend cannot be constructed there.
+    ///
+    /// Default: false
+    pub prefer_perforce_over_git: Option<bool>,
     /// Path to the `p4` command-line executable. When unset, `p4` is resolved
     /// from the workspace `PATH`.
     ///

@@ -279,6 +279,10 @@ struct BackgroundScannerState {
     changed_paths: Vec<Arc<RelPath>>,
     prev_snapshot: Snapshot,
     scanning_enabled: bool,
+    /// When true, `.p4config` markers win over sibling `.git` directories
+    /// during backend registration. Sourced from the `perforce.prefer_perforce_over_git`
+    /// setting at scanner construction; not re-read during the scanner's lifetime.
+    prefer_perforce_over_git: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1217,6 +1221,7 @@ impl LocalWorktree {
                         paths_to_scan: Default::default(),
                         removed_entries: Default::default(),
                         changed_paths: Default::default(),
+                        prefer_perforce_over_git: settings.prefer_perforce_over_git,
                     }),
                     phase: BackgroundScannerPhase::InitialScan,
                     share_private_files,
@@ -2093,6 +2098,25 @@ impl LocalWorktree {
         self.git_repositories
             .values()
             .map(|entry| entry.work_directory_abs_path.clone())
+            .collect::<Vec<_>>()
+    }
+
+    /// Test helper: return the marker file name (last path component of
+    /// `dot_git_abs_path`) for each registered repository entry, so tests can
+    /// tell git-backed vs Perforce-backed repositories apart. Order matches
+    /// [`Self::repositories`].
+    #[cfg(feature = "test-support")]
+    pub fn repository_marker_names(&self) -> Vec<String> {
+        self.git_repositories
+            .values()
+            .map(|entry| {
+                entry
+                    .dot_git_abs_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect::<Vec<_>>()
     }
 }
@@ -3091,7 +3115,8 @@ impl BackgroundScannerState {
             .file_name()
             .is_some_and(git::perforce::is_p4_config_name)
         {
-            self.insert_perforce_repository(entry.path.clone()).await;
+            self.insert_perforce_repository(entry.path.clone(), watcher)
+                .await;
         }
 
         #[cfg(feature = "test-support")]
@@ -3349,6 +3374,23 @@ impl BackgroundScannerState {
                         .display(self.snapshot.path_style)
                 )
             })?;
+        let work_directory_id = work_dir_entry.id;
+
+        // If the Perforce backend has already claimed this directory (because the
+        // user set `perforce.prefer_perforce_over_git = true`), leave it alone.
+        // Detected before adding any `.git` watchers so we don't leak subscriptions
+        // for events we would never act on.
+        if self.prefer_perforce_over_git
+            && let Some(existing) = self.snapshot.git_repositories.get(&work_directory_id)
+            && existing
+                .dot_git_abs_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(git::perforce::is_p4_config_name)
+        {
+            return Ok(existing.clone());
+        }
+
         let work_directory_abs_path = self.snapshot.work_directory_abs_path(&work_directory);
 
         let (repository_dir_abs_path, common_dir_abs_path) =
@@ -3371,8 +3413,6 @@ impl BackgroundScannerState {
                 .context("failed to add reftable directory to watcher")
                 .log_err();
         }
-
-        let work_directory_id = work_dir_entry.id;
 
         let local_repository = LocalRepositoryEntry {
             work_directory_id,
@@ -3401,7 +3441,16 @@ impl BackgroundScannerState {
     /// backend at construction time (by inspecting the marker filename). This does NOT
     /// hit the Perforce server — discovery stays cheap and synchronous; the actual `p4`
     /// connection is validated later, when the backend is constructed.
-    async fn insert_perforce_repository(&mut self, dot_p4_path: Arc<RelPath>) {
+    ///
+    /// Collision policy for `.git + .p4config` in the same folder is controlled by
+    /// `perforce.prefer_perforce_over_git`: when false (default) the existing git
+    /// entry stands; when true, the git entry is evicted (map + watcher subscriptions)
+    /// and replaced with a Perforce entry.
+    async fn insert_perforce_repository(
+        &mut self,
+        dot_p4_path: Arc<RelPath>,
+        watcher: &dyn Watcher,
+    ) {
         let Some(work_dir_path) = dot_p4_path.parent() else {
             // `.p4config` is the worktree root itself; nothing above it to track.
             return;
@@ -3413,9 +3462,31 @@ impl BackgroundScannerState {
         };
         let work_directory_id = work_dir_entry.id;
 
-        // Git takes precedence if a repository is already registered for this directory.
-        if self.snapshot.git_repositories.get(&work_directory_id).is_some() {
-            return;
+        if let Some(existing) = self.snapshot.git_repositories.get(&work_directory_id) {
+            let existing_is_p4 = existing
+                .dot_git_abs_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(git::perforce::is_p4_config_name);
+            // Bail if either: this dir is already Perforce (idempotent rescan), or
+            // the caller has not opted in to Perforce winning over git.
+            if existing_is_p4 || !self.prefer_perforce_over_git {
+                return;
+            }
+            // Evict the git entry so the Perforce backend can claim the slot. Drop
+            // the `.git` watcher subscriptions we no longer consume; without this,
+            // every `.git/HEAD` / index / reftable event would still fire
+            // `update_git_repositories`, which would then no-op and re-skip through
+            // the front-loaded check in `insert_git_repository_for_path`.
+            watcher.remove(&existing.common_dir_abs_path).log_err();
+            // For normal (non-linked) git repos, common_dir == repository_dir; only
+            // remove once. Linked worktrees have distinct paths and need both.
+            if existing.repository_dir_abs_path != existing.common_dir_abs_path {
+                watcher.remove(&existing.repository_dir_abs_path).log_err();
+            }
+            let reftable = existing.common_dir_abs_path.join("reftable");
+            watcher.remove(&reftable).log_err();
+            self.snapshot.git_repositories.remove(&work_directory_id);
         }
 
         let work_directory = WorkDirectory::InProject {
@@ -5046,7 +5117,9 @@ impl BackgroundScanner {
                     .is_some_and(git::perforce::is_p4_config_name)
                 {
                     let mut state = self.state.lock().await;
-                    state.insert_perforce_repository(child_path.clone()).await;
+                    state
+                        .insert_perforce_repository(child_path.clone(), self.watcher.as_ref())
+                        .await;
                 } else if child_name == GITIGNORE {
                     match build_gitignore(&child_abs_path, self.fs.as_ref()).await {
                         Ok(ignore) => {

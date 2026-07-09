@@ -3448,6 +3448,109 @@ async fn test_perforce_workspace_registers_repository(
     pretty_assertions::assert_eq!(repos, [Path::new(path!("/ws")).into()]);
 }
 
+/// When `.git` and `.p4config` live in the same folder and the user has NOT
+/// opted into `perforce.prefer_perforce_over_git`, the git backend wins —
+/// matching the fork's pre-existing behavior since the Perforce backend was
+/// introduced. The Perforce marker is silently ignored for that folder.
+#[gpui::test]
+async fn test_git_and_perforce_collision_defaults_to_git(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/mix"),
+        json!({
+            ".git": {},
+            ".p4config": "P4CLIENT=demo\n",
+            "src": {
+                "a.cpp": "int main() {}"
+            }
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        path!("/mix").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    let markers = worktree.update(cx, |worktree, _| {
+        worktree.as_local().unwrap().repository_marker_names()
+    });
+    pretty_assertions::assert_eq!(markers, vec![".git".to_string()]);
+}
+
+/// With `perforce.prefer_perforce_over_git = true`, the Perforce backend wins
+/// over a sibling `.git` directory. Regardless of which entry the scanner
+/// encounters first, the final registration is the Perforce marker.
+#[gpui::test]
+async fn test_prefer_perforce_over_git_wins_over_git(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                let mut p4 = settings.perforce.clone().unwrap_or_default();
+                p4.prefer_perforce_over_git = Some(true);
+                settings.perforce = Some(p4);
+            });
+        });
+    });
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/mix"),
+        json!({
+            ".git": {},
+            ".p4config": "P4CLIENT=demo\n",
+            "src": {
+                "a.cpp": "int main() {}"
+            }
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        path!("/mix").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    let markers = worktree.update(cx, |worktree, _| {
+        worktree.as_local().unwrap().repository_marker_names()
+    });
+    pretty_assertions::assert_eq!(markers, vec![".p4config".to_string()]);
+}
+
 #[gpui::test]
 async fn test_global_gitignore(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
