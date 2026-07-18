@@ -1614,6 +1614,49 @@ impl GitRepository for PerforceRepository {
         async move { Ok(revs.into_iter().map(|_| None).collect()) }.boxed()
     }
 
+    fn load_revisions(&self, revisions: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>> {
+        // Batch diff-base loader: upstream routes buffer diff-base reloads
+        // through this instead of per-file `load_index_text` /
+        // `load_committed_text`, so it must mirror those exactly:
+        // - `HEAD:{path}` → depot content of the currently-synced revision,
+        //   like [`Self::load_committed_text`] (`p4 print -q //client/path#have`).
+        // - `:{path}` (the git index) → `None`: Perforce has no staging index.
+        // - any other spec (e.g. `{oid}:{path}`) → `None`; commit-pinned
+        //   content is served by `load_commit`, not by oid lookups here.
+        let cli = self.cli.clone();
+        let print_args: Vec<Option<String>> = revisions
+            .iter()
+            .map(|spec| {
+                let rel = spec.strip_prefix("HEAD:")?;
+                let rel_path = RelPath::unix(rel).ok()?;
+                Some(format!(
+                    "{}#have",
+                    self.client_syntax_path(&RepoPath::from_rel_path(&rel_path))
+                ))
+            })
+            .collect();
+        async move {
+            let mut contents = Vec::with_capacity(print_args.len());
+            for print_arg in print_args {
+                let text = match print_arg {
+                    None => None,
+                    Some(print_arg) => cli
+                        .run(false, &["print", "-q", &print_arg])
+                        .await
+                        .ok()
+                        .map(|mut text| {
+                            // CRLF → LF, same reason as in `load_committed_text`.
+                            LineEnding::normalize(&mut text);
+                            text
+                        }),
+                };
+                contents.push(text);
+            }
+            Ok(contents)
+        }
+        .boxed()
+    }
+
     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
         async { None }.boxed()
     }

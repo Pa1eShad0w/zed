@@ -456,15 +456,56 @@ impl LocalBufferStore {
         // succeeds; `Add` runs after the write since `p4 add` needs the file on disk.
         let perforce = self.perforce_open_request(&worktree, &path, is_new_file, cx);
 
+        // Only an actual Perforce `edit` on a Perforce-backed repo has to run before the write
+        // (a synced file is read-only on disk; `write_file`'s background write would race the
+        // checkout). Every other save — all git / non-VCS saves, and Perforce `add`s (which run
+        // after the write) — creates the write task eagerly, exactly as upstream does. That
+        // eager, in-update-cycle creation is load-bearing: an LSP "rename symbol" that also
+        // renames the file saves the buffer and then `fs.rename`s it, and the buffer only
+        // follows the rename to the new path if the write was registered synchronously here.
+        //
+        // The perforce request is `Some` whenever the switch is on (the actual p4-vs-git check
+        // lives in the async `perforce_open_for`, a no-op for git), so it alone can't tell git
+        // from Perforce. Gate the deferral on the repo's synchronous `is_perforce` so git saves
+        // keep the eager path. The `edit`-before-write hook still runs either way; for git it is
+        // simply a no-op, so deferring it there would only cost the rename association.
+        //
+        // Known Perforce-only edges of this gate, both best-effort (a failed checkout only
+        // `log_err`s and the save proceeds), both narrower than the git regression they replace:
+        //   1. `is_perforce` is a `peek()` that reads `false` until the repo backend resolves,
+        //      so the very first save in a freshly-opened p4 workspace (before the state is
+        //      driven) takes the eager path and the `p4 edit` races the still-read-only file —
+        //      the write can fail once, then succeed on retry once the repo has resolved.
+        //   2. It checks the *active* repo, not the repo owning `path`, so a mixed git+p4
+        //      multi-repo project can misclassify a save whose file lives in the non-active
+        //      repo. Single-VCS projects never hit this.
+        let repo_is_perforce = self
+            .git_store
+            .as_ref()
+            .and_then(|git_store| git_store.upgrade())
+            .and_then(|git_store| git_store.read(cx).active_repository())
+            .is_some_and(|repo| repo.read(cx).is_perforce());
+        let needs_edit_first = repo_is_perforce
+            && matches!(&perforce, Some((_, git::perforce::P4OpenAction::Edit, _)));
+        let eager_save = (!needs_edit_first).then(|| {
+            worktree.update(cx, |worktree, cx| {
+                worktree.write_file(
+                    path.clone(),
+                    text.clone(),
+                    line_ending,
+                    encoding,
+                    has_bom,
+                    cx,
+                )
+            })
+        });
+
         cx.spawn(async move |this, cx| {
             // Best-effort throughout: a failed `p4 edit`/`add` must never abort the save.
             if let Some((git_store, action, project_path)) = &perforce
                 && *action == git::perforce::P4OpenAction::Edit
                 && let Some(git_store) = git_store.upgrade()
             {
-                // Open for edit BEFORE the write. gpui Tasks are eager, so this must be
-                // awaited before the write task is even created, or the write races the
-                // checkout and fails on the still-read-only file.
                 git_store
                     .update(cx, |git_store, cx| {
                         git_store.perforce_open_for(project_path, *action, cx)
@@ -473,9 +514,14 @@ impl LocalBufferStore {
                     .log_err();
             }
 
-            let save = worktree.update(cx, |worktree, cx| {
-                worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
-            });
+            // For a Perforce `edit` the write task is created here, after the checkout above,
+            // so the background write never races the still-read-only file.
+            let save = match eager_save {
+                Some(save) => save,
+                None => worktree.update(cx, |worktree, cx| {
+                    worktree.write_file(path, text, line_ending, encoding, has_bom, cx)
+                }),
+            };
             let new_file = save.await?;
 
             // Open for add AFTER the write — `p4 add` requires the file to exist on disk.
@@ -490,6 +536,7 @@ impl LocalBufferStore {
                     .await
                     .log_err();
             }
+
             let mtime = new_file.disk_state().mtime();
             this.update(cx, |this, cx| {
                 if let Some((downstream_client, project_id)) = this.downstream_client.clone() {

@@ -42,6 +42,13 @@
 
 ### Changed
 
+- `85f4acfd08` (2026-07-18) 合并 upstream 稳定版 v1.11.3（自 v1.9.0 基线起 270 个上游提交，跳过 v1.10.x——其间无更高的独立稳定 tag），fork 版本号升为 `1.11.3-fork.1`。上游有几处重写，fork 特性是「重新移植」而非「文本合并」：
+    - **自动更新**：upstream 删除了 `VersionCheckType` 枚举、把版本判定改回裸 `semver::Version`。fork 的 Fork 频道「保留 prerelease 段」比较（`-fork.{N}` 前缀即更新序号，不能像 stable 那样 strip `pre`，否则 `1.11.3-fork.2` 会被 SemVer 判为低于裸 `1.11.3`、每次序号自增都被漏判）重新表达为显式 `ReleaseChannel::Fork` match 分支，委托给返回 `Option<Version>` 的 `check_fork`；SHA-256 安装包校验与 upstream 新增的下载进度回调在同一下载流程内并存。
+    - **changelist 范围 diff**：upstream 用新的 `DiffMultibuffer` + `DiffBufferList` 抽象重写了 `ProjectDiff`。fork 的「按 changelist 范围 diff」（把远程 `p4 print` 基线加载限定在单个 changelist 的 pending 文件内，避免整仓逐文件 print）重新移植：`DiffBufferList` 新增 `path_scope` 过滤器（在基线加载 task 生成之前跳过范围外文件），`ProjectDiff` 新增 `scope_title` 与 `deploy_changelist`；范围 tab 不会被全仓「Uncommitted Changes」diff 复用、不参与序列化（反序列化只会重建整仓 diff）、split 时克隆自身范围。
+    - **diff hunk 回退崩溃修复迁移**：upstream 把 stage/unstage 机制从 `restore_diff_hunks` 移到 `DiffHunkControls::restore` trait 方法；fork 的 Perforce 守卫（跳过 staging：p4 无 index，pending stage 永不 reconcile 会泄漏幽灵 hunk 并在下次编辑时 panic）随之搬到新调用点。
+    - **批量 diff-base 加载**：upstream 把 buffer diff-base 重载合并进新的 `GitRepository::load_revisions` trait 方法（`load_index_text` / `load_committed_text` 现为其默认实现）；`PerforceRepository` 实现之：`HEAD:{path}` → `p4 print -q //client/path#have`（CRLF 归一化，与 `load_committed_text` 一致），git index 段 `:{path}` 与其他 spec → `None`。
+    - **文件历史表**：Perforce 文件历史表（6 列）保留全宽布局；upstream 新增的表头「隐藏列」右键菜单对它禁用（菜单列的是 git graph 列名，与 Perforce 表不对应）。
+    - **保存路径回归修复**：upstream 新增行为——LSP「重命名符号」若同时重命名文件，buffer 必须跟随到新路径（`test_rename_that_also_renames_file`）。fork 的 Perforce 自动 checkout 保存把 worktree 写入 task 推迟进异步块（好让 `p4 edit` 先把已同步的只读文件改为可写），这破坏了对**所有**保存的该关联（请求在开关开启时恒为 `Some`，git 保存也误走了推迟路径）。改为按仓库同步 `is_perforce` 门控推迟：git / 非 VCS 保存保留 upstream 的即时写入（即保留重命名关联），仅真正 Perforce `edit` 推迟。
 - `2e413e1ce6` (2026-07-07) Windows 安装包的发布者字段（AppPublisher）由占位名改为 "Zed Perforce Fork"：仅安装器元数据与"添加/删除程序"里显示的发布者名变化，AppId / 互斥量 / 进程名 / appx 标识不动，与 upstream stable 的替换式安装行为完全不受影响。随 `v1.9.0-fork.2` 发布（取代从未发布成功的 `v1.9.0-fork.1`，其 CI 构建在发布前已取消）。
 - `0807d9521d` (2026-07-06) 合并 upstream 稳定版 v1.9.0（自 v1.8.2 基线起 118 个上游提交），fork 版本号升为 `1.9.0-fork.1`。适配要点：changelist 范围 diff 的按范围跳过逻辑与 upstream 新的 `project_diff_path_key` 排序重构（group_by / tree_view / sort_by 三设置拆分）合成，changelist tab 现在同样响应这些排序设置变化；git 仓库可访问性探针从全量 `status()` 换成 upstream 新增的轻量 `check_access()`，Perforce 后端继承默认实现——p4 连接故障不再误触发 git 专用的 "unsafe repository" 修复界面，也省去面板加载时一次多余的 p4 调用。
 - `da8647d7da` (2026-06-27) `assets/settings/default.json`：`telemetry.metrics` 与 `telemetry.diagnostics` 默认翻为 `false`（spec §7.2 telemetry 默认关）；新增 `auto_update_server_url: null`（公开 GitHub 二进制不能 baked 内网 URL，内网用户主动配置开启）。
