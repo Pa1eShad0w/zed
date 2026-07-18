@@ -39,6 +39,10 @@ which.workspace = true
 ctor.workspace = true
 client = { workspace = true, features = ["test-support"] }
 clock= { workspace = true, "features" = ["test-support"] }
+# `test_auto_update_downloads` reaches `KeyValueStore::global`, which needs the
+# test database; without this the test panics ("database not initialized") when
+# the crate's tests run in isolation (`cargo test -p auto_update`).
+db = { workspace = true, features = ["test-support"] }
 futures.workspace = true
 gpui = { workspace = true, "features" = ["test-support"] }
 parking_lot.workspace = true
