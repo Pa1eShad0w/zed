@@ -42,6 +42,7 @@
 
 ### Changed
 
+- `38b80f20a9` (2026-07-22) Windows 安装包文件名带上版本号：`Zed-Fork-x86_64.exe` → `Zed-Fork-<版本>-windows-<架构>.exe`（例 `Zed-Fork-1.11.3-fork.1-windows-x64.exe`；`x86_64`→`x64`、`aarch64`→`arm64`）。此前所有 release 的安装包同名，内网更新服务器把每个 release 的安装包镜像进共享的 `blob/` 目录，新版本会覆盖旧版本的二进制，导致旧版本目录里 asset.json 记录的 SHA256 与实际文件不再一致；spec、服务器 RUNBOOK 的清理命令和测试数据本就假定版本化命名，是 CI 实现漂移了。版本号取自 `crates/zed/Cargo.toml` 的 package version（与 tag 去 `v` 后一致）。下游全链路（Inno `OutputBaseFilename`、`SETUP_PATH`、CI 的 `sha256sum` 通配、GH Release 通配上传、内网 worker 按 `.exe` 后缀匹配、客户端下载后固定存为本地 `Zed.exe`）均不依赖具体文件名，已镜像的旧 release 不受影响。
 - `85f4acfd08` (2026-07-18) 合并 upstream 稳定版 v1.11.3（自 v1.9.0 基线起 270 个上游提交，跳过 v1.10.x——其间无更高的独立稳定 tag），fork 版本号升为 `1.11.3-fork.1`。上游有几处重写，fork 特性是「重新移植」而非「文本合并」：
     - **自动更新**：upstream 删除了 `VersionCheckType` 枚举、把版本判定改回裸 `semver::Version`。fork 的 Fork 频道「保留 prerelease 段」比较（`-fork.{N}` 前缀即更新序号，不能像 stable 那样 strip `pre`，否则 `1.11.3-fork.2` 会被 SemVer 判为低于裸 `1.11.3`、每次序号自增都被漏判）重新表达为显式 `ReleaseChannel::Fork` match 分支，委托给返回 `Option<Version>` 的 `check_fork`；SHA-256 安装包校验与 upstream 新增的下载进度回调在同一下载流程内并存。
     - **changelist 范围 diff**：upstream 用新的 `DiffMultibuffer` + `DiffBufferList` 抽象重写了 `ProjectDiff`。fork 的「按 changelist 范围 diff」（把远程 `p4 print` 基线加载限定在单个 changelist 的 pending 文件内，避免整仓逐文件 print）重新移植：`DiffBufferList` 新增 `path_scope` 过滤器（在基线加载 task 生成之前跳过范围外文件），`ProjectDiff` 新增 `scope_title` 与 `deploy_changelist`；范围 tab 不会被全仓「Uncommitted Changes」diff 复用、不参与序列化（反序列化只会重建整仓 diff）、split 时克隆自身范围。

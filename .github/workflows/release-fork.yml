@@ -169,7 +169,7 @@ jobs:
         #   - cargo build --release --target x86_64-pc-windows-msvc for
         #     zed, cli, auto_update_helper, explorer_command_injector, remote_server
         #   - makeAppx, Inno Setup compile
-        #   - writes `SETUP_PATH=target/Zed-Fork-x86_64.exe` to $GITHUB_ENV
+        #   - writes `SETUP_PATH=target/Zed-Fork-<version>-windows-x64.exe` to $GITHUB_ENV
         #
         # We deliberately clear $env:CI before invoking the script. With CI
         # set, bundle-windows.ps1 demands Azure Trusted Signing secrets

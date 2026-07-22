@@ -26,7 +26,7 @@ GitHub Actions picks up the tag and runs `.github/workflows/release-fork.yml`. ~
 
 On success the workflow:
 
-1. Builds `Zed-Fork-x86_64.exe` via `script/bundle-windows.ps1`.
+1. Builds `Zed-Fork-<version>-windows-x64.exe` (e.g. `Zed-Fork-1.11.3-fork.1-windows-x64.exe`) via `script/bundle-windows.ps1`. The filename embeds the version so every release lands as a distinct blob on the intranet update server instead of overwriting the previous installer.
 2. Emits `SHA256SUMS.txt` via `sha256sum -b *.exe`.
 3. Extracts release notes from the bump commit body via `git show -s --format=%b "$GITHUB_REF_NAME"`.
 4. Publishes a GitHub Release with installer + `SHA256SUMS.txt` + body via `softprops/action-gh-release@v2`. `fail_on_unmatched_files: true` so a missing artifact loud-fails the workflow.
