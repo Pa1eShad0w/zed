@@ -366,7 +366,18 @@ function BuildInstaller {
             $appName = "Zed Fork"
             $appDisplayName = "Zed Fork"
             $appPublisher = "Zed Perforce Fork"
-            $appSetupName = "Zed-Fork-$Architecture"
+            # Versioned installer filename, e.g. Zed-Fork-1.11.3-fork.1-windows-x64.exe.
+            # The version must be part of the name: the intranet update server
+            # mirrors every release's installer into a shared blob/ directory,
+            # and an unversioned name makes each new release overwrite the
+            # previous binary, silently invalidating the sha256 recorded in
+            # older versions' asset.json. RELEASE_VERSION is set by
+            # lib/workspace.ps1 from the zed package's Cargo.toml version.
+            $setupArch = switch ($Architecture) {
+                "x86_64" { "x64" }
+                "aarch64" { "arm64" }
+            }
+            $appSetupName = "Zed-Fork-$env:RELEASE_VERSION-windows-$setupArch"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Stable-Instance-Mutex"
             $appExeName = "Zed"
