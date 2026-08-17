@@ -29,6 +29,7 @@ component.workspace = true
 db.workspace = true
 editor.workspace = true
 file_icons.workspace = true
+fs.workspace = true
 futures-lite.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
