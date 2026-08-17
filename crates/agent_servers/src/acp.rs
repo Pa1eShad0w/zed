@@ -230,6 +230,69 @@ fn exited_load_error_with_stderr(status: ExitStatus, debug_log: &AcpDebugLog) ->
     }
 }
 
+/// How much of a non-protocol line we keep. The agent's stdout is untrusted
+/// input, so we keep enough to recognize what is polluting the channel and
+/// nothing more.
+const MAX_UNPARSED_OUTPUT_CHARS: usize = 512;
+
+/// Whether a line read from the agent's stdout can be a protocol message.
+///
+/// Every ACP message is a JSON-RPC request, notification or response, that is,
+/// a JSON *object*, so a line that does not start with `{` cannot be one. It
+/// came from something else writing to the agent's stdout: a shell banner or
+/// prompt, an ANSI query, or - on Windows, where agents are spawned through
+/// `cmd.exe /C` - a batch file's `Terminate batch job (Y/N)?` prompt.
+fn is_protocol_line(line: &str) -> bool {
+    line.trim_start().starts_with('{')
+}
+
+fn truncate_unparsed_output(line: &str) -> String {
+    let line = line.trim_end();
+    match line.char_indices().nth(MAX_UNPARSED_OUTPUT_CHARS) {
+        Some((byte_ix, _)) => format!("{}… ({} bytes total)", &line[..byte_ix], line.len()),
+        None => line.to_string(),
+    }
+}
+
+/// Keeps protocol messages on the transport and diverts anything else to the
+/// debug log.
+///
+/// Feeding non-protocol output to the JSON-RPC parser is not just useless: a
+/// parse error makes the transport write an error notification *back* to the
+/// agent's stdin, quoting the offending line in full. A peer that echoes its
+/// stdin - `cmd.exe` does exactly that while waiting for an answer to
+/// `Terminate batch job (Y/N)?` - returns that notification on stdout behind
+/// the prompt, so it fails to parse again. Each round trip re-escapes the
+/// previous line and doubles its length; roughly thirty of them wrote a 19 GiB
+/// log record. Never answering output we cannot parse removes the cycle.
+fn protocol_lines(
+    incoming: impl futures::Stream<Item = std::io::Result<String>>,
+    debug_log: AcpDebugLog,
+) -> impl futures::Stream<Item = std::io::Result<String>> {
+    incoming.filter(move |result| {
+        let keep = match result {
+            Ok(line) if is_protocol_line(line) => {
+                debug_log.record_line(AcpDebugMessageDirection::Incoming, line);
+                true
+            }
+            Ok(line) => {
+                // Blank lines carry nothing to diagnose and shells emit plenty.
+                if !line.trim().is_empty() {
+                    let line = truncate_unparsed_output(line);
+                    log::warn!("Ignoring non-protocol output on agent stdout: {line}");
+                    debug_log.record_line(AcpDebugMessageDirection::Stderr, &line);
+                }
+                false
+            }
+            Err(err) => {
+                log::warn!("ACP transport read error: {err}");
+                true
+            }
+        };
+        futures::future::ready(keep)
+    })
+}
+
 #[derive(Debug, Error)]
 #[error("Unsupported version")]
 pub struct UnsupportedVersion;
@@ -883,15 +946,7 @@ impl AcpConnection {
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
 
         let incoming_lines = futures::io::BufReader::new(stdout).lines();
-        let tapped_incoming = incoming_lines.inspect({
-            let debug_log = debug_log.clone();
-            move |result| match result {
-                Ok(line) => debug_log.record_line(AcpDebugMessageDirection::Incoming, line),
-                Err(err) => {
-                    log::warn!("ACP transport read error: {err}");
-                }
-            }
-        });
+        let tapped_incoming = protocol_lines(incoming_lines, debug_log.clone());
 
         let tapped_outgoing = futures::sink::unfold(
             (Box::pin(stdin), debug_log.clone()),
@@ -3037,6 +3092,90 @@ mod tests {
             .expect("expected client capabilities meta");
 
         assert!(!meta.contains_key(PARAMETERIZED_MODEL_PICKER_META_KEY));
+    }
+
+    fn filtered_lines(lines: Vec<std::io::Result<String>>, debug_log: &AcpDebugLog) -> Vec<String> {
+        futures::executor::block_on(
+            protocol_lines(futures::stream::iter(lines), debug_log.clone())
+                .map(|line| line.expect("fixture has no io errors"))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn recorded(debug_log: &AcpDebugLog) -> Vec<AcpDebugMessage> {
+        let (backlog, _receiver) = debug_log.subscribe();
+        backlog
+    }
+
+    #[test]
+    fn non_protocol_output_never_reaches_the_transport() {
+        let debug_log = AcpDebugLog::default();
+        // What `cmd.exe` writes to stdout once a batch wrapper has been
+        // interrupted: its prompt, followed by whatever it read from stdin -
+        // here the parse error Zed itself sent during the previous round.
+        let echoed_prompt = concat!(
+            "Terminate batch job (Y/N)? ",
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#
+        );
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"session/update"}"#;
+        let indented_notification = r#"  {"jsonrpc":"2.0","method":"initialized"}"#;
+
+        let kept = filtered_lines(
+            vec![
+                Ok(echoed_prompt.into()),
+                Ok(request.into()),
+                Ok("\u{1b}[6n".into()),
+                Ok(indented_notification.into()),
+            ],
+            &debug_log,
+        );
+
+        assert_eq!(kept, vec![request.to_string(), indented_notification.into()]);
+
+        let directions = recorded(&debug_log)
+            .iter()
+            .map(|message| message.direction)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            directions,
+            vec![
+                AcpDebugMessageDirection::Stderr,
+                AcpDebugMessageDirection::Incoming,
+                AcpDebugMessageDirection::Stderr,
+                AcpDebugMessageDirection::Incoming,
+            ],
+            "non-protocol lines belong in the debug log, not on the transport"
+        );
+    }
+
+    #[test]
+    fn ignored_output_is_recorded_but_truncated() {
+        let debug_log = AcpDebugLog::default();
+        let noise = "x".repeat(MAX_UNPARSED_OUTPUT_CHARS * 4);
+
+        assert!(filtered_lines(vec![Ok(noise.clone())], &debug_log).is_empty());
+
+        let messages = recorded(&debug_log);
+        let [message] = messages.as_slice() else {
+            panic!("expected exactly one recorded line, got {}", messages.len());
+        };
+        let AcpDebugMessageContent::Stderr { line } = &message.message else {
+            panic!("expected the ignored line to be recorded verbatim");
+        };
+        assert!(line.starts_with("xxx"));
+        assert!(line.len() < noise.len());
+        assert!(line.contains(&format!("({} bytes total)", noise.len())));
+    }
+
+    #[test]
+    fn blank_output_is_dropped_without_recording() {
+        let debug_log = AcpDebugLog::default();
+
+        assert!(filtered_lines(vec![Ok("".into()), Ok("   \r".into())], &debug_log).is_empty());
+        assert!(
+            recorded(&debug_log).is_empty(),
+            "blank lines should not fill the ACP log view"
+        );
     }
 
     #[test]
