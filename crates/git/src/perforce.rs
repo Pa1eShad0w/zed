@@ -151,6 +151,12 @@ pub(crate) struct P4Cli {
 
 impl P4Cli {
     fn build_command<S: AsRef<OsStr>>(&self, tagged: bool, args: &[S]) -> util::command::Command {
+        // `crates/git/clippy.toml` bans constructing commands directly so that every git
+        // invocation goes through `GitBinary::build_command`, which forces
+        // `-c core.fsmonitor=false` (a repository's own config can otherwise name a program
+        // for git to execute). This spawns the `p4` binary: it has no fsmonitor config to
+        // suppress, and `GitBinary::build_command` would prepend git-only arguments.
+        #[allow(clippy::disallowed_methods)]
         let mut command = new_command(&self.p4_binary_path);
         command.current_dir(&self.working_directory);
         // `-ztag` is a global option and must precede the subcommand. It produces
@@ -2383,7 +2389,11 @@ impl PerforceRepository {
     /// exists on disk.
     pub fn move_path(&self, src: RepoPath, dst: RepoPath) -> Task<Result<()>> {
         let cli = self.cli.clone();
-        let edit_args = p4_open_args(P4OpenAction::Edit, &self.client_name, &[src.clone()]);
+        let edit_args = p4_open_args(
+            P4OpenAction::Edit,
+            &self.client_name,
+            std::slice::from_ref(&src),
+        );
         let move_args = p4_move_args(&self.client_name, &src, &dst);
         self.cli.executor.clone().spawn(async move {
             // Open source for edit first; ignore failure (already open for add, or untracked).
