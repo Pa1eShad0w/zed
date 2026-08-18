@@ -6904,6 +6904,10 @@ mod tests {
                         commit_timestamp: 1_700_000_000,
                         subject: "Commit subject".into(),
                         message: "Commit message".into(),
+                        // Perforce-only fields (fork): plain git commit data.
+                        revision_label: None,
+                        file_revision: None,
+                        branch: None,
                     },
                     false,
                 )
@@ -7559,6 +7563,10 @@ mod tests {
                     commit_timestamp: 1_700_000_000,
                     subject: "Long commit message".into(),
                     message: message.into(),
+                    // Perforce-only fields (fork): plain git commit data.
+                    revision_label: None,
+                    file_revision: None,
+                    branch: None,
                 },
                 false,
             )],
