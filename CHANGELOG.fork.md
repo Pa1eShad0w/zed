@@ -42,6 +42,15 @@
 
 ### Changed
 
+- `cb84970f9d` `0e60a21c1d` `41cc821e05` (2026-08-17) 合并 upstream 稳定版 v1.15.0（自 v1.11.3 基线起 531 个上游提交，跳过 v1.12.x / v1.13.x / v1.14.x——一次合入最新稳定 tag），fork 版本号升为 `1.15.0-fork.1`。上游在 git 区域有多处结构性重写，fork 特性按「采纳上游新结构 + 重新挂接 fork 行为」处理：
+    - **commit 右键菜单**：upstream 把 git graph 的 commit 上下文菜单抽成共享函数（git graph 与 Git Panel History 页共用）。fork 的 Perforce 定制（`Copy Changelist` 文案、`Changelist <n>` 标题、`View in Swarm` 入口、复制裸 changelist 数字）随之迁入共享函数——现在 Git Panel History 页的右键菜单在 Perforce 仓库下也获得同样定制；git 仓库行为逐字节不变（`revision_label` 为空时全部走原文案）。
+    - **删除文件的 Perforce 记账**：upstream 把项目删除入口拆成可撤销的回收站路径（新的 Project Panel undo/redo 特性）与永久删除路径两个方法。fork 的「删除文件时 `p4 delete`」钩子同时挂到两条路径，与拆分前行为一致。已知边界：用 Project Panel 的 undo 恢复被回收的文件后，depot 侧的 open-for-delete 不会自动 revert，需要手工 `p4 revert`（拆分前的回收站删除同样如此，非本次合并引入）。
+    - **Git Panel 活动仓库切换检测**：upstream 自己也把「仅在活动仓库真正变化时重置访问性探测」的模式做进了 `schedule_update`（fork 此前为避免每个状态 tick 都发 Perforce 解析任务做过同样的事）。fork 的 perforce-ness 重解析改挂在 upstream 的新检测点上，去掉了 fork 自己那份重复检测。
+    - **editor diff hunk 按钮**：upstream 新增 `is_stageable` 判定（merge-base diff 不可 stage）。与 fork 的「Perforce 隐藏 Stage/Unstage、保留 Restore 并改叫 Revert」叠加：Perforce diff 走 HEAD-base 机制，`is_stageable` 恒真，Revert 按钮不受影响。
+    - **worktree git 目录重登记**：采纳 upstream 的 `git_dir_scan_id` 结转逻辑（watcher 强制 rescan 时重插仓库不再吞掉同周期内的 git 更新）；fork 为 Perforce 判定提前的 `work_directory_id` 绑定保留，去掉 upstream 侧的重复绑定。
+    - **API 适配**：`GitRepository::diff_stat` 新增 `DiffStatType` 参数（Perforce 实现忽略之，仍返回空 stat）；`Blame` 新增 `tag_names` 字段（Perforce 无 tag，置空 map）；`RelPath::unix` 上游更名 `RelPath::from_unix_str`（语义不变）；upstream 从 git_ui 移除了未用的 `fs` 依赖，fork 的 Perforce 面板仍用 `fs::RemoveOptions`，恢复该依赖。
+    - **新设置 `git.diff_base` 对 Perforce 的影响**：设为 `default_branch` 时需要 `default_branch()`，Perforce 后端返回 `None`，merge-base diff 优雅退化为无（不报错不崩溃）；默认值 `head` 行为与升级前一致。
+    - **测试**：`git` 116 / `worktree` 68 / `git_ui` 128 全部通过。upstream 新测试 `test_merge_base_status_uses_worktree_contents` 在本机 Windows 上失败，已在 pristine v1.15.0 上复现同样失败，判定为 upstream 自身问题（Windows 下 merge-base 状态叠加出幽灵 Deleted 状态），与 fork 无关，待上游修复后随后续 uptake 消化。
 - `38b80f20a9` (2026-07-22) Windows 安装包文件名带上版本号：`Zed-Fork-x86_64.exe` → `Zed-Fork-<版本>-windows-<架构>.exe`（例 `Zed-Fork-1.11.3-fork.1-windows-x64.exe`；`x86_64`→`x64`、`aarch64`→`arm64`）。此前所有 release 的安装包同名，内网更新服务器把每个 release 的安装包镜像进共享的 `blob/` 目录，新版本会覆盖旧版本的二进制，导致旧版本目录里 asset.json 记录的 SHA256 与实际文件不再一致；spec、服务器 RUNBOOK 的清理命令和测试数据本就假定版本化命名，是 CI 实现漂移了。版本号取自 `crates/zed/Cargo.toml` 的 package version（与 tag 去 `v` 后一致）。下游全链路（Inno `OutputBaseFilename`、`SETUP_PATH`、CI 的 `sha256sum` 通配、GH Release 通配上传、内网 worker 按 `.exe` 后缀匹配、客户端下载后固定存为本地 `Zed.exe`）均不依赖具体文件名，已镜像的旧 release 不受影响。
 - `85f4acfd08` (2026-07-18) 合并 upstream 稳定版 v1.11.3（自 v1.9.0 基线起 270 个上游提交，跳过 v1.10.x——其间无更高的独立稳定 tag），fork 版本号升为 `1.11.3-fork.1`。上游有几处重写，fork 特性是「重新移植」而非「文本合并」：
     - **自动更新**：upstream 删除了 `VersionCheckType` 枚举、把版本判定改回裸 `semver::Version`。fork 的 Fork 频道「保留 prerelease 段」比较（`-fork.{N}` 前缀即更新序号，不能像 stable 那样 strip `pre`，否则 `1.11.3-fork.2` 会被 SemVer 判为低于裸 `1.11.3`、每次序号自增都被漏判）重新表达为显式 `ReleaseChannel::Fork` match 分支，委托给返回 `Option<Version>` 的 `check_fork`；SHA-256 安装包校验与 upstream 新增的下载进度回调在同一下载流程内并存。
