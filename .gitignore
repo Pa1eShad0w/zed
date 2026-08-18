@@ -67,3 +67,5 @@ crates/docs_preprocessor/actions.json
 /Microsoft.Windows.Console.ConPTY.*.nupkg
 /conpty/
 /inno/
+
+.local*

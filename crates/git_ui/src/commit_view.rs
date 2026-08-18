@@ -373,6 +373,7 @@ impl CommitView {
                                 &snapshot,
                                 snapshot.language().cloned(),
                                 Some(language_registry.clone()),
+                                buffer_diff::DiffBaseKind::Oid,
                                 cx,
                             )
                         })
@@ -980,9 +981,9 @@ async fn build_buffer(
     let text = Rope::from(text);
     let language =
         cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
-    let language = if let Some(language) = language {
+    let language = if let Some(language_id) = language {
         language_registry
-            .load_language(&language)
+            .load_language(language_id)
             .await
             .ok()
             .and_then(|e| e.log_err())
@@ -1016,8 +1017,15 @@ async fn build_buffer_diff(
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
 
-    let diff =
-        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
+    let diff = cx.new(|cx| {
+        BufferDiff::new(
+            &buffer.text,
+            language,
+            Some(language_registry.clone()),
+            buffer_diff::DiffBaseKind::Oid,
+            cx,
+        )
+    });
 
     diff.update(cx, |diff, cx| {
         diff.set_base_text(
@@ -1354,7 +1362,7 @@ impl Render for CommitViewToolbar {
                         }),
                 )
                 .children(remote_info.map(|(provider_name, url)| {
-                    let icon = crate::get_provider_icon(provider_name.as_str());
+                    let icon = ui::git_hosting_provider_icon(provider_name.as_str());
 
                     IconButton::new("view_on_provider", icon)
                         .icon_size(IconSize::Small)

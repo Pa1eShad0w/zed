@@ -18,9 +18,9 @@
 use crate::blame::{Blame, BlameEntry};
 use crate::repository::{
     AskPassDelegate, BranchesScanResult, CommitData, CommitDataReader, CommitDetails, CommitDiff,
-    CommitFile, CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, GitCommitTemplate,
-    GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-    PushOptions, RemoteCommandOutput, RepoPath, ResetMode,
+    CommitFile, CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+    GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+    LogSource, PushOptions, RemoteCommandOutput, RepoPath, ResetMode,
 };
 use crate::{Oid, RunHook};
 use crate::stash::GitStash;
@@ -353,7 +353,7 @@ fn action_to_status(action: &str) -> Option<FileStatus> {
 fn client_path_to_repo_path(client_name: &str, client_file: &str) -> Option<RepoPath> {
     let prefix = format!("//{client_name}/");
     let rel = client_file.strip_prefix(&prefix)?;
-    let rel_path = RelPath::unix(rel).ok()?;
+    let rel_path = RelPath::from_unix_str(rel).ok()?;
     Some(RepoPath::from_rel_path(&rel_path))
 }
 
@@ -372,7 +372,7 @@ fn local_path_to_repo_path(working_directory: &Path, client_file: &str) -> Optio
     if rel.is_empty() {
         return None;
     }
-    let rel_path = RelPath::unix(rel).ok()?;
+    let rel_path = RelPath::from_unix_str(rel).ok()?;
     Some(RepoPath::from_rel_path(&rel_path))
 }
 
@@ -1030,7 +1030,12 @@ fn build_p4_blame_mapped(
             revision_label: Some(format!("@{change}")),
         });
     }
-    Blame { entries, messages }
+    Blame {
+        entries,
+        messages,
+        // Perforce has no tags; blame tooltips just show no tag chips.
+        tag_names: HashMap::default(),
+    }
 }
 
 /// Remap a depot annotation onto the local buffer content so each *buffer* line carries the
@@ -1634,7 +1639,7 @@ impl GitRepository for PerforceRepository {
             .iter()
             .map(|spec| {
                 let rel = spec.strip_prefix("HEAD:")?;
-                let rel_path = RelPath::unix(rel).ok()?;
+                let rel_path = RelPath::from_unix_str(rel).ok()?;
                 Some(format!(
                     "{}#have",
                     self.client_syntax_path(&RepoPath::from_rel_path(&rel_path))
@@ -2109,6 +2114,7 @@ impl GitRepository for PerforceRepository {
 
     fn diff_stat(
         &self,
+        _diff: DiffStatType,
         _path_prefixes: &[RepoPath],
     ) -> BoxFuture<'static, Result<crate::status::GitDiffStat>> {
         async { Ok(crate::status::GitDiffStat::default()) }.boxed()
@@ -2989,7 +2995,7 @@ line two
     // ---- Phase 2: auto-checkout p4 command construction ----
 
     fn repo_path(unix: &str) -> RepoPath {
-        RepoPath::from_rel_path(RelPath::unix(unix).unwrap())
+        RepoPath::from_rel_path(RelPath::from_unix_str(unix).unwrap())
     }
 
     #[test]

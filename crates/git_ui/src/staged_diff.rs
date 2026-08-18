@@ -198,11 +198,19 @@ impl StagedDiff {
 
         if let Some(entry) = entry {
             staged_diff.update(cx, |staged_diff, cx| {
-                staged_diff
-                    .diff
-                    .update(cx, |diff, cx| diff.move_to_entry(entry, window, cx));
+                staged_diff.move_to_entry(entry, window, cx);
             });
         }
+    }
+
+    pub(crate) fn move_to_entry(
+        &mut self,
+        entry: GitStatusEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_entry(entry, window, cx));
     }
 
     pub(crate) fn new(
@@ -211,8 +219,8 @@ impl StagedDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch_diff =
-            cx.new(|cx| DiffBufferList::new(DiffBase::Staged, project.clone(), window, cx));
+        let git_store = project.read(cx).git_store().clone();
+        let branch_diff = cx.new(|cx| DiffBufferList::new(DiffBase::Staged, git_store, None, cx));
         let workspace_handle = workspace.downgrade();
         let diff = cx.new(|cx| {
             DiffMultibuffer::new(
