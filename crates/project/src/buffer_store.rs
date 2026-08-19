@@ -1,8 +1,8 @@
 use crate::{
     ProjectPath,
-    git_store::GitStore,
+    git_store::{GitStore, Repository},
     lsp_store::OpenLspBufferHandle,
-    project_settings::ProjectSettings,
+    project_settings::{PerforceSettings, ProjectSettings},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -85,6 +85,12 @@ struct LocalBufferStore {
     /// `BufferStore`, so this is the symmetric weak link). Used only by the Perforce
     /// auto-checkout pre-save hook; `None` until set.
     git_store: Option<WeakEntity<GitStore>>,
+    /// Buffers that opened locked because they are read-only on disk and the Perforce answer
+    /// was not available synchronously. Each is re-decided in the background by
+    /// [`BufferStore::resolve_perforce_lock`]; entries that outlive that (no repository exists
+    /// for the path yet) are retried when one is discovered. Only ever holds buffers this store
+    /// locked itself.
+    perforce_locked_buffers: HashMap<BufferId, ProjectPath>,
 }
 
 enum OpenBuffer {
@@ -100,6 +106,51 @@ pub enum BufferStoreEvent {
         buffer: Entity<Buffer>,
         old_file: Option<Arc<dyn language::File>>,
     },
+}
+
+/// Whether a file that is read-only on disk is covered by Perforce auto-checkout.
+///
+/// Perforce keeps every file that is not open for edit read-only on disk. That is a checkout
+/// state, not an edit permission: the first modification or save runs `p4 edit`, which clears
+/// the read-only bit. Opening such a buffer locked would deadlock that workflow — the editor
+/// refuses keystrokes, so the checkout that would unlock the file can never be triggered, and
+/// the user has to click the tab's lock icon before they can type at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerforceCheckoutVerdict {
+    /// The path resolves to a Perforce repository and auto-checkout on save is enabled.
+    AutoCheckout,
+    /// The path is not covered: a git or non-VCS repository, or a Perforce workspace with
+    /// auto-checkout turned off — where a read-only file really is not meant to be edited.
+    NotApplicable,
+    /// The answer is not available yet: no repository is known for the path, or its backend has
+    /// not resolved. The buffer opens locked, as upstream would, and is re-decided in the
+    /// background.
+    Unknown,
+}
+
+/// Capability for a freshly loaded file.
+///
+/// Upstream opens any file that is read-only on disk in [`Capability::Read`], which puts a lock
+/// icon on the tab and blocks editing. [`PerforceCheckoutVerdict::AutoCheckout`] is the one case
+/// where the read-only bit does not mean that.
+pub fn capability_for_loaded_file(
+    is_writable: bool,
+    perforce: PerforceCheckoutVerdict,
+) -> Capability {
+    if is_writable || perforce == PerforceCheckoutVerdict::AutoCheckout {
+        Capability::ReadWrite
+    } else {
+        Capability::Read
+    }
+}
+
+/// Whether saving a Perforce-tracked file will open it for edit on the user's behalf.
+///
+/// This is the pre-save hook specifically: it is what guarantees a save of a read-only synced
+/// file succeeds. `edit_on_file_modified` only makes the checkout happen earlier, so it does not
+/// affect whether the read-only bit is safe to ignore.
+pub fn perforce_auto_checkout_enabled(settings: &PerforceSettings) -> bool {
+    settings.enabled && settings.edit_on_file_save
 }
 
 #[derive(Default, Debug, Clone)]
@@ -768,15 +819,26 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
         let load_file = worktree.update(cx, |worktree, cx| worktree.load_file(path.as_ref(), cx));
+        let worktree_id = worktree.read(cx).id();
         cx.spawn(async move |this, cx| {
             let path = path.clone();
+            // Set when the file is read-only on disk and the Perforce answer was not available
+            // synchronously, so the buffer opened locked and needs re-deciding in the background.
+            let mut perforce_lock_unresolved = false;
             let buffer = match load_file.await {
                 Ok(loaded) => {
-                    let is_writable = loaded.is_writable;
-                    let capability = if is_writable {
+                    let capability = if loaded.is_writable {
                         Capability::ReadWrite
                     } else {
-                        Capability::Read
+                        let project_path = ProjectPath {
+                            worktree_id,
+                            path: path.clone(),
+                        };
+                        let verdict = this.update(cx, |this, cx| {
+                            this.perforce_checkout_peek(&project_path, cx)
+                        })?;
+                        perforce_lock_unresolved = verdict == PerforceCheckoutVerdict::Unknown;
+                        capability_for_loaded_file(false, verdict)
                     };
                     let reservation = cx.reserve_entity::<Buffer>();
                     let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
@@ -833,6 +895,10 @@ impl LocalBufferStore {
                         buffer.update(cx, |buffer, cx| {
                             buffer.set_capability(Capability::Read, cx);
                         });
+                    } else if perforce_lock_unresolved {
+                        // A configured read-only path stays locked whatever Perforce says, so
+                        // only a buffer locked purely by its on-disk permission is re-decided.
+                        this.resolve_perforce_lock(buffer_id, project_path.clone(), cx);
                     }
 
                     this.path_to_buffer_id.insert(project_path, buffer_id);
@@ -922,6 +988,7 @@ impl BufferStore {
                     }
                 }),
                 git_store: None,
+                perforce_locked_buffers: Default::default(),
             }),
             downstream_client: None,
             opened_buffers: Default::default(),
@@ -968,6 +1035,124 @@ impl BufferStore {
     pub fn set_git_store_weak(&mut self, git_store: WeakEntity<GitStore>) {
         if let Some(local) = self.as_local_mut() {
             local.git_store = Some(git_store);
+        }
+    }
+
+    fn repository_for_path(&self, path: &ProjectPath, cx: &App) -> Option<Entity<Repository>> {
+        let git_store = self
+            .as_local()?
+            .git_store
+            .as_ref()
+            .and_then(|git_store| git_store.upgrade())?;
+        let (repository, _) = git_store
+            .read(cx)
+            .repository_and_path_for_project_path(path, cx)?;
+        Some(repository)
+    }
+
+    /// Best-effort synchronous answer for a file that is read-only on disk.
+    ///
+    /// Deliberately a peek rather than an await: resolving a repository's backend runs `p4 info`,
+    /// and making a file open wait on that would mean a user whose Perforce server is unreachable
+    /// could no longer open files at all. A miss here only costs a moment of the tab being locked
+    /// — [`Self::resolve_perforce_lock`] settles it in the background.
+    fn perforce_checkout_peek(&self, path: &ProjectPath, cx: &App) -> PerforceCheckoutVerdict {
+        if !perforce_auto_checkout_enabled(&ProjectSettings::get_global(cx).perforce) {
+            return PerforceCheckoutVerdict::NotApplicable;
+        }
+        match self.repository_for_path(path, cx) {
+            Some(repository) if repository.read(cx).is_perforce() => {
+                PerforceCheckoutVerdict::AutoCheckout
+            }
+            // `is_perforce` reads `false` both for git and for a Perforce repository whose backend
+            // has not resolved yet, so a negative peek is not an answer.
+            _ => PerforceCheckoutVerdict::Unknown,
+        }
+    }
+
+    fn forget_perforce_locked_buffer(&mut self, buffer_id: BufferId) {
+        if let Some(local) = self.as_local_mut() {
+            local.perforce_locked_buffers.remove(&buffer_id);
+        }
+    }
+
+    /// Settle whether a buffer that opened locked on its on-disk permission is actually covered
+    /// by Perforce auto-checkout, and unlock it if so.
+    ///
+    /// Runs in the background so nothing about opening a file depends on Perforce being
+    /// reachable. The buffer is only unlocked while it is still [`Capability::Read`], so a tab
+    /// the user unlocked and re-locked by hand is left alone. A verdict of
+    /// [`PerforceCheckoutVerdict::Unknown`] means no repository exists for the path yet; the
+    /// buffer stays recorded and [`Self::refresh_perforce_locked_buffers`] retries it when
+    /// repository discovery reports one.
+    fn resolve_perforce_lock(
+        &mut self,
+        buffer_id: BufferId,
+        project_path: ProjectPath,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        local
+            .perforce_locked_buffers
+            .insert(buffer_id, project_path.clone());
+
+        if !perforce_auto_checkout_enabled(&ProjectSettings::get_global(cx).perforce) {
+            self.forget_perforce_locked_buffer(buffer_id);
+            return;
+        }
+        let Some(repository) = self.repository_for_path(&project_path, cx) else {
+            return;
+        };
+        let is_perforce = repository.read(cx).is_perforce_resolved(cx);
+        cx.spawn(async move |this, cx| {
+            let is_perforce = is_perforce.await;
+            this.update(cx, |this, cx| {
+                this.forget_perforce_locked_buffer(buffer_id);
+                if is_perforce
+                    && let Some(buffer) = this.get(buffer_id)
+                    && buffer.read(cx).capability() == Capability::Read
+                {
+                    buffer
+                        .update(cx, |buffer, cx| buffer.set_capability(Capability::ReadWrite, cx));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Retry the buffers that opened locked before any repository was known for their path.
+    ///
+    /// Called by the `GitStore` when a repository is added: session restore opens buffers while
+    /// repository discovery is still running, so a Perforce file can load before Zed knows its
+    /// workspace is Perforce-backed and would otherwise stay locked for the rest of the session.
+    pub fn refresh_perforce_locked_buffers(&mut self, cx: &mut Context<Self>) {
+        let Some(local) = self.as_local() else {
+            return;
+        };
+        let pending = local
+            .perforce_locked_buffers
+            .iter()
+            .map(|(buffer_id, path)| (*buffer_id, path.clone()))
+            .collect::<Vec<_>>();
+
+        for (buffer_id, project_path) in pending {
+            match self.get(buffer_id) {
+                // Dropped, or the user unlocked the tab themselves: nothing left to decide.
+                Some(buffer) if buffer.read(cx).capability() == Capability::Read => {
+                    self.resolve_perforce_lock(buffer_id, project_path, cx)
+                }
+                _ => self.forget_perforce_locked_buffer(buffer_id),
+            }
+        }
+    }
+
+    fn as_local(&self) -> Option<&LocalBufferStore> {
+        match &self.state {
+            BufferStoreState::Local(state) => Some(state),
+            _ => None,
         }
     }
 
@@ -1113,9 +1298,11 @@ impl BufferStore {
         let handle = cx.entity().downgrade();
         buffer_entity.update(cx, move |_, cx| {
             cx.on_release(move |buffer, cx| {
+                let buffer_id = buffer.remote_id();
                 handle
-                    .update(cx, |_, cx| {
-                        cx.emit(BufferStoreEvent::BufferDropped(buffer.remote_id()))
+                    .update(cx, |this, cx| {
+                        this.forget_perforce_locked_buffer(buffer_id);
+                        cx.emit(BufferStoreEvent::BufferDropped(buffer_id))
                     })
                     .ok();
             })
@@ -1970,3 +2157,4 @@ fn apply_initial_line_ending(buffer: &mut Buffer, cx: &mut Context<Buffer>) {
         buffer.set_line_ending(desired, cx);
     }
 }
+
