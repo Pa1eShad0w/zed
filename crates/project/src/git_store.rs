@@ -2490,6 +2490,13 @@ impl GitStore {
                 self.repositories.insert(id, repo);
                 self.worktree_ids.insert(id, HashSet::from([worktree_id]));
                 cx.emit(GitStoreEvent::RepositoryAdded);
+                // Buffers restored at startup can finish loading before this repository exists.
+                // A Perforce file is read-only on disk until it is opened for edit, so those
+                // buffers opened locked without ever getting to ask whether Perforce would check
+                // them out on save; now that a repository is known, let them ask.
+                self.buffer_store.update(cx, |buffer_store, cx| {
+                    buffer_store.refresh_perforce_locked_buffers(cx);
+                });
                 self.refresh_diff_base_for_repo(id, cx);
                 self.active_repo_id.get_or_insert_with(|| {
                     cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
