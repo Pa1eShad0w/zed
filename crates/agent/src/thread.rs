@@ -20,6 +20,7 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
     AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
     SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
+    with_summary_language,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -3828,9 +3829,14 @@ impl Thread {
 
         self.extend_request_history_until(&mut request.messages, self.messages.len());
 
+        let language = AgentSettings::get_global(cx)
+            .thread_summary_language
+            .clone();
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
-            content: vec![SUMMARIZE_THREAD_DETAILED_PROMPT.into()],
+            content: vec![
+                with_summary_language(SUMMARIZE_THREAD_DETAILED_PROMPT, language.as_deref()).into(),
+            ],
             cache: false,
             reasoning_details: None,
         });
@@ -3909,7 +3915,14 @@ impl Thread {
         log::debug!("Generating title with model: {:?}", model.name());
 
         let temperature = AgentSettings::temperature_for_model(&model, cx);
-        let request = build_thread_title_request(&self.messages, temperature);
+        let language = AgentSettings::get_global(cx)
+            .thread_summary_language
+            .clone();
+        let request = build_thread_title_request_with_language(
+            &self.messages,
+            temperature,
+            language.as_deref(),
+        );
 
         let title_generation = cx.spawn(async move |_this, cx| {
             stream_thread_title(model, request, cx)
@@ -4898,6 +4911,21 @@ pub fn build_thread_title_request(
         cache: false,
         reasoning_details: None,
     });
+    request
+}
+
+/// Like [`build_thread_title_request`], but appends the user's preferred
+/// summary language (`thread_summary_language` setting) to the prompt when
+/// one is configured.
+pub fn build_thread_title_request_with_language(
+    messages: &[Arc<Message>],
+    temperature: Option<f32>,
+    language: Option<&str>,
+) -> LanguageModelRequest {
+    let mut request = build_thread_title_request(messages, temperature);
+    if let Some(prompt) = request.messages.last_mut() {
+        prompt.content = vec![with_summary_language(SUMMARIZE_THREAD_PROMPT, language).into()];
+    }
     request
 }
 
@@ -6998,6 +7026,41 @@ mod tests {
                 "after assistant".to_string(),
                 SUMMARIZE_THREAD_PROMPT.to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_thread_title_request_with_language_preference() {
+        let messages = vec![
+            user_text_message(ClientUserMessageId::new(), "user"),
+            agent_text_message("assistant"),
+        ];
+
+        // No preference: the prompt is passed through unchanged.
+        let request = build_thread_title_request_with_language(&messages, None, None);
+        assert_eq!(
+            request.messages.last().unwrap().string_contents(),
+            SUMMARIZE_THREAD_PROMPT
+        );
+
+        // Blank preference behaves like no preference.
+        let request = build_thread_title_request_with_language(&messages, None, Some("  "));
+        assert_eq!(
+            request.messages.last().unwrap().string_contents(),
+            SUMMARIZE_THREAD_PROMPT
+        );
+
+        // A configured language is appended as an instruction.
+        let request =
+            build_thread_title_request_with_language(&messages, None, Some("Simplified Chinese"));
+        let prompt = request.messages.last().unwrap().string_contents();
+        assert!(
+            prompt.starts_with(SUMMARIZE_THREAD_PROMPT.trim_end()),
+            "prompt should keep the base instructions, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Simplified Chinese"),
+            "prompt should contain the language preference, got: {prompt}"
         );
     }
 

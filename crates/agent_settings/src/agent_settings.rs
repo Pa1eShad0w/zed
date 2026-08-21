@@ -31,6 +31,19 @@ pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
 
+/// Appends the user's preferred output language (`thread_summary_language`)
+/// to a summarization prompt. Returns the prompt unchanged when no language
+/// is configured, so the model follows the conversation language.
+pub fn with_summary_language(prompt: &str, language: Option<&str>) -> String {
+    let Some(language) = language
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+    else {
+        return prompt.to_string();
+    };
+    format!("{}\nWrite the response in {language}.", prompt.trim_end())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelLayout {
     pub(crate) agent_dock: Option<DockPosition>,
@@ -219,6 +232,7 @@ pub struct AgentSettings {
     pub commit_message_include_project_rules: bool,
     pub commit_message_instructions: Option<String>,
     pub thread_summary_model: Option<LanguageModelSelection>,
+    pub thread_summary_language: Option<String>,
     pub compaction_model: Option<LanguageModelSelection>,
     pub inline_alternatives: Vec<LanguageModelSelection>,
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -779,6 +793,7 @@ impl Settings for AgentSettings {
             commit_message_model: agent.commit_message_model,
             commit_message_instructions: agent.commit_message_instructions,
             thread_summary_model: agent.thread_summary_model,
+            thread_summary_language: agent.thread_summary_language,
             compaction_model: agent.compaction_model,
             inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
             favorite_models: agent.favorite_models,

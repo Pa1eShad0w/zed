@@ -5,20 +5,25 @@ mod terminal;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp};
+use agent_settings::{SUMMARIZE_THREAD_PROMPT, with_summary_language};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
 pub use connection::*;
 pub use diff::*;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
-use futures::{FutureExt, channel::oneshot, future::BoxFuture};
+use futures::{FutureExt, StreamExt, channel::oneshot, future::BoxFuture};
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task, TaskExt,
     WeakEntity,
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
 use language::{
     Anchor, Buffer, BufferEditSource, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
+};
+use language_model::{
+    CompletionIntent, LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
+    LanguageModelRequestMessage, Role,
 };
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
@@ -64,6 +69,35 @@ impl std::error::Error for MaxOutputTokensError {}
 /// Key used in ACP ToolCall meta to store the tool's programmatic name.
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
+
+/// Maximum number of characters included from the first user and assistant
+/// messages when building a client-side title generation request.
+const TITLE_GENERATION_EXCERPT_MAX_CHARS: usize = 4000;
+
+/// Streams a title generation request, keeping only the first line of output.
+async fn stream_title_generation(
+    model: Arc<dyn LanguageModel>,
+    request: LanguageModelRequest,
+    cx: &AsyncApp,
+) -> Result<String> {
+    let mut title = String::new();
+    let mut events = model.stream_completion(request, cx).await?;
+    while let Some(event) = events.next().await {
+        let LanguageModelCompletionEvent::Text(text) = event? else {
+            continue;
+        };
+        if let Some(newline_ix) = text.find(|ch| ch == '\n' || ch == '\r') {
+            title.push_str(&text[..newline_ix]);
+            break;
+        }
+        title.push_str(&text);
+    }
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(anyhow!("model returned an empty thread title"));
+    }
+    Ok(title)
+}
 
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
@@ -2092,6 +2126,9 @@ pub struct AcpThread {
     parent_session_id: Option<acp::SessionId>,
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
+    /// In-flight client-side title generation, started when the agent never
+    /// provided a title of its own. Kept so generation isn't started twice.
+    pending_title_generation: Option<Task<()>>,
     entries: Vec<AgentThreadEntry>,
     elicitations: ElicitationStore,
     plan: Plan,
@@ -2311,6 +2348,7 @@ impl AcpThread {
             plan: Default::default(),
             title,
             provisional_title: None,
+            pending_title_generation: None,
             project,
             running_turn: None,
             turn_id: 0,
@@ -3094,6 +3132,123 @@ impl AcpThread {
     pub fn set_provisional_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
         self.provisional_title = Some(title);
         cx.emit(AcpThreadEvent::TitleUpdated);
+    }
+
+    /// Whether a client-side title generation can be started: the agent has
+    /// not provided a title and no generation is currently in flight.
+    pub fn can_generate_title(&self) -> bool {
+        self.title.is_none() && self.pending_title_generation.is_none()
+    }
+
+    /// Generates a conversation title client-side from the first turn.
+    ///
+    /// Session titles are the agent's responsibility (pushed via
+    /// `session/update` info notifications), but many external agents never
+    /// provide one, leaving the thread stuck with the provisional
+    /// first-message excerpt. This falls back to summarizing the first turn
+    /// with the given model. A title provided by the agent — before or after
+    /// generation — always wins, as does a manual rename.
+    pub fn generate_title(
+        &mut self,
+        model: Arc<dyn LanguageModel>,
+        language: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_generate_title() {
+            return;
+        }
+        let Some(excerpt) = self.title_generation_excerpt(cx) else {
+            return;
+        };
+
+        let request = LanguageModelRequest {
+            intent: Some(CompletionIntent::ThreadSummarization),
+            messages: vec![
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![excerpt.into()],
+                    cache: false,
+                    reasoning_details: None,
+                },
+                LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![with_summary_language(SUMMARIZE_THREAD_PROMPT, language).into()],
+                    cache: false,
+                    reasoning_details: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        log::debug!("Generating thread title with model: {:?}", model.name());
+        self.pending_title_generation = Some(cx.spawn(async move |this, cx| {
+            let title = stream_title_generation(model, request, cx).await;
+            this.update(cx, |this, cx| {
+                this.pending_title_generation = None;
+                match title {
+                    Ok(title) => {
+                        // A real title may have arrived from the agent (or via
+                        // a manual rename) while generation was in flight;
+                        // never clobber it.
+                        if this.title.is_none() {
+                            this.set_title(title.into(), cx).detach_and_log_err(cx);
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("failed to generate thread title: {error:#}");
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Builds the conversation excerpt sent to the model for client-side
+    /// title generation: the first user message plus the first assistant
+    /// reply, each capped at [`TITLE_GENERATION_EXCERPT_MAX_CHARS`].
+    fn title_generation_excerpt(&self, cx: &App) -> Option<String> {
+        let first_user_message = self.entries.iter().find_map(|entry| match entry {
+            AgentThreadEntry::UserMessage(message) => {
+                Some(message.content.to_markdown(cx).trim().to_string())
+            }
+            _ => None,
+        })?;
+        if first_user_message.is_empty() {
+            return None;
+        }
+
+        let mut excerpt = format!(
+            "## User\n\n{}\n\n",
+            util::truncate_and_trailoff(&first_user_message, TITLE_GENERATION_EXCERPT_MAX_CHARS)
+        );
+
+        let first_assistant_message = self.entries.iter().find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => Some(
+                message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .join("\n"),
+            ),
+            _ => None,
+        });
+        if let Some(first_assistant_message) = first_assistant_message {
+            let first_assistant_message = first_assistant_message.trim();
+            if !first_assistant_message.is_empty() {
+                excerpt.push_str(&format!(
+                    "## Assistant\n\n{}\n\n",
+                    util::truncate_and_trailoff(
+                        first_assistant_message,
+                        TITLE_GENERATION_EXCERPT_MAX_CHARS
+                    )
+                ));
+            }
+        }
+
+        Some(excerpt)
     }
 
     pub fn subagent_spawned(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
@@ -4767,11 +4922,12 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use feature_flags::FeatureFlag as _;
-    use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
     use gpui::UpdateGlobal as _;
     use gpui::{App, AsyncApp, TestAppContext, WeakEntity};
     use indoc::indoc;
+    use language_model::LanguageModelCompletionError;
+    use language_model::fake_provider::FakeLanguageModel;
     use project::{AgentId, FakeFs, Fs, RemoveOptions};
     use rand::{distr, prelude::*};
     use serde_json::json;
@@ -9900,6 +10056,256 @@ mod tests {
             connection.set_title_calls.borrow().is_empty(),
             "session info title update should not propagate back to the connection"
         );
+    }
+
+    /// Creates a thread whose first turn has completed: the user asked about
+    /// Rust lifetimes and the fake agent replied with `agent_reply`.
+    async fn init_thread_with_first_turn(
+        cx: &mut TestAppContext,
+        agent_reply: &'static str,
+    ) -> (Rc<FakeAgentConnection>, Entity<AcpThread>) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_, thread, mut cx| {
+                async move {
+                    thread.update(&mut cx, |thread, cx| {
+                        thread
+                            .handle_session_update(
+                                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                    agent_reply.into(),
+                                )),
+                                cx,
+                            )
+                            .unwrap();
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread
+            .update(cx, |thread, cx| {
+                thread.send_raw("How do lifetimes work in Rust?", cx)
+            })
+            .await
+            .unwrap();
+        (connection, thread)
+    }
+
+    #[gpui::test]
+    async fn test_generated_title_replaces_provisional_title(cx: &mut TestAppContext) {
+        let (connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+        let set_title_calls = connection.set_title_calls.clone();
+
+        thread.update(cx, |thread, cx| {
+            thread.set_provisional_title("How do lifetimes work i…".into(), cx);
+        });
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            model.completion_count(),
+            1,
+            "title generation should issue exactly one completion request"
+        );
+
+        model.send_last_completion_stream_text_chunk("Rust lifetimes explained\nignored line");
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.title().as_deref(), Some("Rust lifetimes explained"));
+            assert!(
+                !thread.has_provisional_title(),
+                "generated title should clear the provisional title"
+            );
+        });
+        assert_eq!(
+            set_title_calls.borrow().as_slice(),
+            &[SharedString::from("Rust lifetimes explained")],
+            "generated title should propagate to agents that support set_title"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_generate_title_request_contains_first_turn_and_language(cx: &mut TestAppContext) {
+        let (_connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), Some("Simplified Chinese"), cx);
+        });
+        cx.run_until_parked();
+
+        let requests = model.pending_completions();
+        assert_eq!(requests.len(), 1);
+        let messages = &requests[0].messages;
+        let excerpt = messages[0].string_contents();
+        assert!(
+            excerpt.contains("How do lifetimes work in Rust?"),
+            "excerpt should contain the first user message, got: {excerpt}"
+        );
+        assert!(
+            excerpt.contains("Let me explain lifetimes."),
+            "excerpt should contain the first assistant reply, got: {excerpt}"
+        );
+        let prompt = messages.last().unwrap().string_contents();
+        assert!(
+            prompt.contains("Simplified Chinese"),
+            "prompt should contain the language preference, got: {prompt}"
+        );
+
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_generate_title_skipped_without_user_message(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            model.completion_count(),
+            0,
+            "no title request should be issued for a thread without a user message"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_generate_title_skipped_when_agent_provided_title(cx: &mut TestAppContext) {
+        let (_connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+
+        let task = thread.update(cx, |thread, cx| {
+            thread.set_title("Agent provided title".into(), cx)
+        });
+        task.await.expect("set_title should succeed");
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            model.completion_count(),
+            0,
+            "no title request should be issued when the agent already provided a title"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_generate_title_does_not_clobber_agent_title_arriving_mid_generation(
+        cx: &mut TestAppContext,
+    ) {
+        let (connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+        let set_title_calls = connection.set_title_calls.clone();
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(model.completion_count(), 1);
+
+        // While the client-side generation is in flight, the agent provides a
+        // real title of its own.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::SessionInfoUpdate(
+                        acp::SessionInfoUpdate::new().title("Agent title"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        model.send_last_completion_stream_text_chunk("Client title");
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.title().as_deref(),
+                Some("Agent title"),
+                "a title from the agent must win over a late client-side generation"
+            );
+        });
+        assert!(
+            !set_title_calls
+                .borrow()
+                .contains(&SharedString::from("Client title")),
+            "the discarded generated title must not propagate to the connection"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_generate_title_failure_allows_retry(cx: &mut TestAppContext) {
+        let (_connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        model.send_last_completion_stream_error(LanguageModelCompletionError::PromptTooLarge {
+            tokens: None,
+        });
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.title(), None, "failed generation leaves no title");
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            model.completion_count(),
+            1,
+            "a failed title generation should be retryable"
+        );
+        model.send_last_completion_stream_text_chunk("Recovered title");
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.title().as_deref(), Some("Recovered title"));
+        });
     }
 
     #[gpui::test]

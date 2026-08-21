@@ -34,7 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::LanguageModelCompletionError;
+use language_model::{LanguageModelCompletionError, LanguageModelRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -552,6 +552,23 @@ fn resolve_outcome_from_selection(
         .unwrap_or_else(|| choices.len().saturating_sub(1));
     let selected_choice = choices.get(selected_index).or(choices.last())?;
     Some(selected_choice.build_outcome(is_allow))
+}
+
+/// Generates a title client-side for threads whose agent never provided one,
+/// using the configured thread summary model and language preference.
+fn maybe_generate_thread_title(thread: &Entity<AcpThread>, cx: &mut App) {
+    let Some(model) = LanguageModelRegistry::read_global(cx)
+        .thread_summary_model(cx)
+        .map(|configured| configured.model)
+    else {
+        return;
+    };
+    let language = AgentSettings::get_global(cx)
+        .thread_summary_language
+        .clone();
+    thread.update(cx, |thread, cx| {
+        thread.generate_title(model, language.as_deref(), cx);
+    });
 }
 
 fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
@@ -1677,6 +1694,13 @@ impl ConversationView {
                         });
                     }
                     return;
+                }
+
+                // Session titles are the agent's responsibility, but many
+                // external agents never provide one; fall back to a
+                // client-side summary of the first turn.
+                if *stop_reason == acp::StopReason::EndTurn {
+                    maybe_generate_thread_title(&thread, cx);
                 }
 
                 let sent_queued_message = if let Some(active) = self.root_thread_view() {

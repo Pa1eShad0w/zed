@@ -261,6 +261,9 @@ pub struct AgentSettingsContent {
     pub commit_message_instructions: Option<String>,
     /// Model to use for generating thread summaries. Defaults to default_model when not specified.
     pub thread_summary_model: Option<LanguageModelSelection>,
+    /// Language to use for AI-generated thread titles and summaries (e.g. "English" or "中文").
+    /// When not set, the model chooses, usually following the conversation language.
+    pub thread_summary_language: Option<String>,
     /// Model to use for context compaction (`/compact` and auto-compaction).
     /// Falls back to the thread's currently selected model when not specified.
     /// If the configured model is unavailable (provider not registered, model
