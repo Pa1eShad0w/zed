@@ -1083,8 +1083,8 @@ impl BufferStore {
     /// reachable. The buffer is only unlocked while it is still [`Capability::Read`], so a tab
     /// the user unlocked and re-locked by hand is left alone. A verdict of
     /// [`PerforceCheckoutVerdict::Unknown`] means no repository exists for the path yet; the
-    /// buffer stays recorded and [`Self::refresh_perforce_locked_buffers`] retries it when
-    /// repository discovery reports one.
+    /// buffer stays recorded and [`Self::settle_perforce_locks`] retries it when repository
+    /// discovery reports one.
     fn resolve_perforce_lock(
         &mut self,
         buffer_id: BufferId,
@@ -1102,9 +1102,27 @@ impl BufferStore {
             self.forget_perforce_locked_buffer(buffer_id);
             return;
         }
+        // Safe to look the repository up here: this runs from `open_buffer`, not from inside a
+        // `GitStore` update. The discovery path must push the repository in instead; see
+        // [`Self::settle_perforce_locks`].
         let Some(repository) = self.repository_for_path(&project_path, cx) else {
             return;
         };
+        self.unlock_buffer_if_perforce(buffer_id, repository, cx);
+    }
+
+    /// Ask an already-located repository whether it would check this buffer out on save, and
+    /// unlock the buffer if so.
+    ///
+    /// Runs in the background so nothing about opening a file depends on Perforce being
+    /// reachable. The buffer is only unlocked while it is still [`Capability::Read`], so a tab
+    /// the user unlocked and re-locked by hand is left alone.
+    fn unlock_buffer_if_perforce(
+        &mut self,
+        buffer_id: BufferId,
+        repository: Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) {
         let is_perforce = repository.read(cx).is_perforce_resolved(cx);
         cx.spawn(async move |this, cx| {
             let is_perforce = is_perforce.await;
@@ -1123,30 +1141,58 @@ impl BufferStore {
         .detach();
     }
 
-    /// Retry the buffers that opened locked before any repository was known for their path.
+    /// Settle the buffers that opened locked before any repository was known for their path.
     ///
-    /// Called by the `GitStore` when a repository is added: session restore opens buffers while
-    /// repository discovery is still running, so a Perforce file can load before Zed knows its
-    /// workspace is Perforce-backed and would otherwise stay locked for the rest of the session.
-    pub fn refresh_perforce_locked_buffers(&mut self, cx: &mut Context<Self>) {
-        let Some(local) = self.as_local() else {
-            return;
-        };
-        let pending = local
-            .perforce_locked_buffers
-            .iter()
-            .map(|(buffer_id, path)| (*buffer_id, path.clone()))
-            .collect::<Vec<_>>();
-
-        for (buffer_id, project_path) in pending {
+    /// Called by the `GitStore` when it discovers a repository: session restore opens buffers
+    /// while repository discovery is still running, so a Perforce file can load before Zed knows
+    /// its workspace is Perforce-backed and would otherwise stay locked for the rest of the
+    /// session.
+    ///
+    /// The caller resolves each buffer's repository and pushes the answer in; this must not look
+    /// it up itself. Discovery reports from inside `GitStore::update`, which leases the git store
+    /// out of the entity map, so reading it back here aborts the process — on Windows the panic
+    /// cannot unwind out of the platform window procedure. Pass `None` for a buffer that still
+    /// has no repository: it stays parked for the next discovery round.
+    pub fn settle_perforce_locks(
+        &mut self,
+        resolved: Vec<(BufferId, Option<Entity<Repository>>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let auto_checkout_enabled =
+            perforce_auto_checkout_enabled(&ProjectSettings::get_global(cx).perforce);
+        for (buffer_id, repository) in resolved {
             match self.get(buffer_id) {
                 // Dropped, or the user unlocked the tab themselves: nothing left to decide.
                 Some(buffer) if buffer.read(cx).capability() == Capability::Read => {
-                    self.resolve_perforce_lock(buffer_id, project_path, cx)
+                    if !auto_checkout_enabled {
+                        self.forget_perforce_locked_buffer(buffer_id);
+                        continue;
+                    }
+                    let Some(repository) = repository else {
+                        continue;
+                    };
+                    self.unlock_buffer_if_perforce(buffer_id, repository, cx);
                 }
                 _ => self.forget_perforce_locked_buffer(buffer_id),
             }
         }
+    }
+
+    /// Buffers that opened locked purely on their on-disk read-only bit and are still waiting
+    /// for repository discovery to say whether Perforce would check them out on save.
+    ///
+    /// The `GitStore` resolves these on the buffer store's behalf; see
+    /// [`Self::settle_perforce_locks`] for why the lookup cannot happen here.
+    pub fn perforce_parked_buffers(&self) -> Vec<(BufferId, ProjectPath)> {
+        self.as_local()
+            .map(|local| {
+                local
+                    .perforce_locked_buffers
+                    .iter()
+                    .map(|(buffer_id, path)| (*buffer_id, path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn as_local(&self) -> Option<&LocalBufferStore> {
