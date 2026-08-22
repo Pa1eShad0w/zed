@@ -2490,13 +2490,7 @@ impl GitStore {
                 self.repositories.insert(id, repo);
                 self.worktree_ids.insert(id, HashSet::from([worktree_id]));
                 cx.emit(GitStoreEvent::RepositoryAdded);
-                // Buffers restored at startup can finish loading before this repository exists.
-                // A Perforce file is read-only on disk until it is opened for edit, so those
-                // buffers opened locked without ever getting to ask whether Perforce would check
-                // them out on save; now that a repository is known, let them ask.
-                self.buffer_store.update(cx, |buffer_store, cx| {
-                    buffer_store.refresh_perforce_locked_buffers(cx);
-                });
+                self.resolve_perforce_locked_buffers(cx);
                 self.refresh_diff_base_for_repo(id, cx);
                 self.active_repo_id.get_or_insert_with(|| {
                     cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
@@ -2518,6 +2512,36 @@ impl GitStore {
                     .ok();
             }
         }
+    }
+
+    /// Give the buffers that opened locked before any repository existed another chance to be
+    /// unlocked, now that one has been discovered.
+    ///
+    /// A Perforce file is read-only on disk until it is opened for edit, and session restore
+    /// opens buffers while repository discovery is still running, so such a buffer can load
+    /// before Zed knows its workspace is Perforce-backed and would otherwise stay locked for the
+    /// rest of the session.
+    ///
+    /// Each buffer's repository is resolved here and pushed to the buffer store rather than
+    /// looked up there: this runs inside a `GitStore` update, which leases the git store out of
+    /// the entity map, and a buffer store reading its git store back would abort the process.
+    fn resolve_perforce_locked_buffers(&mut self, cx: &mut Context<Self>) {
+        let parked = self.buffer_store.read(cx).perforce_parked_buffers();
+        if parked.is_empty() {
+            return;
+        }
+        let resolved = parked
+            .into_iter()
+            .map(|(buffer_id, project_path)| {
+                let repository = self
+                    .repository_and_path_for_project_path(&project_path, cx)
+                    .map(|(repository, _)| repository);
+                (buffer_id, repository)
+            })
+            .collect();
+        self.buffer_store.update(cx, |buffer_store, cx| {
+            buffer_store.settle_perforce_locks(resolved, cx);
+        });
     }
 
     fn on_trusted_worktrees_event(

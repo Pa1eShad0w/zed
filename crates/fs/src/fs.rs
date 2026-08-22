@@ -1445,6 +1445,7 @@ impl FakeFsState {
                 len: 0,
                 content: Vec::new(),
                 git_dir_path: None,
+                is_writable: true,
             });
             Ok(())
         })?;
@@ -1463,6 +1464,9 @@ enum FakeFsEntry {
         content: Vec<u8>,
         // The path to the repository state directory, if this is a gitfile.
         git_dir_path: Option<PathBuf>,
+        // Mirrors the on-disk read-only bit. Perforce leaves every unopened file read-only, and
+        // upstream opens a read-only file in `Capability::Read`, so tests need to model it.
+        is_writable: bool,
     },
     Dir {
         inode: u64,
@@ -1487,6 +1491,7 @@ impl PartialEq for FakeFsEntry {
                     len: l_len,
                     content: l_content,
                     git_dir_path: l_git_dir_path,
+                    is_writable: l_is_writable,
                 },
                 Self::File {
                     inode: r_inode,
@@ -1494,6 +1499,7 @@ impl PartialEq for FakeFsEntry {
                     len: r_len,
                     content: r_content,
                     git_dir_path: r_git_dir_path,
+                    is_writable: r_is_writable,
                 },
             ) => {
                 l_inode == r_inode
@@ -1501,6 +1507,7 @@ impl PartialEq for FakeFsEntry {
                     && l_len == r_len
                     && l_content == r_content
                     && l_git_dir_path == r_git_dir_path
+                    && l_is_writable == r_is_writable
             }
             (
                 Self::Dir {
@@ -1783,6 +1790,7 @@ impl FakeFs {
                             content: Vec::new(),
                             len: 0,
                             git_dir_path: None,
+                            is_writable: true,
                         });
                     }
                     btree_map::Entry::Occupied(mut e) => match &mut *e.get_mut() {
@@ -1799,6 +1807,22 @@ impl FakeFs {
 
     pub async fn insert_file(&self, path: impl AsRef<Path>, content: Vec<u8>) {
         self.write_file_internal(path, content, true).unwrap()
+    }
+
+    /// Flip a file's read-only bit, as Perforce does for every file that is not open for edit.
+    ///
+    /// Emits no path event: changing permissions is not a content change, and the real watcher
+    /// does not report one either.
+    pub fn set_readonly(&self, path: impl AsRef<Path>, readonly: bool) {
+        let mut state = self.state.lock();
+        let path = normalize_path(path.as_ref());
+        let Some((entry, _)) = state.try_entry(&path, true) else {
+            panic!("cannot set readonly on missing path: {path:?}");
+        };
+        match entry {
+            FakeFsEntry::File { is_writable, .. } => *is_writable = !readonly,
+            _ => panic!("cannot set readonly on a non-file: {path:?}"),
+        }
     }
 
     pub async fn insert_symlink(&self, path: impl AsRef<Path>, target: PathBuf) {
@@ -1849,6 +1873,7 @@ impl FakeFs {
                             len: new_len,
                             content: new_content,
                             git_dir_path: None,
+                            is_writable: true,
                         });
                     }
                     btree_map::Entry::Occupied(mut e) => {
@@ -2874,6 +2899,7 @@ impl Fs for FakeFs {
             len: 0,
             content: Vec::new(),
             git_dir_path: None,
+            is_writable: true,
         };
         let mut kind = Some(PathEventKind::Created);
         state.write_path(path, |entry| {
@@ -3037,6 +3063,7 @@ impl Fs for FakeFs {
                     len: content.len() as u64,
                     content,
                     git_dir_path: None,
+                    is_writable: true,
                 })
                 .clone(),
             )),
@@ -3184,7 +3211,11 @@ impl Fs for FakeFs {
 
             Ok(Some(match &*entry {
                 FakeFsEntry::File {
-                    inode, mtime, len, ..
+                    inode,
+                    mtime,
+                    len,
+                    is_writable,
+                    ..
                 } => Metadata {
                     inode: *inode,
                     mtime: *mtime,
@@ -3193,7 +3224,7 @@ impl Fs for FakeFs {
                     is_symlink,
                     is_fifo: false,
                     is_executable: false,
-                    is_writable: true,
+                    is_writable: *is_writable,
                 },
                 FakeFsEntry::Dir {
                     inode, mtime, len, ..

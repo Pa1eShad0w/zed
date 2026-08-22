@@ -74,3 +74,74 @@ fn auto_checkout_gate_follows_the_perforce_settings() {
         "without the pre-save checkout there is nothing to clear the read-only bit"
     );
 }
+
+/// Settling a buffer that parked before its repository existed.
+///
+/// A read-only file opened while repository discovery is still running has no repository to ask,
+/// so it parks and waits. The `GitStore` is what later reports a repository — and it does so from
+/// inside its own `update`, with the entity leased out of the entity map. Anything on that path
+/// that reads the git store back aborts the process, so these tests pin the settle path down.
+mod perforce_relock {
+    use crate::Project;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    async fn discovering_a_repository_settles_a_parked_read_only_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ "a.txt": "hello" }))
+            .await;
+        fs.set_readonly(path!("/project/a.txt"), true);
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let _buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/a.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+
+        project.read_with(cx, |project, cx| {
+            assert_eq!(
+                project
+                    .buffer_store()
+                    .read(cx)
+                    .perforce_parked_buffers()
+                    .len(),
+                1,
+                "a read-only file opened with no repository must park for a later decision"
+            );
+        });
+
+        // Repository discovery reports the new repo from inside `GitStore::update`. Settling the
+        // parked buffer there used to read the leased git store back and abort the process.
+        fs.insert_tree(path!("/project/.git"), json!({})).await;
+        cx.executor().run_until_parked();
+
+        project.read_with(cx, |project, cx| {
+            assert!(
+                project
+                    .buffer_store()
+                    .read(cx)
+                    .perforce_parked_buffers()
+                    .is_empty(),
+                "discovering a repository must settle the parked buffer"
+            );
+        });
+    }
+}
