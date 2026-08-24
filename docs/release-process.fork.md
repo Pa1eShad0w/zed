@@ -20,7 +20,9 @@ Runbook for cutting a fork release. Use this every time you want a new `vX.Y.Z-f
 ./script/bump-fork-version.sh
 ```
 
-The script does everything: preconditions → editor for release notes → bump `crates/zed/Cargo.toml` and `Cargo.lock` → commit → tag `v<new>` → push `--follow-tags`.
+The script does everything: preconditions → editor for release notes → bump `crates/zed/Cargo.toml` and `Cargo.lock` → commit → tag `v<new>` → push the branch and the tag, then confirm the tag is on the remote.
+
+The tag is what triggers CI, so the script fails loudly if it is not on the remote after the push. If that happens the commit is already pushed and only the tag is missing — re-run `git push origin v<new>`; do not bump the version again.
 
 GitHub Actions picks up the tag and runs `.github/workflows/release-fork.yml`. ~15-20 min on `windows-latest`. Watch the run at `https://github.com/<org>/<fork>/actions`.
 
