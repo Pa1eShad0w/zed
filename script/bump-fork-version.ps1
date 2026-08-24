@@ -11,7 +11,7 @@
 #   Step 4  Bump crates/zed/Cargo.toml + Cargo.lock to the new version
 #   Step 5  git commit "Bump to <new>\n\n<notes>"
 #   Step 6  git tag v<new>
-#   Step 7  git push --follow-tags origin <branch>
+#   Step 7  git push origin <branch> <tag>, then verify the tag landed
 #
 # Required tools: git, cargo. cargo-edit (cargo set-version) is preferred but
 # optional; if absent we fall back to a regex rewrite of crates/zed/Cargo.toml
@@ -180,7 +180,16 @@ if ($LASTEXITCODE -ne 0) { Fail "git commit failed." }
 git tag $newTag
 if ($LASTEXITCODE -ne 0) { Fail "git tag $newTag failed." }
 
-git push --follow-tags origin $branch
-if ($LASTEXITCODE -ne 0) { Fail "git push --follow-tags failed. Local commit + tag are still in place; rerun the push manually." }
+# Name both refs explicitly: `--follow-tags` pushes only annotated tags, and the
+# tag above is lightweight, so it would be silently skipped.
+git push origin $branch $newTag
+if ($LASTEXITCODE -ne 0) { Fail "git push failed. Local commit + tag are still in place; rerun the push manually." }
+
+# CI triggers on the tag, so a push that reports success without the tag landing
+# means a release that never happens. Verify rather than assume.
+$remoteTag = git ls-remote --tags origin $newTag
+if ([string]::IsNullOrWhiteSpace($remoteTag)) {
+    Fail "$newTag is missing on origin after push. The commit is pushed; re-run: git push origin $newTag"
+}
 
 Write-Host "Bumped to $new and pushed $newTag. CI will build and publish the release."
