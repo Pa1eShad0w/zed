@@ -1,18 +1,22 @@
-//! Pure logic for scheduled messages: persisted data types, fire-time text
-//! parsing, the per-session in-memory set, and garbage collection.
+//! Scheduled messages: persisted data types, fire-time text parsing, the
+//! per-session in-memory set, garbage collection, and the global store that
+//! owns persistence.
 //!
-//! See docs/scheduled-messages.spec.md (§2 data structures, §4.3 GC, §5 time
-//! grammar). No GPUI, UI, or storage code lives here; everything is unit
-//! testable without an app context.
+//! See docs/scheduled-messages.spec.md (§2 data structures, §3 persistence,
+//! §4.3 GC, §5 time grammar). Everything except [`ScheduledMessageStore`] is
+//! pure logic, unit testable without an app context.
 
-// Not yet referenced by the thread view; the store and UI integration land in
+// Not yet referenced by the thread view; the UI integration lands in
 // follow-up commits. Remove this once the first caller outside tests exists.
 #![allow(dead_code)]
 
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use collections::HashMap;
+use db::kvp::KeyValueStore;
+use gpui::{App, AppContext as _, Global, Task};
 use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 
 /// Stable identity of a scheduled message. Unlike `QueueEntryId` (a
 /// process-local counter), this survives Zed restarts because entries are
@@ -81,6 +85,144 @@ pub fn gc(file: ScheduledMessagesFile, now: DateTime<Utc>) -> ScheduledMessagesF
     ScheduledMessagesFile {
         version: file.version,
         sessions,
+    }
+}
+
+/// KV namespace for scheduled messages (spec §3). It holds exactly one key:
+/// `ScopedKeyValueStore` cannot enumerate keys, so per-session keys would
+/// leave unreachable orphan records once their session is forgotten.
+const NAMESPACE: &str = "scheduled-messages";
+const FILE_KEY: &str = "all";
+
+/// Single owner of every scheduled message across sessions (spec §2.2).
+/// Loaded once at startup and held in memory; every mutation serializes the
+/// whole file back to the single KV key as a fire-and-forget background
+/// write. The in-memory state is authoritative for the session.
+///
+/// Registered as a GPUI global by [`ScheduledMessageStore::init`]; access it
+/// through the `gpui::ReadGlobal` / `gpui::UpdateGlobal` traits, e.g.
+/// `ScheduledMessageStore::global(cx)` and
+/// `ScheduledMessageStore::update_global(cx, |store, cx| ...)`.
+pub struct ScheduledMessageStore {
+    file: ScheduledMessagesFile,
+    // Chains background writes so they land in mutation order. Every write
+    // overwrites the same key, so two unordered writes could otherwise
+    // finish last-spawned-first and persist stale state.
+    pending_write: Option<Task<()>>,
+}
+
+impl Global for ScheduledMessageStore {}
+
+impl ScheduledMessageStore {
+    /// Synchronously reads the persisted file, drops expired entries
+    /// (spec §4.3), and registers the store as a global. Total volume is a
+    /// handful of messages, so the synchronous read is effectively free.
+    pub fn init(cx: &mut App) {
+        let store = Self::load(cx);
+        cx.set_global(store);
+    }
+
+    fn load(cx: &App) -> Self {
+        let raw = KeyValueStore::global(cx)
+            .scoped(NAMESPACE)
+            .read(FILE_KEY)
+            .log_err()
+            .flatten();
+        // A persisted value that fails to deserialize (e.g. the content
+        // block schema changed across an upstream uptake) or carries an
+        // unknown version must never break startup: warn and start empty.
+        // Version 1 has nothing to migrate (spec §3).
+        let file = raw
+            .and_then(
+                |raw| match serde_json::from_str::<ScheduledMessagesFile>(&raw) {
+                    Ok(file) if file.version == SCHEDULED_MESSAGES_FILE_VERSION => Some(file),
+                    Ok(file) => {
+                        log::warn!(
+                            "dropping scheduled messages with unsupported version {}",
+                            file.version
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "dropping persisted scheduled messages that no longer \
+                             deserialize: {error}"
+                        );
+                        None
+                    }
+                },
+            )
+            .unwrap_or_else(|| ScheduledMessagesFile {
+                version: SCHEDULED_MESSAGES_FILE_VERSION,
+                sessions: HashMap::default(),
+            });
+        let mut store = Self {
+            file: gc(file.clone(), Utc::now()),
+            pending_write: None,
+        };
+        // Write back only when GC actually dropped something, so a normal
+        // start doesn't touch the database.
+        if store.file != file {
+            store.persist(cx);
+        }
+        store
+    }
+
+    /// This session's messages, cloned out. Session keys have the form
+    /// `"{agent_id}|{session_id}"`.
+    pub fn messages_for(&self, session_key: &str) -> Vec<ScheduledMessage> {
+        self.file
+            .sessions
+            .get(session_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn add(&mut self, session_key: String, message: ScheduledMessage, cx: &mut App) {
+        self.file
+            .sessions
+            .entry(session_key)
+            .or_default()
+            .push(message);
+        self.persist(cx);
+    }
+
+    /// Removes one message; a session left with no messages is dropped
+    /// entirely so the persisted file doesn't accumulate dead session keys.
+    pub fn remove(
+        &mut self,
+        session_key: &str,
+        id: &ScheduledMessageId,
+        cx: &mut App,
+    ) -> Option<ScheduledMessage> {
+        let messages = self.file.sessions.get_mut(session_key)?;
+        let index = messages.iter().position(|message| &message.id == id)?;
+        let removed = messages.remove(index);
+        if messages.is_empty() {
+            self.file.sessions.remove(session_key);
+        }
+        self.persist(cx);
+        Some(removed)
+    }
+
+    /// Serializes the whole file and overwrites the single key in the
+    /// background. Failures are logged, not surfaced: the in-memory store
+    /// stays authoritative for the rest of the session.
+    fn persist(&mut self, cx: &App) {
+        let Some(payload) = serde_json::to_string(&self.file).log_err() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        let previous_write = self.pending_write.take();
+        self.pending_write = Some(cx.background_spawn(async move {
+            if let Some(previous_write) = previous_write {
+                previous_write.await;
+            }
+            kvp.scoped(NAMESPACE)
+                .write(FILE_KEY.to_string(), payload)
+                .await
+                .log_err();
+        }));
     }
 }
 
@@ -284,6 +426,8 @@ mod tests {
     use agent_client_protocol::schema::v1 as acp;
     use chrono::{DateTime, Local, TimeZone as _, Utc};
     use collections::HashMap;
+    use db::kvp::KeyValueStore;
+    use gpui::{ReadGlobal as _, TestAppContext, UpdateGlobal as _};
 
     /// Fixed "now" for parser tests: 2026-08-25 12:00:00 local time. Tests
     /// convert expected values through `Local` the same way the parser does,
@@ -564,6 +708,147 @@ mod tests {
 
         let collected = gc(file, now);
         assert_eq!(collected.sessions["zed|session"], vec![future]);
+    }
+
+    /// Gives `KeyValueStore::global` an isolated in-memory database so store
+    /// tests don't leak state into each other or the developer's real
+    /// database. Same setup as the kvp tests in `agent_ui.rs`.
+    fn init_test_db(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+    }
+
+    /// Writes a raw string to the store's single KV key, bypassing the store,
+    /// to simulate pre-existing (or corrupted) persisted state.
+    async fn seed_raw_file(value: &str, cx: &mut TestAppContext) {
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        kvp.scoped(NAMESPACE)
+            .write(FILE_KEY.to_string(), value.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_store_round_trip_isolates_sessions(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        cx.update(ScheduledMessageStore::init);
+
+        let now = Utc::now();
+        let message_a = message_at(now + chrono::Duration::hours(2), now);
+        let message_b = message_at(now + chrono::Duration::hours(3), now);
+        cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add("zed|session-a".to_string(), message_a.clone(), cx);
+                store.add("claude|session-b".to_string(), message_b.clone(), cx);
+            })
+        });
+        cx.run_until_parked();
+
+        // A fresh store built from the same database sees both sessions,
+        // each holding only its own message.
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            let store = ScheduledMessageStore::global(cx);
+            assert_eq!(store.messages_for("zed|session-a"), vec![message_a]);
+            assert_eq!(store.messages_for("claude|session-b"), vec![message_b]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_load_drops_expired_entries(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        let now = Utc::now();
+        let expired = message_at(
+            now - chrono::Duration::days(31),
+            now - chrono::Duration::days(40),
+        );
+        let valid = message_at(now + chrono::Duration::days(1), now);
+        let mut sessions = HashMap::default();
+        sessions.insert("zed|stale".to_string(), vec![expired]);
+        sessions.insert("zed|live".to_string(), vec![valid.clone()]);
+        let file = ScheduledMessagesFile {
+            version: SCHEDULED_MESSAGES_FILE_VERSION,
+            sessions,
+        };
+        seed_raw_file(&serde_json::to_string(&file).unwrap(), cx).await;
+
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            let store = ScheduledMessageStore::global(cx);
+            assert_eq!(store.messages_for("zed|live"), vec![valid]);
+            assert!(store.messages_for("zed|stale").is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_loads_empty_on_corrupted_value(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        seed_raw_file("not json", cx).await;
+
+        // Must not panic; the unreadable value is dropped.
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            assert!(ScheduledMessageStore::global(cx).file.sessions.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_loads_empty_on_unsupported_version(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        let now = Utc::now();
+        let file = ScheduledMessagesFile {
+            version: SCHEDULED_MESSAGES_FILE_VERSION + 1,
+            ..file_with_session(
+                "zed|session",
+                vec![message_at(now + chrono::Duration::days(1), now)],
+            )
+        };
+        seed_raw_file(&serde_json::to_string(&file).unwrap(), cx).await;
+
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            assert!(ScheduledMessageStore::global(cx).file.sessions.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_remove_drops_empty_session(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        cx.update(ScheduledMessageStore::init);
+        let now = Utc::now();
+        let message = message_at(now + chrono::Duration::hours(1), now);
+        let id = message.id.clone();
+        cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add("zed|session".to_string(), message.clone(), cx);
+            })
+        });
+
+        let removed = cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.remove("zed|session", &id, cx)
+            })
+        });
+        assert_eq!(removed, Some(message));
+        cx.update(|cx| {
+            let store = ScheduledMessageStore::global(cx);
+            assert!(!store.file.sessions.contains_key("zed|session"));
+        });
+
+        // Removing the same id again finds nothing.
+        let removed = cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.remove("zed|session", &id, cx)
+            })
+        });
+        assert_eq!(removed, None);
+
+        // The emptied session is gone from a fresh reload of the database
+        // too, not just from memory.
+        cx.run_until_parked();
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            assert!(ScheduledMessageStore::global(cx).file.sessions.is_empty());
+        });
     }
 
     #[test]
