@@ -66,8 +66,12 @@ foreach ($tool in 'cargo', 'git') {
 }
 
 # cargo-edit detection: probe for the `cargo set-version` subcommand.
+# Probed through cmd so the probe's stderr never enters the PowerShell
+# error stream: under Windows PowerShell 5.1 with ErrorActionPreference
+# Stop, redirecting a native command's stderr (`*>$null`) turns its
+# "no such command" complaint into a terminating NativeCommandError.
 $haveCargoEdit = $false
-& cargo set-version --help *>$null
+& cmd /c "cargo set-version --help >NUL 2>&1"
 if ($LASTEXITCODE -eq 0) { $haveCargoEdit = $true }
 
 # ---------------------------------------------------------------------------
