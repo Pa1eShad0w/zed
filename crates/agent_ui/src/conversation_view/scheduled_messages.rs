@@ -900,9 +900,15 @@ impl ThreadView {
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(
-                        Icon::new(IconName::Clock)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        // Matches the horizontal footprint of the queue
+                        // summary's `Disclosure` (an `IconButton`, whose
+                        // default size pads the icon by `Base04` per side),
+                        // so this title left-aligns with the queue title.
+                        h_flex().px(DynamicSpacing::Base04.rems(cx)).child(
+                            Icon::new(IconName::Clock)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        ),
                     )
                     .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
             )
