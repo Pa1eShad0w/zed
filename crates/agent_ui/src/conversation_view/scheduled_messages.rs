@@ -6,17 +6,24 @@
 //! §4.3 GC, §5 time grammar). Everything except [`ScheduledMessageStore`] is
 //! pure logic, unit testable without an app context.
 
-// Not yet referenced by the thread view; the UI integration lands in
-// follow-up commits. Remove this once the first caller outside tests exists.
-#![allow(dead_code)]
-
+use acp_thread::ThreadStatus;
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use collections::HashMap;
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Global, Task};
+use editor::EditorMode;
+use futures::FutureExt as _;
+use futures::future::Shared;
+use gpui::{
+    App, AppContext as _, Context, Entity, Focusable as _, Global, Task, TaskExt as _,
+    UpdateGlobal as _, Window,
+};
+use project::AgentId;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
+
+use super::ThreadView;
+use crate::message_editor::MessageEditor;
 
 /// Stable identity of a scheduled message. Unlike `QueueEntryId` (a
 /// process-local counter), this survives Zed restarts because entries are
@@ -107,8 +114,9 @@ pub struct ScheduledMessageStore {
     file: ScheduledMessagesFile,
     // Chains background writes so they land in mutation order. Every write
     // overwrites the same key, so two unordered writes could otherwise
-    // finish last-spawned-first and persist stale state.
-    pending_write: Option<Task<()>>,
+    // finish last-spawned-first and persist stale state. Shared so `remove`
+    // can hand callers a clone to await (see `remove` docs).
+    pending_write: Option<Shared<Task<()>>>,
 }
 
 impl Global for ScheduledMessageStore {}
@@ -189,12 +197,19 @@ impl ScheduledMessageStore {
 
     /// Removes one message; a session left with no messages is dropped
     /// entirely so the persisted file doesn't accumulate dead session keys.
+    ///
+    /// Returns the removed message together with a task that resolves once
+    /// this deletion (including every write chained before it) has been
+    /// persisted. The fire path must await that task before enqueueing the
+    /// content: if Zed crashed between the send and the write, the record
+    /// would resurrect on restart as an overdue catch-up and double-send
+    /// (spec §3 prefers loss over double-send).
     pub fn remove(
         &mut self,
         session_key: &str,
         id: &ScheduledMessageId,
         cx: &mut App,
-    ) -> Option<ScheduledMessage> {
+    ) -> Option<(ScheduledMessage, Shared<Task<()>>)> {
         let messages = self.file.sessions.get_mut(session_key)?;
         let index = messages.iter().position(|message| &message.id == id)?;
         let removed = messages.remove(index);
@@ -202,7 +217,13 @@ impl ScheduledMessageStore {
             self.file.sessions.remove(session_key);
         }
         self.persist(cx);
-        Some(removed)
+        // `persist` only fails to queue a write when serialization fails; a
+        // ready task keeps the caller's await from hanging in that case.
+        let persisted = self
+            .pending_write
+            .clone()
+            .unwrap_or_else(|| Task::ready(()).shared());
+        Some((removed, persisted))
     }
 
     /// Serializes the whole file and overwrites the single key in the
@@ -214,15 +235,18 @@ impl ScheduledMessageStore {
         };
         let kvp = KeyValueStore::global(cx);
         let previous_write = self.pending_write.take();
-        self.pending_write = Some(cx.background_spawn(async move {
-            if let Some(previous_write) = previous_write {
-                previous_write.await;
-            }
-            kvp.scoped(NAMESPACE)
-                .write(FILE_KEY.to_string(), payload)
-                .await
-                .log_err();
-        }));
+        self.pending_write = Some(
+            cx.background_spawn(async move {
+                if let Some(previous_write) = previous_write {
+                    previous_write.await;
+                }
+                kvp.scoped(NAMESPACE)
+                    .write(FILE_KEY.to_string(), payload)
+                    .await
+                    .log_err();
+            })
+            .shared(),
+        );
     }
 }
 
@@ -239,6 +263,13 @@ pub struct ScheduledMessageSet {
 
 impl ScheduledMessageSet {
     pub fn add(&mut self, message: ScheduledMessage) {
+        // Ids are freshly generated UUIDs or restored from unique persisted
+        // records, so duplicates indicate a caller bug: `remove`/`get` would
+        // silently hit only the first copy.
+        debug_assert!(
+            self.get(&message.id).is_none(),
+            "scheduled message ids must be unique within a session"
+        );
         let index = self.entries.partition_point(|entry| {
             (entry.fire_at, entry.created_at) <= (message.fire_at, message.created_at)
         });
@@ -258,10 +289,15 @@ impl ScheduledMessageSet {
         self.entries.iter()
     }
 
+    // Consumed by the scheduled-section rendering (show only when non-empty)
+    // in the UI phase.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    // Consumed by the scheduled-section header (entry count) in the UI phase.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -269,6 +305,9 @@ impl ScheduledMessageSet {
     /// IDs of every entry whose fire time has arrived (`fire_at <= now`),
     /// in fire order. Firing them in this order preserves FIFO semantics in
     /// the message queue they are handed to.
+    // Production uses the grace-aware `ScheduledMessagesState::due_now`;
+    // this raw variant is pinned by the set's unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn due_entries(&self, now: DateTime<Utc>) -> Vec<ScheduledMessageId> {
         self.entries
             .iter()
@@ -277,10 +316,396 @@ impl ScheduledMessageSet {
             .collect()
     }
 
-    /// The earliest fire time, used to re-arm the wake-up timer after any
-    /// change to the set.
+    /// The earliest fire time.
+    // Production re-arms the timer from the grace-aware
+    // `ScheduledMessagesState::next_wake`; this raw variant is pinned by
+    // the set's unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_fire_at(&self) -> Option<DateTime<Utc>> {
         self.entries.first().map(|entry| entry.fire_at)
+    }
+}
+
+/// How long restored-overdue entries are held before they catch-up fire,
+/// giving the user a chance to cancel a stale send (spec §4.2).
+const OVERDUE_GRACE_SECONDS: i64 = 10;
+
+/// The grace window for entries whose fire time had already passed when
+/// their thread view was constructed. All such entries share one deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverdueGrace {
+    /// The view-construction instant: entries with `fire_at <= cutoff` are
+    /// the restored-overdue ones held by this window. Entries scheduled
+    /// later always have a future fire time, so they never match.
+    pub cutoff: DateTime<Utc>,
+    /// When the held entries actually fire (`cutoff` + ten seconds).
+    pub deadline: DateTime<Utc>,
+}
+
+/// Runtime state for one session's scheduled messages, owned by its thread
+/// view. The set mirrors this session's slice of [`ScheduledMessageStore`];
+/// the editors are read-only [`MessageEditor`]s used to render entry
+/// content (spec §2.1).
+#[derive(Default)]
+pub struct ScheduledMessagesState {
+    /// Store key of the owning session, `"{agent_id}|{session_id}"`.
+    pub session_key: String,
+    pub set: ScheduledMessageSet,
+    pub editors: HashMap<ScheduledMessageId, Entity<MessageEditor>>,
+    pub overdue_grace: Option<OverdueGrace>,
+    /// Sleeps until [`Self::next_wake`], then runs the fire routine.
+    /// Re-armed after every mutation of the set.
+    pub timer: Option<Task<()>>,
+}
+
+impl ScheduledMessagesState {
+    /// When this entry should actually fire: grace-held entries resolve to
+    /// the shared grace deadline, everything else to its own fire time.
+    pub fn effective_fire_at(&self, message: &ScheduledMessage) -> DateTime<Utc> {
+        match self.overdue_grace {
+            Some(grace) if message.fire_at <= grace.cutoff => grace.deadline,
+            _ => message.fire_at,
+        }
+    }
+
+    /// IDs of entries due at `now`, in fire order. Uses effective fire
+    /// times, so grace-held entries stay out until the deadline passes.
+    pub fn due_now(&self, now: DateTime<Utc>) -> Vec<ScheduledMessageId> {
+        self.set
+            .iter()
+            .filter(|message| self.effective_fire_at(message) <= now)
+            .map(|message| message.id.clone())
+            .collect()
+    }
+
+    /// The earliest instant anything should fire; `None` when the set is
+    /// empty (so the timer stands down).
+    pub fn next_wake(&self) -> Option<DateTime<Utc>> {
+        self.set
+            .iter()
+            .map(|message| self.effective_fire_at(message))
+            .min()
+    }
+
+    /// Drops one entry and its display editor. When the last entry held by
+    /// the overdue grace window leaves the set — fired, withdrawn, or
+    /// deleted — the window is cleared, so stale grace state can never
+    /// outlive the entries it applied to.
+    pub fn remove_entry(&mut self, id: &ScheduledMessageId) -> Option<ScheduledMessage> {
+        self.editors.remove(id);
+        let removed = self.set.remove(id)?;
+        if let Some(grace) = self.overdue_grace
+            && !self
+                .set
+                .iter()
+                .any(|message| message.fire_at <= grace.cutoff)
+        {
+            self.overdue_grace = None;
+        }
+        Some(removed)
+    }
+}
+
+/// The store key for one thread's scheduled messages (spec §2.2).
+pub fn session_key(agent_id: &AgentId, session_id: &acp::SessionId) -> String {
+    format!("{agent_id}|{session_id}")
+}
+
+/// Scheduled-message behavior of the thread view. The bodies live here
+/// rather than in `thread_view.rs` to keep that file's footprint at the
+/// field declaration plus one constructor call; same-crate field visibility
+/// makes this split free.
+impl ThreadView {
+    /// Rebuilds this session's runtime state from the global store: one
+    /// read-only display editor per entry, overdue entries (fire time
+    /// already past) held in a shared ten-second grace window instead of
+    /// firing instantly, and the wake-up timer armed. Called once from the
+    /// constructor (spec §4.2).
+    pub(crate) fn restore_scheduled_messages(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scheduled.session_key = session_key(&self.agent_id, &self.session_id);
+        // Absent only in tests that never initialize the store; production
+        // registers it at startup.
+        let Some(store) = cx.try_global::<ScheduledMessageStore>() else {
+            return;
+        };
+        let messages = store.messages_for(&self.scheduled.session_key);
+        if messages.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        if messages.iter().any(|message| message.fire_at <= now) {
+            self.scheduled.overdue_grace = Some(OverdueGrace {
+                cutoff: now,
+                deadline: now + chrono::Duration::seconds(OVERDUE_GRACE_SECONDS),
+            });
+        }
+        for message in messages {
+            let editor = self.build_scheduled_display_editor(message.content.clone(), window, cx);
+            self.scheduled.editors.insert(message.id.clone(), editor);
+            self.scheduled.set.add(message);
+        }
+        self.arm_scheduled_message_timer(window, cx);
+    }
+
+    /// A read-only editor rendering one scheduled entry's content, built the
+    /// same way as the queued-message display editors.
+    fn build_scheduled_display_editor(
+        &self,
+        content: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<MessageEditor> {
+        cx.new(|cx| {
+            let mut editor = MessageEditor::new(
+                self.workspace.clone(),
+                self.project.clone(),
+                None,
+                self.session_capabilities.clone(),
+                self.agent_id.clone(),
+                "",
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(10),
+                },
+                window,
+                cx,
+            );
+            editor.set_read_only(true, cx);
+            editor.set_message(content, window, cx);
+            editor
+        })
+    }
+
+    /// (Re)arms the wake-up: sleeps until the next effective fire time, then
+    /// runs the fire routine. The routine re-checks the wall clock, so an
+    /// early wake merely re-arms with the remaining delay. Replacing the
+    /// task cancels any previous timer (spec §4.1).
+    pub(crate) fn arm_scheduled_message_timer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(wake_at) = self.scheduled.next_wake() else {
+            self.scheduled.timer = None;
+            return;
+        };
+        let delay = (wake_at - Utc::now()).to_std().unwrap_or_default();
+        self.scheduled.timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update_in(cx, |this, window, cx| {
+                this.fire_due_scheduled_messages(window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Fires every entry whose effective fire time has arrived, oldest
+    /// first (spec §4.1).
+    pub(crate) fn fire_due_scheduled_messages(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let due = self.scheduled.due_now(Utc::now());
+        self.fire_scheduled_messages(due, window, cx);
+    }
+
+    /// The shared fire routine, driven by the wake-up timer (everything
+    /// due) and by "Send Now" (one entry). For each entry the store record
+    /// is deleted and that deletion is awaited to disk *before* the content
+    /// is enqueued: a crash after the send must not resurrect the record on
+    /// restart and double-send it (spec §3 prefers loss over double-send).
+    /// After enqueueing, an idle thread dispatches the queue front through
+    /// the existing send-now path, which yields all three behaviors of the
+    /// spec §4 table: generating → the fired message waits at the queue
+    /// tail; idle with an empty queue → the fired message itself starts a
+    /// turn; idle with a stale paused queue → the queue front drains first.
+    fn fire_scheduled_messages(
+        &mut self,
+        ids: Vec<ScheduledMessageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut fired = Vec::new();
+        let store_exists = cx.try_global::<ScheduledMessageStore>().is_some();
+        for id in ids {
+            let Some(message) = self.scheduled.remove_entry(&id) else {
+                continue;
+            };
+            let persisted = if store_exists {
+                ScheduledMessageStore::update_global(cx, |store, cx| {
+                    store.remove(&self.scheduled.session_key, &id, cx)
+                })
+                .map(|(_, persisted)| persisted)
+            } else {
+                None
+            };
+            fired.push((message.content, persisted));
+        }
+        self.arm_scheduled_message_timer(window, cx);
+        if fired.is_empty() {
+            return;
+        }
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            for (content, persisted) in fired {
+                if let Some(persisted) = persisted {
+                    persisted.await;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    this.add_to_queue(content, Vec::new(), window, cx);
+                })
+                .ok();
+            }
+            this.update_in(cx, |this, window, cx| {
+                if this.thread.read(cx).status() == ThreadStatus::Idle
+                    && let Some(front_id) = this.message_queue.first_id()
+                {
+                    this.send_queued_message_now(front_id, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fires one entry immediately, regardless of its fire time, through
+    /// the shared fire routine — so the delete-before-enqueue ordering and
+    /// the idle-dispatch rule hold here exactly as for a timer-driven fire.
+    // Called from the scheduled-section entry actions in the UI phase.
+    #[allow(dead_code)]
+    pub(crate) fn send_scheduled_message_now(
+        &mut self,
+        id: &ScheduledMessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fire_scheduled_messages(vec![id.clone()], window, cx);
+    }
+
+    /// Cancels one entry and returns its content to the main message
+    /// editor: the withdrawn message has no schedule anymore, and sending
+    /// it again requires picking a new time (spec §4). Mirrors
+    /// `move_queued_message_to_main_editor`: an empty editor takes the
+    /// content wholesale, a non-empty editor gets it appended after a
+    /// blank line, and the editor is focused either way.
+    ///
+    /// The store write is fire-and-forget: unlike the fire path nothing is
+    /// sent afterwards, so a write lost to a crash can at worst resurrect
+    /// the entry on restart — never double-send.
+    // Called from the scheduled-section entry body click in the UI phase.
+    #[allow(dead_code)]
+    pub(crate) fn withdraw_scheduled_message(
+        &mut self,
+        id: &ScheduledMessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(message) = self.remove_scheduled_message_everywhere(id, window, cx) else {
+            return;
+        };
+        let message_editor = self.message_editor.clone();
+        window.focus(&message_editor.focus_handle(cx), cx);
+        if message_editor.read(cx).is_empty(cx) {
+            message_editor.update(cx, |editor, cx| {
+                editor.set_message(message.content, window, cx);
+            });
+        } else {
+            message_editor.update(cx, |editor, cx| {
+                editor.append_message(message.content, Some("\n\n"), window, cx);
+            });
+        }
+    }
+
+    /// Discards one entry: record removed, timer re-armed, nothing sent
+    /// and no editor interaction (spec §4).
+    // Called from the scheduled-section entry actions in the UI phase.
+    #[allow(dead_code)]
+    pub(crate) fn delete_scheduled_message(
+        &mut self,
+        id: &ScheduledMessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_scheduled_message_everywhere(id, window, cx);
+    }
+
+    /// Removes one entry from the runtime set and the persisted store and
+    /// re-arms the timer — the shared tail of withdraw and delete. The
+    /// store write is fire-and-forget (see `withdraw_scheduled_message`).
+    fn remove_scheduled_message_everywhere(
+        &mut self,
+        id: &ScheduledMessageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ScheduledMessage> {
+        let message = self.scheduled.remove_entry(id)?;
+        if cx.try_global::<ScheduledMessageStore>().is_some() {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.remove(&self.scheduled.session_key, id, cx);
+            });
+        }
+        self.arm_scheduled_message_timer(window, cx);
+        cx.notify();
+        Some(message)
+    }
+
+    /// Schedules the main editor's current content to fire at `fire_at`:
+    /// resolves the content blocks, persists a new entry, adds it to the
+    /// runtime set with a display editor (like a restored entry), clears
+    /// the editor, and re-arms the timer. An empty editor is a no-op.
+    ///
+    /// Tracked buffers are deliberately dropped — they only feed
+    /// stale-buffer detection and are never persisted (spec §2.1); the
+    /// content blocks carry the mentions.
+    // Called from the send-button dropdown in the UI phase (spec §6.1).
+    #[allow(dead_code)]
+    pub(crate) fn schedule_current_message(
+        &mut self,
+        fire_at: DateTime<Utc>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message_editor = self.message_editor.clone();
+        if message_editor.read(cx).is_empty(cx) {
+            return;
+        }
+        // Resolve before clearing: the resolve task reads the editor
+        // lazily, so clearing first would wipe the contents.
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let (content, _tracked_buffers) = contents.await?;
+            if content.is_empty() {
+                return Ok(());
+            }
+            this.update_in(cx, |this, window, cx| {
+                let message = ScheduledMessage {
+                    id: ScheduledMessageId::new(),
+                    content,
+                    fire_at,
+                    created_at: Utc::now(),
+                };
+                if cx.try_global::<ScheduledMessageStore>().is_some() {
+                    ScheduledMessageStore::update_global(cx, |store, cx| {
+                        store.add(this.scheduled.session_key.clone(), message.clone(), cx);
+                    });
+                }
+                let editor =
+                    this.build_scheduled_display_editor(message.content.clone(), window, cx);
+                this.scheduled.editors.insert(message.id.clone(), editor);
+                this.scheduled.set.add(message);
+                message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+                this.arm_scheduled_message_timer(window, cx);
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach_and_log_err(cx);
     }
 }
 
@@ -324,6 +749,9 @@ const MIN_LEAD_SECONDS: i64 = 10;
 /// `now_local` is injected rather than read from the clock so callers (and
 /// tests) control the reference instant; the result is rejected if it is less
 /// than ten seconds after it.
+// Consumed by the custom-time input of the send-button dropdown in the UI
+// phase (spec §6.1).
+#[allow(dead_code)]
 pub fn parse_fire_time(
     input: &str,
     now_local: DateTime<Local>,
@@ -424,10 +852,10 @@ fn local_date_time_to_utc(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1 as acp;
-    use chrono::{DateTime, Local, TimeZone as _, Utc};
+    use chrono::{DateTime, Local, Utc};
     use collections::HashMap;
     use db::kvp::KeyValueStore;
-    use gpui::{ReadGlobal as _, TestAppContext, UpdateGlobal as _};
+    use gpui::{ReadGlobal as _, TestAppContext};
 
     /// Fixed "now" for parser tests: 2026-08-25 12:00:00 local time. Tests
     /// convert expected values through `Local` the same way the parser does,
@@ -792,6 +1220,23 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_store_load_leaves_corrupted_value_untouched_on_disk(cx: &mut TestAppContext) {
+        init_test_db(cx);
+        seed_raw_file("not json", cx).await;
+
+        cx.update(ScheduledMessageStore::init);
+        cx.run_until_parked();
+
+        // Loading starts the store empty in memory but must not write that
+        // emptiness back: the unreadable value stays on disk (where a future
+        // build that understands it again could still recover it) until some
+        // later mutation legitimately overwrites the key.
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let raw = kvp.scoped(NAMESPACE).read(FILE_KEY).unwrap();
+        assert_eq!(raw.as_deref(), Some("not json"));
+    }
+
+    #[gpui::test]
     async fn test_store_loads_empty_on_unsupported_version(cx: &mut TestAppContext) {
         init_test_db(cx);
         let now = Utc::now();
@@ -828,7 +1273,10 @@ mod tests {
                 store.remove("zed|session", &id, cx)
             })
         });
-        assert_eq!(removed, Some(message));
+        assert_eq!(
+            removed.map(|(removed_message, _)| removed_message),
+            Some(message)
+        );
         cx.update(|cx| {
             let store = ScheduledMessageStore::global(cx);
             assert!(!store.file.sessions.contains_key("zed|session"));
@@ -840,7 +1288,7 @@ mod tests {
                 store.remove("zed|session", &id, cx)
             })
         });
-        assert_eq!(removed, None);
+        assert_eq!(removed.map(|(removed_message, _)| removed_message), None);
 
         // The emptied session is gone from a fresh reload of the database
         // too, not just from memory.
@@ -849,6 +1297,69 @@ mod tests {
         cx.update(|cx| {
             assert!(ScheduledMessageStore::global(cx).file.sessions.is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn test_store_remove_persistence_task_resolves_after_write_lands(
+        cx: &mut TestAppContext,
+    ) {
+        init_test_db(cx);
+        cx.update(ScheduledMessageStore::init);
+        let message = message_at(utc(14, 0), utc(12, 0));
+        let id = message.id.clone();
+        cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add("zed|session".to_string(), message, cx);
+            })
+        });
+
+        let (_, persisted) = cx
+            .update(|cx| {
+                ScheduledMessageStore::update_global(cx, |store, cx| {
+                    store.remove("zed|session", &id, cx)
+                })
+            })
+            .expect("the entry exists");
+        persisted.await;
+
+        // Once the task resolves — with no further executor pumping — a
+        // store reloaded from the database must already see the removal.
+        // The fire path relies on this ordering: enqueueing before the
+        // delete is durable could double-send after a crash.
+        cx.update(ScheduledMessageStore::init);
+        cx.update(|cx| {
+            assert!(ScheduledMessageStore::global(cx).file.sessions.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_removing_last_grace_window_entry_clears_overdue_grace() {
+        let cutoff = utc(12, 0);
+        let mut state = ScheduledMessagesState::default();
+        state.overdue_grace = Some(OverdueGrace {
+            cutoff,
+            deadline: cutoff + chrono::Duration::seconds(OVERDUE_GRACE_SECONDS),
+        });
+        let held = message_at(utc(11, 0), utc(10, 0));
+        let future = message_at(utc(14, 0), utc(10, 0));
+        state.set.add(held.clone());
+        state.set.add(future.clone());
+
+        // Removing an entry outside the grace window keeps the window alive
+        // for the entry it still holds.
+        state.remove_entry(&future.id);
+        assert_eq!(
+            state.overdue_grace,
+            Some(OverdueGrace {
+                cutoff,
+                deadline: cutoff + chrono::Duration::seconds(OVERDUE_GRACE_SECONDS),
+            })
+        );
+
+        // Removing the last grace-held entry clears the window, so stale
+        // grace state can never outlive the entries it applied to.
+        state.remove_entry(&held.id);
+        assert_eq!(state.overdue_grace, None);
     }
 
     #[test]
@@ -870,5 +1381,703 @@ mod tests {
         let collected = gc(file, now);
         assert_eq!(collected.sessions.len(), 1);
         assert_eq!(collected.sessions["zed|live-session"], vec![kept]);
+    }
+}
+
+/// Integration tests that drive a real thread view (stub agent connection,
+/// test window) through restore and the fire routine.
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use crate::agent_connection_store::AgentConnectionStore;
+    use crate::conversation_view::ConversationView;
+    use crate::conversation_view::tests::{StubAgentServer, init_test};
+    use crate::{Agent, AgentThreadSource};
+    use acp_thread::{AgentThreadEntry, StubAgentConnection};
+    use agent::ThreadStore;
+    use fs::FakeFs;
+    use gpui::{App, ReadGlobal as _, TestAppContext, VisualTestContext};
+    use project::Project;
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicUsize;
+    use workspace::MultiWorkspace;
+
+    fn init_view_test(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            // A per-test counter makes session ids deterministic ("0",
+            // "1", ...), so tests can seed the store for a session key
+            // before the view that owns it exists.
+            cx.set_global(acp_thread::StubSessionCounter(AtomicUsize::new(0)));
+            ScheduledMessageStore::init(cx);
+        });
+    }
+
+    /// Builds a conversation view around a stub connection and returns its
+    /// active thread view. The conversation view must be kept alive by the
+    /// caller: it owns the thread view entity.
+    async fn setup_thread_view(
+        connection: StubAgentConnection,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ConversationView>,
+        Entity<ThreadView>,
+        &mut VisualTestContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection)),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let thread_view = conversation_view.read_with(cx, |view, _| {
+            view.active_thread()
+                .expect("stub agent should connect")
+                .clone()
+        });
+        (conversation_view, thread_view, cx)
+    }
+
+    fn text_block(text: &str) -> acp::ContentBlock {
+        acp::ContentBlock::Text(acp::TextContent::new(text))
+    }
+
+    fn scheduled_text_message(
+        text: &str,
+        fire_at: DateTime<Utc>,
+        created_at: DateTime<Utc>,
+    ) -> ScheduledMessage {
+        ScheduledMessage {
+            id: ScheduledMessageId::new(),
+            content: vec![text_block(text)],
+            fire_at,
+            created_at,
+        }
+    }
+
+    fn queue_texts(view: &ThreadView) -> Vec<String> {
+        view.message_queue
+            .iter()
+            .map(|entry| {
+                entry
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn user_message_texts(view: &ThreadView, cx: &App) -> Vec<String> {
+        view.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    Some(message.content.to_markdown(cx).to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Adds a message to both the global store and the view's in-memory
+    /// set, mirroring what the scheduling UI will do once it exists. Does
+    /// not arm the timer: these tests invoke the fire routine directly.
+    fn seed_scheduled_message(
+        view: &Entity<ThreadView>,
+        message: ScheduledMessage,
+        cx: &mut VisualTestContext,
+    ) {
+        view.update(cx, |view, cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add(view.scheduled.session_key.clone(), message.clone(), cx);
+            });
+            view.scheduled.set.add(message);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fire_while_generating_appends_to_queue_tail_without_cancelling(
+        cx: &mut TestAppContext,
+    ) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        // Start a turn that stays in flight: the stub connection resolves a
+        // prompt only when explicitly told to end the turn.
+        view.update_in(cx, |view, window, cx| {
+            view.message_editor
+                .update(cx, |editor, cx| editor.set_text("first", window, cx));
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+        });
+
+        // A message already waiting in the queue makes the tail position
+        // observable.
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec![text_block("queued earlier")], Vec::new(), window, cx);
+        });
+
+        let now = Utc::now();
+        seed_scheduled_message(
+            &view,
+            scheduled_text_message(
+                "scheduled follow-up",
+                now - chrono::Duration::seconds(1),
+                now,
+            ),
+            cx,
+        );
+        view.update_in(cx, |view, window, cx| {
+            view.fire_due_scheduled_messages(window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "firing while generating must not cancel the current turn"
+            );
+            assert_eq!(
+                queue_texts(view),
+                vec![
+                    "queued earlier".to_string(),
+                    "scheduled follow-up".to_string()
+                ],
+                "the fired message waits at the queue tail"
+            );
+            assert!(view.scheduled.set.is_empty());
+            assert_eq!(user_message_texts(view, cx), vec!["first".to_string()]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fire_while_idle_with_empty_queue_starts_new_turn(cx: &mut TestAppContext) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let now = Utc::now();
+        seed_scheduled_message(
+            &view,
+            scheduled_text_message(
+                "scheduled kick-off",
+                now - chrono::Duration::seconds(1),
+                now,
+            ),
+            cx,
+        );
+
+        view.update_in(cx, |view, window, cx| {
+            view.fire_due_scheduled_messages(window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "the fired message itself starts a turn"
+            );
+            assert_eq!(
+                user_message_texts(view, cx),
+                vec!["scheduled kick-off".to_string()]
+            );
+            assert!(
+                view.message_queue.is_empty(),
+                "the fired message was dispatched, not left queued"
+            );
+            assert!(view.scheduled.set.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fire_while_idle_with_paused_queue_dispatches_queue_front_first(
+        cx: &mut TestAppContext,
+    ) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        // A turn in flight...
+        view.update_in(cx, |view, window, cx| {
+            view.message_editor
+                .update(cx, |editor, cx| editor.set_text("first", window, cx));
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        // ...with a follow-up queued, then the user cancels generation: the
+        // queue pauses with the follow-up still in it.
+        view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec![text_block("stale queued")], Vec::new(), window, cx);
+            view.cancel_generation(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Idle);
+            assert_eq!(queue_texts(view), vec!["stale queued".to_string()]);
+        });
+
+        let now = Utc::now();
+        seed_scheduled_message(
+            &view,
+            scheduled_text_message("scheduled behind", now - chrono::Duration::seconds(1), now),
+            cx,
+        );
+        view.update_in(cx, |view, window, cx| {
+            view.fire_due_scheduled_messages(window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                user_message_texts(view, cx),
+                vec!["first".to_string(), "stale queued".to_string()],
+                "the stale queue front is dispatched, not the fired message"
+            );
+            assert_eq!(
+                queue_texts(view),
+                vec!["scheduled behind".to_string()],
+                "the fired message stays queued behind the drained front"
+            );
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fire_deletes_store_record_before_enqueueing(cx: &mut TestAppContext) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let now = Utc::now();
+        let message =
+            scheduled_text_message("persist first", now - chrono::Duration::seconds(1), now);
+        let id = message.id.clone();
+        seed_scheduled_message(&view, message, cx);
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.fire_due_scheduled_messages(window, cx);
+        });
+
+        // Synchronously after the fire call: the store record is already
+        // gone, but nothing is enqueued yet — the enqueue waits on the
+        // delete's persistence task.
+        view.read_with(cx, |view, cx| {
+            assert!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.scheduled.session_key)
+                    .is_empty(),
+                "the store delete happens before anything is enqueued"
+            );
+            assert!(
+                view.message_queue.is_empty(),
+                "the enqueue must wait for the delete to persist"
+            );
+            assert!(view.scheduled.set.get(&id).is_none());
+        });
+
+        cx.run_until_parked();
+
+        // Once the write has landed the message goes out, and a store
+        // reloaded from the database no longer has the record.
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                user_message_texts(view, cx),
+                vec!["persist first".to_string()]
+            );
+        });
+        cx.update(|_, cx| ScheduledMessageStore::init(cx));
+        cx.update(|_, cx| {
+            assert!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.read_with(cx, |view, _| view.scheduled.session_key.clone()))
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restore_populates_state_for_future_entry(cx: &mut TestAppContext) {
+        init_view_test(cx);
+
+        // The per-test session counter starts at 0 and the stub server's
+        // agent id is "Test", so the first thread's session key is "Test|0".
+        let now = Utc::now();
+        let future = scheduled_text_message("later", now + chrono::Duration::hours(2), now);
+        cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add("Test|0".to_string(), future.clone(), cx);
+            })
+        });
+
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.scheduled.session_key, "Test|0");
+            assert_eq!(view.scheduled.set.len(), 1);
+            assert_eq!(view.scheduled.set.next_fire_at(), Some(future.fire_at));
+            assert!(view.scheduled.editors.contains_key(&future.id));
+            assert!(view.scheduled.overdue_grace.is_none());
+            assert!(view.scheduled.timer.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restore_holds_overdue_entry_in_grace_window(cx: &mut TestAppContext) {
+        init_view_test(cx);
+
+        let now = Utc::now();
+        let overdue = scheduled_text_message(
+            "overdue",
+            now - chrono::Duration::hours(1),
+            now - chrono::Duration::hours(2),
+        );
+        cx.update(|cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add("Test|0".to_string(), overdue.clone(), cx);
+            })
+        });
+
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        view.read_with(cx, |view, cx| {
+            // Held, not fired instantly: still in the runtime set, nothing
+            // queued or sent, store record untouched.
+            assert_eq!(view.scheduled.set.len(), 1);
+            assert!(view.message_queue.is_empty());
+            assert_eq!(view.thread.read(cx).entries().len(), 0);
+            assert_eq!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for("Test|0")
+                    .len(),
+                1
+            );
+
+            let grace = view
+                .scheduled
+                .overdue_grace
+                .expect("an overdue entry enters the grace window");
+            assert!(grace.deadline > Utc::now());
+            assert_eq!(
+                grace.deadline,
+                grace.cutoff + chrono::Duration::seconds(OVERDUE_GRACE_SECONDS)
+            );
+            // Its effective fire time is the shared deadline, not the stale
+            // fire time: not due at the cutoff, due once the deadline hits.
+            assert!(view.scheduled.due_now(grace.cutoff).is_empty());
+            assert_eq!(
+                view.scheduled.due_now(grace.deadline),
+                vec![overdue.id.clone()]
+            );
+            assert_eq!(view.scheduled.next_wake(), Some(grace.deadline));
+            assert!(view.scheduled.timer.is_some());
+        });
+    }
+
+    /// Seeds like `seed_scheduled_message` but also builds the display
+    /// editor and arms the timer — the full runtime state the withdraw /
+    /// send-now / delete paths operate on.
+    fn seed_scheduled_message_with_runtime_state(
+        view: &Entity<ThreadView>,
+        message: ScheduledMessage,
+        cx: &mut VisualTestContext,
+    ) {
+        view.update_in(cx, |view, window, cx| {
+            ScheduledMessageStore::update_global(cx, |store, cx| {
+                store.add(view.scheduled.session_key.clone(), message.clone(), cx);
+            });
+            let editor = view.build_scheduled_display_editor(message.content.clone(), window, cx);
+            view.scheduled.editors.insert(message.id.clone(), editor);
+            view.scheduled.set.add(message);
+            view.arm_scheduled_message_timer(window, cx);
+        });
+    }
+
+    fn content_texts(content: &[acp::ContentBlock]) -> Vec<String> {
+        content
+            .iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_withdraw_moves_content_to_empty_main_editor_and_cancels_schedule(
+        cx: &mut TestAppContext,
+    ) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let now = Utc::now();
+        let message =
+            scheduled_text_message("come back to me", now + chrono::Duration::hours(1), now);
+        let id = message.id.clone();
+        seed_scheduled_message_with_runtime_state(&view, message, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.withdraw_scheduled_message(&id, window, cx);
+            // Checked synchronously: this detached view is not in the test
+            // window's element tree, so the next draw drops focus from any
+            // unpainted handle.
+            assert!(
+                view.message_editor.focus_handle(cx).is_focused(window),
+                "withdraw hands focus to the main editor"
+            );
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.message_editor.read(cx).text(cx), "come back to me");
+            assert!(view.scheduled.set.is_empty());
+            assert!(view.scheduled.editors.is_empty());
+            assert!(
+                view.scheduled.timer.is_none(),
+                "no entries left, so no wake-up to arm"
+            );
+            assert!(view.message_queue.is_empty(), "withdraw never sends");
+            assert_eq!(view.thread.read(cx).entries().len(), 0);
+            assert!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.scheduled.session_key)
+                    .is_empty(),
+                "the schedule is gone; sending again requires a new time"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_withdraw_appends_after_existing_main_editor_text(cx: &mut TestAppContext) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.message_editor.update(cx, |editor, cx| {
+                editor.set_text("draft in progress", window, cx)
+            });
+        });
+
+        let now = Utc::now();
+        let message =
+            scheduled_text_message("withdrawn text", now + chrono::Duration::hours(1), now);
+        let id = message.id.clone();
+        seed_scheduled_message_with_runtime_state(&view, message, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.withdraw_scheduled_message(&id, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            // Same behavior as pulling a queued message back into a
+            // non-empty editor: append after a blank line, replace nothing.
+            assert_eq!(
+                view.message_editor.read(cx).text(cx),
+                "draft in progress\n\nwithdrawn text"
+            );
+            assert!(view.scheduled.set.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_send_now_fires_only_the_requested_entry(cx: &mut TestAppContext) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let now = Utc::now();
+        let keep = scheduled_text_message("stays scheduled", now + chrono::Duration::hours(2), now);
+        let send = scheduled_text_message("goes out now", now + chrono::Duration::hours(1), now);
+        seed_scheduled_message_with_runtime_state(&view, keep.clone(), cx);
+        seed_scheduled_message_with_runtime_state(&view, send.clone(), cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.send_scheduled_message_now(&send.id, window, cx);
+        });
+
+        // Synchronously after the call: the fired entry's store record is
+        // already deleted, but nothing is enqueued until that delete has
+        // been persisted — the same ordering as a timer-driven fire.
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                ScheduledMessageStore::global(cx).messages_for(&view.scheduled.session_key),
+                vec![keep.clone()]
+            );
+            assert!(view.message_queue.is_empty());
+            assert!(view.scheduled.set.get(&send.id).is_none());
+            assert!(view.scheduled.set.get(&keep.id).is_some());
+        });
+
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                user_message_texts(view, cx),
+                vec!["goes out now".to_string()],
+                "the idle thread dispatches the fired message immediately"
+            );
+            assert_eq!(view.scheduled.set.len(), 1, "the other entry is untouched");
+            assert!(view.scheduled.editors.contains_key(&keep.id));
+            assert!(!view.scheduled.editors.contains_key(&send.id));
+            assert!(
+                view.scheduled.timer.is_some(),
+                "the timer is re-armed for the remaining entry"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_removes_entry_without_editor_interaction_or_sending(
+        cx: &mut TestAppContext,
+    ) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        view.update_in(cx, |view, window, cx| {
+            view.message_editor
+                .update(cx, |editor, cx| editor.set_text("draft stays", window, cx));
+        });
+
+        let now = Utc::now();
+        let message = scheduled_text_message("discarded", now + chrono::Duration::hours(1), now);
+        let id = message.id.clone();
+        seed_scheduled_message_with_runtime_state(&view, message, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.delete_scheduled_message(&id, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.message_editor.read(cx).text(cx),
+                "draft stays",
+                "delete never touches the main editor"
+            );
+            assert!(view.scheduled.set.is_empty());
+            assert!(view.scheduled.editors.is_empty());
+            assert!(view.scheduled.timer.is_none());
+            assert!(view.message_queue.is_empty(), "delete never sends");
+            assert_eq!(view.thread.read(cx).entries().len(), 0);
+        });
+
+        // The removal reached the database, not just memory.
+        cx.update(|_, cx| ScheduledMessageStore::init(cx));
+        cx.update(|_, cx| {
+            assert!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.read_with(cx, |view, _| view.scheduled.session_key.clone()))
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_schedule_current_message_moves_editor_content_to_scheduled(
+        cx: &mut TestAppContext,
+    ) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let fire_at = Utc::now() + chrono::Duration::hours(1);
+        view.update_in(cx, |view, window, cx| {
+            view.message_editor.update(cx, |editor, cx| {
+                editor.set_text("send this later", window, cx)
+            });
+            view.schedule_current_message(fire_at, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.message_editor.read(cx).is_empty(cx),
+                "scheduling consumes the editor content"
+            );
+            assert_eq!(view.scheduled.set.len(), 1);
+            let entry = view.scheduled.set.iter().next().unwrap();
+            assert_eq!(entry.fire_at, fire_at);
+            assert_eq!(content_texts(&entry.content), vec!["send this later"]);
+            assert!(
+                view.scheduled.editors.contains_key(&entry.id),
+                "the entry gets a display editor like a restored one"
+            );
+            assert!(view.scheduled.timer.is_some());
+            assert!(view.message_queue.is_empty(), "nothing is sent yet");
+            assert_eq!(view.thread.read(cx).entries().len(), 0);
+            assert_eq!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.scheduled.session_key)
+                    .len(),
+                1,
+                "the entry is persisted"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_schedule_current_message_with_empty_editor_does_nothing(cx: &mut TestAppContext) {
+        init_view_test(cx);
+        let (_conversation_view, view, cx) =
+            setup_thread_view(StubAgentConnection::new(), cx).await;
+
+        let fire_at = Utc::now() + chrono::Duration::hours(1);
+        view.update_in(cx, |view, window, cx| {
+            view.schedule_current_message(fire_at, window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(view.scheduled.set.is_empty());
+            assert!(view.scheduled.editors.is_empty());
+            assert!(view.scheduled.timer.is_none());
+            assert!(
+                ScheduledMessageStore::global(cx)
+                    .messages_for(&view.scheduled.session_key)
+                    .is_empty()
+            );
+        });
     }
 }

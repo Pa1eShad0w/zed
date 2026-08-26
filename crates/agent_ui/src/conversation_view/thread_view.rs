@@ -606,6 +606,9 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    /// This session's scheduled messages; behavior lives in
+    /// `scheduled_messages.rs` (restore, wake-up timer, fire routine).
+    pub(crate) scheduled: super::scheduled_messages::ScheduledMessagesState,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp::ToolCallId>,
     pub is_loading_contents: bool,
@@ -1021,6 +1024,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            scheduled: Default::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -1055,6 +1059,7 @@ impl ThreadView {
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
+        this.restore_scheduled_messages(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -1200,7 +1205,7 @@ impl ThreadView {
     /// Resolves the message editor's contents into content blocks. For profiles
     /// that do not enable any tools, directory mentions are expanded to inline
     /// file contents since the agent can't read files on its own.
-    fn resolve_message_contents(
+    pub(crate) fn resolve_message_contents(
         &self,
         message_editor: &Entity<MessageEditor>,
         cx: &mut App,
