@@ -1,25 +1,31 @@
 //! Scheduled messages: persisted data types, fire-time text parsing, the
-//! per-session in-memory set, garbage collection, and the global store that
-//! owns persistence.
+//! per-session in-memory set, garbage collection, the global store that
+//! owns persistence, and the UI (send-button dropdown, custom-time popover,
+//! scheduled block).
 //!
 //! See docs/scheduled-messages.spec.md (§2 data structures, §3 persistence,
-//! §4.3 GC, §5 time grammar). Everything except [`ScheduledMessageStore`] is
-//! pure logic, unit testable without an app context.
+//! §4.3 GC, §5 time grammar, §6 UX). Everything except
+//! [`ScheduledMessageStore`] and the UI is pure logic, unit testable without
+//! an app context.
 
 use acp_thread::ThreadStatus;
 use agent_client_protocol::schema::v1 as acp;
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use collections::HashMap;
 use db::kvp::KeyValueStore;
-use editor::EditorMode;
+use editor::{Editor, EditorEvent, EditorMode};
 use futures::FutureExt as _;
 use futures::future::Shared;
 use gpui::{
-    App, AppContext as _, Context, Entity, Focusable as _, Global, Task, TaskExt as _,
-    UpdateGlobal as _, Window,
+    AnyElement, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Global, Subscription, Task, TaskExt as _, UpdateGlobal as _, WeakEntity, Window,
 };
 use project::AgentId;
 use serde::{Deserialize, Serialize};
+use ui::{
+    ButtonLike, ContextMenu, ContextMenuEntry, ElevationIndex, PopoverMenu, PopoverMenuHandle,
+    TintColor, Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 
 use super::ThreadView;
@@ -289,15 +295,10 @@ impl ScheduledMessageSet {
         self.entries.iter()
     }
 
-    // Consumed by the scheduled-section rendering (show only when non-empty)
-    // in the UI phase.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    // Consumed by the scheduled-section header (entry count) in the UI phase.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -356,6 +357,14 @@ pub struct ScheduledMessagesState {
     /// Sleeps until [`Self::next_wake`], then runs the fire routine.
     /// Re-armed after every mutation of the set.
     pub timer: Option<Task<()>>,
+    /// Notifies the view once a second so entry countdowns stay live.
+    /// Running only while the set is non-empty.
+    pub countdown_ticker: Option<Task<()>>,
+    /// The send-button dropdown with the preset fire times (spec §6.1).
+    pub schedule_menu_handle: PopoverMenuHandle<ContextMenu>,
+    /// The custom-time input popover, shown from the dropdown's
+    /// "Custom time…" item (spec §6.1).
+    pub time_picker_handle: PopoverMenuHandle<ScheduleTimePicker>,
 }
 
 impl ScheduledMessagesState {
@@ -484,11 +493,16 @@ impl ThreadView {
     /// runs the fire routine. The routine re-checks the wall clock, so an
     /// early wake merely re-arms with the remaining delay. Replacing the
     /// task cancels any previous timer (spec §4.1).
+    ///
+    /// Also manages the one-second countdown ticker for the scheduled block:
+    /// every set mutation funnels through here, so this is the single place
+    /// that can start it on the first entry and stop it on the last.
     pub(crate) fn arm_scheduled_message_timer(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.update_scheduled_countdown_ticker(cx);
         let Some(wake_at) = self.scheduled.next_wake() else {
             self.scheduled.timer = None;
             return;
@@ -501,6 +515,26 @@ impl ThreadView {
             })
             .ok();
         }));
+    }
+
+    /// Keeps the scheduled block's countdowns live: while entries exist a
+    /// task notifies the view once a second; when the set empties the task
+    /// is dropped so an idle view costs nothing.
+    fn update_scheduled_countdown_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.scheduled.set.is_empty() {
+            self.scheduled.countdown_ticker = None;
+        } else if self.scheduled.countdown_ticker.is_none() {
+            self.scheduled.countdown_ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
     }
 
     /// Fires every entry whose effective fire time has arrived, oldest
@@ -577,8 +611,6 @@ impl ThreadView {
     /// Fires one entry immediately, regardless of its fire time, through
     /// the shared fire routine — so the delete-before-enqueue ordering and
     /// the idle-dispatch rule hold here exactly as for a timer-driven fire.
-    // Called from the scheduled-section entry actions in the UI phase.
-    #[allow(dead_code)]
     pub(crate) fn send_scheduled_message_now(
         &mut self,
         id: &ScheduledMessageId,
@@ -598,8 +630,6 @@ impl ThreadView {
     /// The store write is fire-and-forget: unlike the fire path nothing is
     /// sent afterwards, so a write lost to a crash can at worst resurrect
     /// the entry on restart — never double-send.
-    // Called from the scheduled-section entry body click in the UI phase.
-    #[allow(dead_code)]
     pub(crate) fn withdraw_scheduled_message(
         &mut self,
         id: &ScheduledMessageId,
@@ -624,8 +654,6 @@ impl ThreadView {
 
     /// Discards one entry: record removed, timer re-armed, nothing sent
     /// and no editor interaction (spec §4).
-    // Called from the scheduled-section entry actions in the UI phase.
-    #[allow(dead_code)]
     pub(crate) fn delete_scheduled_message(
         &mut self,
         id: &ScheduledMessageId,
@@ -663,8 +691,6 @@ impl ThreadView {
     /// Tracked buffers are deliberately dropped — they only feed
     /// stale-buffer detection and are never persisted (spec §2.1); the
     /// content blocks carry the mentions.
-    // Called from the send-button dropdown in the UI phase (spec §6.1).
-    #[allow(dead_code)]
     pub(crate) fn schedule_current_message(
         &mut self,
         fire_at: DateTime<Utc>,
@@ -706,6 +732,455 @@ impl ThreadView {
             Ok::<(), anyhow::Error>(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// The right half of the send split button (spec §6.1): a chevron that
+    /// opens the preset dropdown, plus the trigger-less popover hosting the
+    /// custom-time input, shown programmatically from the dropdown.
+    pub(crate) fn render_send_dropdown(
+        &self,
+        is_editor_empty: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let menu_open = self.scheduled.schedule_menu_handle.is_deployed();
+        let chevron = ButtonLike::new_rounded_right("schedule-message-trigger")
+            .layer(ElevationIndex::ModalSurface)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .width(rems_from_px(20.))
+            .height(rems_from_px(20.).into())
+            .child(
+                Icon::new(if menu_open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall),
+            )
+            .tooltip(Tooltip::text("Send Later"));
+
+        let weak_menu = cx.weak_entity();
+        let weak_picker = cx.weak_entity();
+        h_flex()
+            .child(
+                PopoverMenu::new("schedule-message-menu")
+                    .trigger(chevron)
+                    .anchor(gpui::Anchor::BottomRight)
+                    .with_handle(self.scheduled.schedule_menu_handle.clone())
+                    .offset(gpui::Point {
+                        x: px(0.0),
+                        y: px(-2.0),
+                    })
+                    .menu(move |window, cx| {
+                        weak_menu
+                            .update(cx, |this, cx| {
+                                this.build_schedule_menu(is_editor_empty, window, cx)
+                            })
+                            .ok()
+                    }),
+            )
+            .child(
+                PopoverMenu::new("schedule-time-picker")
+                    .anchor(gpui::Anchor::BottomRight)
+                    .with_handle(self.scheduled.time_picker_handle.clone())
+                    .offset(gpui::Point {
+                        x: px(0.0),
+                        y: px(-2.0),
+                    })
+                    .menu(move |window, cx| {
+                        Some(cx.new(|cx| ScheduleTimePicker::new(weak_picker.clone(), window, cx)))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The preset dropdown (spec §5): each item computes its instant at
+    /// click time from the wall clock, so every preset is strictly in the
+    /// future; "Tonight at 22:00" is hidden once 22:00 local has passed.
+    fn build_schedule_menu(
+        &self,
+        is_editor_empty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let weak = cx.weak_entity();
+        let picker_handle = self.scheduled.time_picker_handle.clone();
+        let show_tonight = Local::now().time() < chrono::NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+
+        let preset = |label: &'static str,
+                      fire_at: fn() -> Option<DateTime<Utc>>|
+         -> ContextMenuEntry {
+            let weak = weak.clone();
+            ContextMenuEntry::new(label)
+                .disabled(is_editor_empty)
+                .handler(move |window, cx| {
+                    weak.update(cx, |this, cx| {
+                        // `fire_at` reads the clock now, at click time,
+                        // not at menu-build time; `None` only for local
+                        // times skipped by a DST transition. The filter
+                        // keeps the instant strictly in the future, which
+                        // `schedule_current_message` requires: a menu left
+                        // open across the preset's wall-clock boundary
+                        // (e.g. past 22:00 with "Tonight at 22:00" still
+                        // showing) must click through as a no-op rather
+                        // than schedule a time in the past.
+                        if let Some(fire_at) = fire_at().filter(|fire_at| *fire_at > Utc::now()) {
+                            this.schedule_current_message(fire_at, window, cx);
+                        }
+                    })
+                    .ok();
+                })
+        };
+
+        ContextMenu::build(window, cx, move |menu, _window, _cx| {
+            menu.key_context("ScheduleMessageMenu")
+                .header("Send Later")
+                .item(preset("In 30 minutes", || {
+                    Some((Local::now() + chrono::Duration::minutes(30)).with_timezone(&Utc))
+                }))
+                .item(preset("In 1 hour", || {
+                    Some((Local::now() + chrono::Duration::hours(1)).with_timezone(&Utc))
+                }))
+                .when(show_tonight, |menu| {
+                    menu.item(preset("Tonight at 22:00", || {
+                        local_date_time_to_utc(
+                            Local::now().date_naive(),
+                            chrono::NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+                        )
+                    }))
+                })
+                .item(preset("Tomorrow at 9:00", || {
+                    local_date_time_to_utc(
+                        Local::now().date_naive().succ_opt()?,
+                        chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                    )
+                }))
+                .separator()
+                .item(
+                    ContextMenuEntry::new("Custom time…")
+                        .disabled(is_editor_empty)
+                        .handler(move |window, cx| {
+                            let picker_handle = picker_handle.clone();
+                            // Deferred so the picker opens after this menu's
+                            // dismissal has finished, winning the focus race.
+                            window.defer(cx, move |window, cx| {
+                                picker_handle.show(window, cx);
+                            });
+                        }),
+                )
+        })
+    }
+
+    /// The scheduled block (spec §6.2), mounted directly below the message
+    /// queue in the activity bar; the caller skips it entirely when the set
+    /// is empty. `has_section_above` adds the divider toward the preceding
+    /// activity-bar section.
+    pub(crate) fn render_scheduled_messages_block(
+        &self,
+        has_section_above: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let count = self.scheduled.set.len();
+        let title: SharedString = if count == 1 {
+            "1 Scheduled Message".into()
+        } else {
+            format!("{count} Scheduled Messages").into()
+        };
+        let now = Utc::now();
+        let now_local = Local::now();
+
+        v_flex()
+            .when(has_section_above, |this| {
+                this.border_t_1().border_color(cx.theme().colors().border)
+            })
+            .child(
+                h_flex()
+                    .p_1()
+                    .w_full()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(
+                v_flex()
+                    .id("scheduled_message_list")
+                    .max_h_40()
+                    .overflow_y_scroll()
+                    .children(
+                        self.scheduled
+                            .set
+                            .iter()
+                            .enumerate()
+                            .map(|(index, message)| {
+                                let id = message.id.clone();
+                                let editor = self.scheduled.editors.get(&message.id).cloned();
+                                let effective = self.scheduled.effective_fire_at(message);
+                                // Per-entry overdue judgement: the grace window can
+                                // hold some entries while future ones coexist, so
+                                // `overdue_grace.is_some()` alone would mislabel.
+                                let is_overdue = effective != message.fire_at;
+                                let meta_label = if is_overdue {
+                                    let seconds = (effective - now).num_seconds().max(0);
+                                    Label::new(format!("Overdue — sending in {seconds}s…"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning)
+                                } else {
+                                    Label::new(format!(
+                                        "{} · {}",
+                                        fire_time_label(message.fire_at, now_local),
+                                        format_countdown((effective - now).num_seconds()),
+                                    ))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                };
+
+                                h_flex()
+                                    .group("scheduled_entry")
+                                    .w_full()
+                                    .p_1p5()
+                                    .gap_1()
+                                    .bg(cx.theme().colors().editor_background)
+                                    .when(index < count - 1, |this| {
+                                        this.border_b_1()
+                                            .border_color(cx.theme().colors().border_variant)
+                                    })
+                                    .child(Icon::new(IconName::Clock).size(IconSize::Small).color(
+                                        if is_overdue {
+                                            Color::Warning
+                                        } else {
+                                            Color::Muted
+                                        },
+                                    ))
+                                    .child(
+                                        div().flex_1().min_w_0().relative().children(editor).child(
+                                            // Transparent overlay so a body
+                                            // click withdraws instead of
+                                            // focusing the read-only editor.
+                                            div()
+                                                .id(("scheduled-withdraw", index))
+                                                .absolute()
+                                                .inset_0()
+                                                .cursor_pointer()
+                                                .tooltip(Tooltip::text("Move Back to Editor"))
+                                                .on_click(cx.listener({
+                                                    let id = id.clone();
+                                                    move |this, _, window, cx| {
+                                                        this.withdraw_scheduled_message(
+                                                            &id, window, cx,
+                                                        );
+                                                    }
+                                                })),
+                                        ),
+                                    )
+                                    .child(
+                                        h_flex().gap_1().justify_end().child(meta_label).child(
+                                            h_flex()
+                                                .visible_on_hover("scheduled_entry")
+                                                .gap_1()
+                                                .child(
+                                                    IconButton::new(
+                                                        ("scheduled-send-now", index),
+                                                        IconName::Send,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text("Send Now"))
+                                                    .on_click(cx.listener({
+                                                        let id = id.clone();
+                                                        move |this, _, window, cx| {
+                                                            this.send_scheduled_message_now(
+                                                                &id, window, cx,
+                                                            );
+                                                        }
+                                                    })),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        ("scheduled-delete", index),
+                                                        IconName::Trash,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text(
+                                                        "Delete Scheduled Message",
+                                                    ))
+                                                    .on_click(cx.listener({
+                                                        let id = id.clone();
+                                                        move |this, _, window, cx| {
+                                                            this.delete_scheduled_message(
+                                                                &id, window, cx,
+                                                            );
+                                                        }
+                                                    })),
+                                                ),
+                                        ),
+                                    )
+                            }),
+                    ),
+            )
+    }
+}
+
+/// The fire-time label of a scheduled entry: "Today 22:00", "Tomorrow
+/// 09:00", or the full date for anything further out.
+fn fire_time_label(fire_at: DateTime<Utc>, now_local: DateTime<Local>) -> String {
+    let local = fire_at.with_timezone(&Local);
+    let date = local.date_naive();
+    let today = now_local.date_naive();
+    if date == today {
+        format!("Today {}", local.format("%H:%M"))
+    } else if Some(date) == today.succ_opt() {
+        format!("Tomorrow {}", local.format("%H:%M"))
+    } else {
+        local.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
+/// A compact live countdown, two units at most: "in 2d 3h", "in 1h 05m",
+/// "in 4m 32s", "in 42s".
+fn format_countdown(total_seconds: i64) -> String {
+    let total = total_seconds.max(0);
+    let (days, hours, minutes, seconds) = (
+        total / 86_400,
+        total / 3_600 % 24,
+        total / 60 % 60,
+        total % 60,
+    );
+    if days > 0 {
+        format!("in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("in {hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("in {minutes}m {seconds:02}s")
+    } else {
+        format!("in {seconds}s")
+    }
+}
+
+/// The inline preview under the custom-time input: what the entered time
+/// resolves to, phrased relative to today.
+fn schedule_preview(fire_at: DateTime<Utc>, now_local: DateTime<Local>) -> String {
+    let local = fire_at.with_timezone(&Local);
+    let date = local.date_naive();
+    let today = now_local.date_naive();
+    if date == today {
+        format!("Will send today at {}", local.format("%H:%M"))
+    } else if Some(date) == today.succ_opt() {
+        format!("Will send tomorrow at {}", local.format("%H:%M"))
+    } else {
+        format!("Will send on {}", local.format("%Y-%m-%d at %H:%M"))
+    }
+}
+
+/// The custom-time popover (spec §6.1): a single-line input parsed on every
+/// keystroke via [`parse_fire_time`], with the resolved preview or the parse
+/// error shown inline underneath. Enter schedules, Escape dismisses. Hosted
+/// by a trigger-less [`PopoverMenu`] like the crate's other pickers, and
+/// reuses the feedback-editor pattern of a container handling `menu::Confirm`
+/// / `menu::Cancel` around a single-line editor.
+pub struct ScheduleTimePicker {
+    editor: Entity<Editor>,
+    thread_view: WeakEntity<ThreadView>,
+    parsed: Result<DateTime<Utc>, ParseError>,
+    _editor_subscription: Subscription,
+}
+
+impl ScheduleTimePicker {
+    fn new(
+        thread_view: WeakEntity<ThreadView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("30m, 21:30, tomorrow 09:00…", window, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&editor, |this: &mut Self, _, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                this.parsed = this.parse(cx);
+                cx.notify();
+            }
+        });
+        Self {
+            editor,
+            thread_view,
+            parsed: Err(ParseError::Empty),
+            _editor_subscription: subscription,
+        }
+    }
+
+    fn parse(&self, cx: &App) -> Result<DateTime<Utc>, ParseError> {
+        parse_fire_time(&self.editor.read(cx).text(cx), Local::now())
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        // Re-parse against the current clock: the displayed preview may be
+        // stale enough that its instant no longer clears the minimum lead.
+        self.parsed = self.parse(cx);
+        match self.parsed {
+            Ok(fire_at) => {
+                self.thread_view
+                    .update(cx, |thread_view, cx| {
+                        thread_view.schedule_current_message(fire_at, window, cx);
+                    })
+                    .ok();
+                cx.emit(DismissEvent);
+            }
+            Err(_) => cx.notify(),
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for ScheduleTimePicker {}
+
+impl Focusable for ScheduleTimePicker {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for ScheduleTimePicker {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (feedback, feedback_color) = match &self.parsed {
+            Ok(fire_at) => (schedule_preview(*fire_at, Local::now()), Color::Muted),
+            Err(error @ ParseError::Empty) => (error.to_string(), Color::Muted),
+            Err(error) => (error.to_string(), Color::Error),
+        };
+
+        v_flex()
+            .key_context("ScheduleTimePicker")
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            .elevation_2(cx)
+            .w(rems(22.))
+            .p_1()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex().px_1().child(
+                    Label::new(feedback)
+                        .size(LabelSize::XSmall)
+                        .color(feedback_color),
+                ),
+            )
     }
 }
 
@@ -749,9 +1224,6 @@ const MIN_LEAD_SECONDS: i64 = 10;
 /// `now_local` is injected rather than read from the clock so callers (and
 /// tests) control the reference instant; the result is rejected if it is less
 /// than ten seconds after it.
-// Consumed by the custom-time input of the send-button dropdown in the UI
-// phase (spec §6.1).
-#[allow(dead_code)]
 pub fn parse_fire_time(
     input: &str,
     now_local: DateTime<Local>,

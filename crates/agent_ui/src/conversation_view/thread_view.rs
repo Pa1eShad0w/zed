@@ -3099,6 +3099,7 @@ impl ThreadView {
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
+        let scheduled_is_empty = self.scheduled.set.is_empty();
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -3108,6 +3109,7 @@ impl ThreadView {
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
+            && scheduled_is_empty
             && !has_awaiting_permission
         {
             return None;
@@ -3155,7 +3157,10 @@ impl ThreadView {
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
-                            && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
+                            && (!plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty
+                                || !scheduled_is_empty),
                         |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                     )
                     .when(!plan.is_empty(), |this| {
@@ -3195,6 +3200,12 @@ impl ThreadView {
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
                         })
+                    })
+                    .when(!scheduled_is_empty, |this| {
+                        this.child(self.render_scheduled_messages_block(
+                            !plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty,
+                            cx,
+                        ))
                     }),
             )
             .into_any()
@@ -5413,7 +5424,7 @@ impl ThreadView {
             } else {
                 IconName::Send
             };
-            IconButton::new("send-message", send_icon)
+            let send_button = IconButton::new("send-message", send_icon)
                 .style(ButtonStyle::Filled)
                 .map(|this| {
                     if is_editor_empty && !is_generating {
@@ -5460,7 +5471,8 @@ impl ThreadView {
                 })
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.send(window, cx);
-                }))
+                }));
+            SplitButton::new(send_button, self.render_send_dropdown(is_editor_empty, cx))
                 .into_any_element()
         }
     }
