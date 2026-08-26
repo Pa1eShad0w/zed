@@ -967,11 +967,13 @@ impl ThreadView {
                                             // Transparent overlay so a body
                                             // click withdraws instead of
                                             // focusing the read-only editor.
+                                            // Text cursor, matching what the
+                                            // queue rows' editors show.
                                             div()
                                                 .id(("scheduled-withdraw", index))
                                                 .absolute()
                                                 .inset_0()
-                                                .cursor_pointer()
+                                                .cursor_text()
                                                 .tooltip(Tooltip::text("Move Back to Editor"))
                                                 .on_click(cx.listener({
                                                     let id = id.clone();
@@ -985,25 +987,12 @@ impl ThreadView {
                                     )
                                     .child(
                                         h_flex().gap_1().justify_end().child(meta_label).child(
+                                            // Same order as the queue rows'
+                                            // hover actions: destructive
+                                            // first, send-now rightmost.
                                             h_flex()
                                                 .visible_on_hover("scheduled_entry")
                                                 .gap_1()
-                                                .child(
-                                                    IconButton::new(
-                                                        ("scheduled-send-now", index),
-                                                        IconName::Send,
-                                                    )
-                                                    .icon_size(IconSize::Small)
-                                                    .tooltip(Tooltip::text("Send Now"))
-                                                    .on_click(cx.listener({
-                                                        let id = id.clone();
-                                                        move |this, _, window, cx| {
-                                                            this.send_scheduled_message_now(
-                                                                &id, window, cx,
-                                                            );
-                                                        }
-                                                    })),
-                                                )
                                                 .child(
                                                     IconButton::new(
                                                         ("scheduled-delete", index),
@@ -1017,6 +1006,22 @@ impl ThreadView {
                                                         let id = id.clone();
                                                         move |this, _, window, cx| {
                                                             this.delete_scheduled_message(
+                                                                &id, window, cx,
+                                                            );
+                                                        }
+                                                    })),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        ("scheduled-send-now", index),
+                                                        IconName::Send,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text("Send Now"))
+                                                    .on_click(cx.listener({
+                                                        let id = id.clone();
+                                                        move |this, _, window, cx| {
+                                                            this.send_scheduled_message_now(
                                                                 &id, window, cx,
                                                             );
                                                         }
