@@ -925,6 +925,11 @@ mod tests {
     #[gpui::test]
     async fn test_report_remote_event_tags_origin(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.telemetry.get_or_insert_default().metrics = Some(true);
+            });
+        });
         let clock = Arc::new(FakeSystemClock::new());
         let http = FakeHttpClient::with_200_response();
 

@@ -5959,6 +5959,8 @@ mod tests {
                 "outline_panel",
                 "pane",
                 "panel",
+                "perforce",
+                "perforce_panel",
                 "picker",
                 "project_panel",
                 "project_search",

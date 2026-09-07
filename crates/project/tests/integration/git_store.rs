@@ -1837,7 +1837,7 @@ mod repository_activation_tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
-        set_file_scan_depth(cx, 2);
+        set_file_scan_depth(cx, 4);
         let (fs, project) = build_project(
             cx,
             json!({ "a": { "repo": { ".git": {}, "x.txt": "hello" } } }),
