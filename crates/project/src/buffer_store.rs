@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow};
 use client::Client;
 use collections::{HashMap, HashSet, hash_map};
-use futures::{Future, FutureExt as _, channel::oneshot, future::Shared};
+use futures::{Future, FutureExt as _, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt,
     WeakEntity,
@@ -231,7 +231,7 @@ impl RemoteBufferStore {
             proto::create_buffer_for_peer::Variant::State(mut state) => {
                 let buffer_id = BufferId::new(state.id)?;
 
-                let buffer_result = maybe!({
+                let buffer_file_result = maybe!({
                     let mut buffer_file = None;
                     if let Some(file) = state.file.take() {
                         let worktree_id = worktree::WorktreeId::from_proto(file.worktree_id);
@@ -245,12 +245,15 @@ impl RemoteBufferStore {
                         buffer_file = Some(Arc::new(File::from_proto(file, worktree, cx)?)
                             as Arc<dyn language::File>);
                     }
-                    Buffer::from_proto(replica_id, capability, state, buffer_file)
+                    anyhow::Ok(buffer_file)
                 });
 
-                match buffer_result {
-                    Ok(buffer) => {
-                        let buffer = cx.new(|_| buffer);
+                match buffer_file_result {
+                    Ok(buffer_file) => {
+                        let buffer = cx.new(|cx| {
+                            Buffer::from_proto(replica_id, capability, state, buffer_file, cx)
+                                .expect("buffer_id was validated above")
+                        });
                         self.loading_remote_buffers_by_id.insert(buffer_id, buffer);
                     }
                     Err(error) => {
@@ -690,6 +693,38 @@ impl LocalBufferStore {
             return None;
         };
 
+        if snapshot.entry_for_id(entry_id).is_none()
+            && snapshot.entry_for_path(path.as_ref()).is_none()
+            && Self::unloaded_ancestor_hides_path(snapshot, path)
+        {
+            let mut refresh = worktree
+                .read(cx)
+                .as_local()?
+                .refresh_entries_for_paths(vec![path.clone()]);
+            cx.spawn({
+                let path = path.clone();
+                let worktree = worktree.clone();
+                async move |this, cx| {
+                    refresh.next().await;
+                    this.update(cx, |this, cx| {
+                        let snapshot = worktree.read(cx).snapshot();
+                        if Self::unloaded_ancestor_hides_path(&snapshot, &path) {
+                            log::warn!(
+                                "buffer path {path:?} is still hidden by an unloaded directory after a refresh"
+                            );
+                        } else {
+                            Self::local_worktree_entry_changed(
+                                this, entry_id, &path, &worktree, &snapshot, cx,
+                            );
+                        }
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+            return None;
+        }
+
         let events = buffer.update(cx, |buffer, cx| {
             let file = buffer.file()?;
             let old_file = File::from_dyn(Some(file))?;
@@ -783,6 +818,13 @@ impl LocalBufferStore {
         None
     }
 
+    fn unloaded_ancestor_hides_path(snapshot: &worktree::Snapshot, path: &RelPath) -> bool {
+        path.ancestors()
+            .skip(1)
+            .find_map(|ancestor| snapshot.entry_for_path(ancestor))
+            .is_some_and(|entry| entry.kind == worktree::EntryKind::UnloadedDir)
+    }
+
     fn save_buffer(
         &self,
         buffer: Entity<Buffer>,
@@ -844,11 +886,17 @@ impl LocalBufferStore {
                     let buffer_id = BufferId::from(reservation.entity_id().as_non_zero_u64());
                     let text_buffer = cx
                         .background_spawn(async move {
-                            text::Buffer::new(ReplicaId::LOCAL, buffer_id, loaded.text)
+                            text::Buffer::new_normalized(
+                                ReplicaId::LOCAL,
+                                buffer_id,
+                                loaded.line_ending,
+                                loaded.text,
+                            )
                         })
                         .await;
-                    cx.insert_entity(reservation, |_| {
-                        let mut buffer = Buffer::build(text_buffer, Some(loaded.file), capability);
+                    cx.insert_entity(reservation, |cx| {
+                        let mut buffer =
+                            Buffer::build(text_buffer, Some(loaded.file), capability, cx);
                         buffer.set_encoding(loaded.encoding);
                         buffer.set_has_bom(loaded.has_bom);
                         buffer
@@ -868,6 +916,7 @@ impl LocalBufferStore {
                             is_private: false,
                         })),
                         Capability::ReadWrite,
+                        cx,
                     );
                     apply_initial_line_ending(&mut buffer, cx);
                     buffer

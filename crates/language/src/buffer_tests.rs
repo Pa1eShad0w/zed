@@ -76,6 +76,7 @@ fn test_set_line_ending(cx: &mut TestAppContext) {
             Capability::ReadWrite,
             base.read(cx).to_proto(cx),
             None,
+            cx,
         )
         .unwrap()
     });
@@ -418,6 +419,7 @@ fn test_edit_events(cx: &mut gpui::App) {
             ReplicaId::new(1),
             Capability::ReadWrite,
             "abcdef",
+            cx,
         )
     });
     let buffer1_ops = Arc::new(Mutex::new(Vec::new()));
@@ -1666,7 +1668,7 @@ fn test_bracket_ranges_keep_pairs_straddling_a_chunk_boundary_amid_errors(cx: &m
 }
 
 #[gpui::test]
-fn test_bracket_ranges_deduplicate_overlapping_patterns(cx: &mut App) {
+async fn test_bracket_ranges_deduplicate_overlapping_patterns(cx: &mut TestAppContext) {
     let text = indoc! {r#"
         CLAY(CLAY_ID("MenuContainer"),
              CLAY_RECTANGLE({.color = {43, 41, 51, 255}}),
@@ -1693,7 +1695,10 @@ fn test_bracket_ranges_deduplicate_overlapping_patterns(cx: &mut App) {
         .unwrap(),
     );
     let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(language, cx));
-    let snapshot = buffer.read(cx).snapshot();
+    buffer
+        .read_with(cx, |buffer, _| buffer.parsing_idle())
+        .await;
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
     assert_has_syntax_errors(&snapshot);
 
     let mut matches = snapshot
@@ -2677,6 +2682,42 @@ fn test_autoindent_block_mode_multiple_adjacent_ranges(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_replacing_line_content_keeps_manual_indent(cx: &mut App) {
+    init_settings(cx, |_| {});
+
+    cx.new(|cx| {
+        let (text, ranges_to_replace) = marked_text_ranges(
+            // 8 spaces here to represent the additional manual indentation
+            indoc! {r#"
+                fn main() {
+                        «println!("hello");»
+                }
+            "#},
+            false,
+        );
+
+        let mut buffer = Buffer::local(text, cx).with_language(rust_lang(), cx);
+
+        buffer.edit(
+            [(ranges_to_replace[0].clone(), "let x = 1;")],
+            Some(AutoindentMode::EachLine),
+            cx,
+        );
+
+        assert_eq!(
+            buffer.text(),
+            indoc! {r#"
+                fn main() {
+                        let x = 1;
+                }
+            "#}
+        );
+
+        buffer
+    });
+}
+
+#[gpui::test]
 fn test_autoindent_language_without_indents_query(cx: &mut App) {
     init_settings(cx, |_| {});
 
@@ -3649,7 +3690,7 @@ fn test_serialization(cx: &mut gpui::App) {
         .block_on(buffer1.read(cx).serialize_ops(None, cx));
     let buffer2 = cx.new(|cx| {
         let mut buffer =
-            Buffer::from_proto(ReplicaId::new(1), Capability::ReadWrite, state, None).unwrap();
+            Buffer::from_proto(ReplicaId::new(1), Capability::ReadWrite, state, None, cx).unwrap();
         buffer.apply_ops(
             ops.into_iter()
                 .map(|op| proto::deserialize_operation(op).unwrap()),
@@ -3673,6 +3714,7 @@ fn test_branch_and_merge(cx: &mut TestAppContext) {
             Capability::ReadWrite,
             base.read(cx).to_proto(cx),
             None,
+            cx,
         )
         .unwrap()
     });
@@ -3985,9 +4027,14 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
             let ops = cx
                 .foreground_executor()
                 .block_on(base_buffer.read(cx).serialize_ops(None, cx));
-            let mut buffer =
-                Buffer::from_proto(ReplicaId::new(i as u16), Capability::ReadWrite, state, None)
-                    .unwrap();
+            let mut buffer = Buffer::from_proto(
+                ReplicaId::new(i as u16),
+                Capability::ReadWrite,
+                state,
+                None,
+                cx,
+            )
+            .unwrap();
             buffer.apply_ops(
                 ops.into_iter()
                     .map(|op| proto::deserialize_operation(op).unwrap()),
@@ -4076,13 +4123,13 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                             let range = buffer.random_byte_range(0, &mut rng);
                             let range = range.to_point_utf16(buffer);
                             let range = range.start..range.end;
-                            DiagnosticEntry {
+                            DiagnosticEntry::new(
                                 range,
-                                diagnostic: Diagnostic {
+                                Diagnostic {
                                     message: post_inc(&mut next_diagnostic_id).to_string(),
                                     ..Default::default()
                                 },
-                            }
+                            )
                         }),
                         buffer,
                     );
@@ -4116,6 +4163,7 @@ fn test_random_collaboration(cx: &mut App, mut rng: StdRng) {
                         Capability::ReadWrite,
                         old_buffer_state,
                         None,
+                        cx,
                     )
                     .unwrap();
                     new_buffer.apply_ops(
@@ -4999,6 +5047,7 @@ fn test_completion_triggers_across_language_servers(cx: &mut TestAppContext) {
             Capability::ReadWrite,
             buffer.read(cx).to_proto(cx),
             None,
+            cx,
         )
         .unwrap()
     });
@@ -5120,6 +5169,66 @@ fn init_settings(cx: &mut App, f: fn(&mut AllLanguageSettingsContent)) {
     cx.update_global::<SettingsStore, _>(|settings, cx| {
         settings.update_user_settings(cx, |content| f(&mut content.project.all_languages));
     });
+}
+
+#[gpui::test]
+fn test_settings_changed_event(cx: &mut TestAppContext) {
+    cx.update(|cx| init_settings(cx, |_| {}));
+
+    let buffer = cx.new(|cx| Buffer::local("one\ntwo\nthree\n", cx));
+    let settings_change_count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let subscription = cx.update(|cx| {
+        cx.subscribe(&buffer, {
+            let settings_change_count = settings_change_count.clone();
+            move |_, event, _| {
+                if let BufferEvent::SettingsChanged = event {
+                    settings_change_count.set(settings_change_count.get() + 1);
+                }
+            }
+        })
+    });
+
+    assert_eq!(
+        buffer.read_with(cx, |buffer, cx| {
+            crate::language_settings::LanguageSettings::for_buffer(buffer, cx)
+                .tab_size
+                .get()
+        }),
+        4
+    );
+    assert_eq!(settings_change_count.get(), 0);
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings(cx, |content| {
+                content.project.all_languages.defaults.tab_size = Some(3.try_into().unwrap());
+            });
+        });
+    });
+    assert_eq!(settings_change_count.get(), 1);
+    assert_eq!(
+        buffer.read_with(cx, |buffer, cx| {
+            crate::language_settings::LanguageSettings::for_buffer(buffer, cx)
+                .tab_size
+                .get()
+        }),
+        3
+    );
+
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|settings, cx| {
+            settings.update_user_settings(cx, |content| {
+                content.project.all_languages.defaults.tab_size = Some(3.try_into().unwrap());
+            });
+        });
+    });
+    assert_eq!(
+        settings_change_count.get(),
+        1,
+        "a no-op settings update should not emit SettingsChanged"
+    );
+
+    drop(subscription);
 }
 
 #[gpui::test(iterations = 100)]

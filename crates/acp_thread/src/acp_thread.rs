@@ -5505,7 +5505,7 @@ mod tests {
                     ::terminal::terminal_settings::AlternateScroll::On,
                     None,
                     vec![],
-                    0,
+                    Duration::ZERO,
                     false,
                     0,
                     Some(completion_tx),
@@ -10282,9 +10282,14 @@ mod tests {
             thread.generate_title(model.clone(), None, cx);
         });
         cx.run_until_parked();
-        model.send_last_completion_stream_error(LanguageModelCompletionError::PromptTooLarge {
-            tokens: None,
-        });
+        model.send_last_completion_stream_error(LanguageModelCompletionError::from_provider_response(
+            language_model::LanguageModelProviderName::new("test"),
+            None,
+            None,
+            "prompt too large".to_string(),
+            None,
+            language_model::ProviderErrorCategory::PromptTooLarge { tokens: None },
+        ));
         model.end_last_completion_stream();
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {

@@ -22,9 +22,9 @@ use crate::repository::{
     GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
     LogSource, PushOptions, RemoteCommandOutput, RepoPath, ResetMode,
 };
-use crate::{Oid, RunHook};
 use crate::stash::GitStash;
 use crate::status::{DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff};
+use crate::{Oid, RunHook};
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
@@ -33,13 +33,13 @@ use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
 use parking_lot::Mutex;
 use rope::Rope;
 use smallvec::SmallVec;
-use std::str::FromStr as _;
-use std::time::SystemTime;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 use text::LineEnding;
 use util::command::new_command;
 use util::rel_path::RelPath;
@@ -188,6 +188,20 @@ impl P4Cli {
         let (stdout, stderr, ok) = self.run_lenient(tagged, args).await?;
         anyhow::ensure!(ok, "p4 command failed: {stderr}");
         Ok(stdout)
+    }
+
+    async fn run_bytes<S: AsRef<OsStr>>(&self, tagged: bool, args: &[S]) -> Result<Vec<u8>> {
+        let output = self
+            .build_command(tagged, args)
+            .output()
+            .await
+            .context("spawning p4")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "p4 command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(output.stdout)
     }
 
     /// Run a `p4` command, tolerating a nonzero exit status.
@@ -380,10 +394,7 @@ fn local_path_to_repo_path(working_directory: &Path, client_file: &str) -> Optio
 /// `(change number, file)` pairs. Each shelved file reports a local `clientFile`, an `action`,
 /// and its `change`; records lacking those (e.g. the trailing changelist-description record) are
 /// skipped. Every returned file is marked `shelved`.
-fn parse_shelved_files(
-    working_directory: &Path,
-    fstat_output: &str,
-) -> Vec<(u32, ChangelistFile)> {
+fn parse_shelved_files(working_directory: &Path, fstat_output: &str) -> Vec<(u32, ChangelistFile)> {
     let mut out = Vec::new();
     for record in parse_ztag(fstat_output) {
         let (Some(client_file), Some(action), Some(change)) = (
@@ -852,7 +863,13 @@ fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitDa
         author_name: rev.user.clone().into(),
         author_email: SharedString::default(),
         commit_timestamp: rev.time.unwrap_or(0),
-        subject: rev.desc.lines().next().unwrap_or_default().to_string().into(),
+        subject: rev
+            .desc
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+            .into(),
         message: rev.desc.clone().into(),
         // Decimal changelist for the "Commit" column / detail header (not the synthetic-Oid hex).
         revision_label: Some(format!("@{}", rev.change).into()),
@@ -894,16 +911,9 @@ fn parse_formatted_annotate(output: &str) -> Vec<AnnotatedLine> {
         .filter_map(|line| {
             let mut parts = line.splitn(3, '|');
             let change = parts.next()?.trim().parse::<u32>().ok()?;
-            let user = parts
-                .next()
-                .map(str::to_string)
-                .filter(|u| !u.is_empty());
+            let user = parts.next().map(str::to_string).filter(|u| !u.is_empty());
             let time = parts.next().and_then(parse_p4_datetime);
-            Some(AnnotatedLine {
-                change,
-                user,
-                time,
-            })
+            Some(AnnotatedLine { change, user, time })
         })
         .collect()
 }
@@ -922,7 +932,8 @@ fn parse_p4_datetime(s: &str) -> Option<i64> {
     let hour: u8 = t.next().unwrap_or("0").parse().ok()?;
     let minute: u8 = t.next().unwrap_or("0").parse().ok()?;
     let second: u8 = t.next().unwrap_or("0").parse().ok()?;
-    let date = time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()?;
+    let date =
+        time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()?;
     let clock = time::Time::from_hms(hour, minute, second).ok()?;
     Some(date.with_time(clock).assume_utc().unix_timestamp())
 }
@@ -1000,9 +1011,7 @@ fn build_p4_blame_mapped(
         let change = line.change;
         let start = i;
         // Group consecutive rows that share the same depot change AND are not holes.
-        while i < lines.len()
-            && lines[i].as_ref().is_some_and(|l| l.change == change)
-        {
+        while i < lines.len() && lines[i].as_ref().is_some_and(|l| l.change == change) {
             i += 1;
         }
         let oid = change_to_oid(change);
@@ -1109,7 +1118,10 @@ fn split_lines(text: &str) -> Vec<&str> {
     let trimmed = text.strip_suffix('\n').unwrap_or(text);
     // `split('\n')` on "a\nb" -> ["a", "b"]; on "" (after stripping a lone "\n") -> [""],
     // but we returned early for the fully-empty case so a single empty line is preserved.
-    trimmed.split('\n').map(|l| l.trim_end_matches('\r')).collect()
+    trimmed
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r'))
+        .collect()
 }
 
 /// Classic LCS over two line-text slices, returning for each `b`-line the matched `a`-index
@@ -1507,19 +1519,11 @@ impl GitRepository for PerforceRepository {
         })
     }
 
-    fn load_committed_text(&self, path: RepoPath) -> BoxFuture<'_, Option<String>> {
-        // Depot content of the currently-synced revision: `p4 print -q //client/path#have`.
+    fn load_committed_text(&self, path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
         let cli = self.cli.clone();
         let arg = format!("{}#have", self.client_syntax_path(&path));
-        async move {
-            let mut out = cli.run(false, &["print", "-q", &arg]).await.ok()?;
-            // `p4 print` returns CRLF on Windows text files, but Zed buffers are stored internally
-            // as LF. A CRLF diff base would make every line diff as "removed + identical added"
-            // (and a hunk revert could never clear it), so normalize to LF to match the buffer.
-            LineEnding::normalize(&mut out);
-            Some(out)
-        }
-        .boxed()
+        // The project layer decodes the original bytes before normalizing line endings.
+        async move { cli.run_bytes(false, &["print", "-q", &arg]).await.ok() }.boxed()
     }
 
     fn path(&self) -> PathBuf {
@@ -1596,18 +1600,18 @@ impl GitRepository for PerforceRepository {
 
     // ---- Everything below is unsupported in the MVP (read-only status only). ----
 
-    fn load_index_text(&self, _path: RepoPath) -> BoxFuture<'_, Option<String>> {
+    fn load_index_text(&self, _path: RepoPath) -> BoxFuture<'_, Option<Vec<u8>>> {
         async { None }.boxed()
     }
 
-    fn load_blob_content(&self, _oid: Oid) -> BoxFuture<'_, Result<String>> {
+    fn load_blob_content(&self, _oid: Oid) -> BoxFuture<'_, Result<Vec<u8>>> {
         unsupported_result!()
     }
 
     fn set_index_text(
         &self,
         _path: RepoPath,
-        _content: Option<String>,
+        _content: Option<Vec<u8>>,
         _env: Arc<HashMap<String, String>>,
         _is_executable: bool,
     ) -> BoxFuture<'_, Result<()>> {
@@ -1625,7 +1629,10 @@ impl GitRepository for PerforceRepository {
         async move { Ok(revs.into_iter().map(|_| None).collect()) }.boxed()
     }
 
-    fn load_revisions(&self, revisions: Vec<String>) -> BoxFuture<'_, Result<Vec<Option<String>>>> {
+    fn load_revisions(
+        &self,
+        revisions: Vec<String>,
+    ) -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>> {
         // Batch diff-base loader: upstream routes buffer diff-base reloads
         // through this instead of per-file `load_index_text` /
         // `load_committed_text`, so it must mirror those exactly:
@@ -1652,14 +1659,9 @@ impl GitRepository for PerforceRepository {
                 let text = match print_arg {
                     None => None,
                     Some(print_arg) => cli
-                        .run(false, &["print", "-q", &print_arg])
+                        .run_bytes(false, &["print", "-q", &print_arg])
                         .await
-                        .ok()
-                        .map(|mut text| {
-                            // CRLF → LF, same reason as in `load_committed_text`.
-                            LineEnding::normalize(&mut text);
-                            text
-                        }),
+                        .ok(),
                 };
                 contents.push(text);
             }
@@ -1811,60 +1813,68 @@ impl GitRepository for PerforceRepository {
     fn load_commit(&self, commit: String, _cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
         let cli = self.cli.clone();
         let client_name = self.client_name.clone();
-        self.cli.executor.clone().spawn(async move {
-            let change = Oid::from_str(&commit)
-                .ok()
-                .map(|oid| oid_to_change(&oid))
-                .context("invalid Perforce commit id")?;
-            let change_str = change.to_string();
-            let describe_out = cli.run(true, &["describe", "-s", &change_str]).await?;
-            let files = parse_describe_files(&describe_out);
-            if files.is_empty() {
-                return Ok(CommitDiff { files: Vec::new() });
-            }
+        self.cli
+            .executor
+            .clone()
+            .spawn(async move {
+                let change = Oid::from_str(&commit)
+                    .ok()
+                    .map(|oid| oid_to_change(&oid))
+                    .context("invalid Perforce commit id")?;
+                let change_str = change.to_string();
+                let describe_out = cli.run(true, &["describe", "-s", &change_str]).await?;
+                let files = parse_describe_files(&describe_out);
+                if files.is_empty() {
+                    return Ok(CommitDiff { files: Vec::new() });
+                }
 
-            // One `p4 where` maps every depot path in the change to its client path.
-            let mut where_args = vec!["where".to_string()];
-            where_args.extend(files.iter().map(|(depot, _, _)| depot.clone()));
-            let where_out = cli.run(true, &where_args).await.unwrap_or_default();
-            let depot_to_client = parse_where(&where_out);
+                // One `p4 where` maps every depot path in the change to its client path.
+                let mut where_args = vec!["where".to_string()];
+                where_args.extend(files.iter().map(|(depot, _, _)| depot.clone()));
+                let where_out = cli.run(true, &where_args).await.unwrap_or_default();
+                let depot_to_client = parse_where(&where_out);
 
-            let mut commit_files = Vec::new();
-            for (depot, rev, action) in files {
-                let Some(repo_path) = depot_to_client
-                    .get(&depot)
-                    .and_then(|client| client_path_to_repo_path(&client_name, client))
-                else {
-                    continue;
-                };
-                let is_add = matches!(action.as_str(), "add" | "branch" | "import" | "move/add");
-                let is_delete = matches!(action.as_str(), "delete" | "move/delete" | "purge");
-                let new_text = if is_delete {
-                    None
-                } else {
-                    cli.run(false, &["print", "-q", &format!("{depot}#{rev}")])
-                        .await
-                        .ok()
-                };
-                let old_text = if is_add || rev <= 1 {
-                    None
-                } else {
-                    cli.run(false, &["print", "-q", &format!("{depot}#{}", rev - 1)])
-                        .await
-                        .ok()
-                };
-                commit_files.push(CommitFile {
-                    path: repo_path,
-                    old_text,
-                    new_text,
-                    is_binary: false,
-                });
-            }
-            Ok(CommitDiff {
-                files: commit_files,
+                let mut commit_files = Vec::new();
+                for (depot, rev, action) in files {
+                    let Some(repo_path) = depot_to_client
+                        .get(&depot)
+                        .and_then(|client| client_path_to_repo_path(&client_name, client))
+                    else {
+                        continue;
+                    };
+                    let is_add =
+                        matches!(action.as_str(), "add" | "branch" | "import" | "move/add");
+                    let is_delete = matches!(action.as_str(), "delete" | "move/delete" | "purge");
+                    let new_content = if is_delete {
+                        None
+                    } else {
+                        cli.run_bytes(false, &["print", "-q", &format!("{depot}#{rev}")])
+                            .await
+                            .ok()
+                    };
+                    let old_content = if is_add || rev <= 1 {
+                        None
+                    } else {
+                        cli.run_bytes(false, &["print", "-q", &format!("{depot}#{}", rev - 1)])
+                            .await
+                            .ok()
+                    };
+                    commit_files.push(CommitFile {
+                        path: repo_path,
+                        old_content,
+                        new_content,
+                        is_binary: false,
+                    });
+                }
+                Ok(CommitDiff {
+                    files: commit_files,
+                })
             })
-        })
-        .boxed()
+            .boxed()
+    }
+
+    fn blame_at_revision(&self, _path: RepoPath, _revision: Oid) -> BoxFuture<'_, Result<Blame>> {
+        unsupported_result!()
     }
 
     fn blame(
@@ -1894,13 +1904,8 @@ impl GitRepository for PerforceRepository {
             let mtime = std::fs::metadata(&abs).and_then(|m| m.modified()).ok();
             if let Some(hit) = cache.lock().get(&path) {
                 if hit.mtime == mtime {
-                    let mapped =
-                        remap_annotation_to_content(&hit.lines, &hit.depot_text, &content);
-                    return Ok(build_p4_blame_mapped(
-                        &mapped,
-                        &hit.descriptions,
-                        filename,
-                    ));
+                    let mapped = remap_annotation_to_content(&hit.lines, &hit.depot_text, &content);
+                    return Ok(build_p4_blame_mapped(&mapped, &hit.descriptions, filename));
                 }
             }
 
@@ -2014,6 +2019,15 @@ impl GitRepository for PerforceRepository {
     fn stash_paths(
         &self,
         _paths: Vec<RepoPath>,
+        _message: Option<String>,
+        _env: Arc<HashMap<String, String>>,
+    ) -> BoxFuture<'_, Result<()>> {
+        unsupported_result!()
+    }
+
+    fn stash_staged(
+        &self,
+        _message: Option<String>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         unsupported_result!()
@@ -2248,36 +2262,39 @@ impl GitRepository for PerforceRepository {
         let cli = self.cli.clone();
         let cache = self.history_cache.clone();
         let executor = self.cli.executor.clone();
-        Ok(CommitDataReader::from_async_resolver(executor, move |oid| {
-            let cli = cli.clone();
-            let cache = cache.clone();
-            async move {
-                let change = oid_to_change(&oid);
-                if let Some(data) = cache.lock().get(&change).cloned() {
-                    return Ok(data);
+        Ok(CommitDataReader::from_async_resolver(
+            executor,
+            move |oid| {
+                let cli = cli.clone();
+                let cache = cache.clone();
+                async move {
+                    let change = oid_to_change(&oid);
+                    if let Some(data) = cache.lock().get(&change).cloned() {
+                        return Ok(data);
+                    }
+                    let change_str = change.to_string();
+                    let out = cli.run(true, &["describe", "-s", &change_str]).await?;
+                    let meta = parse_describe_meta(&out)
+                        .get(&change)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(CommitData {
+                        sha: oid,
+                        parents: SmallVec::new(),
+                        author_name: meta.user.unwrap_or_default().into(),
+                        author_email: SharedString::default(),
+                        commit_timestamp: meta.time.unwrap_or(0),
+                        subject: meta.summary.clone().unwrap_or_default().into(),
+                        message: meta.summary.unwrap_or_default().into(),
+                        // Describe-fallback (a change not in the filelog cache): no per-file rev or
+                        // integration branch here, so show just the decimal changelist.
+                        revision_label: Some(format!("@{change}").into()),
+                        file_revision: None,
+                        branch: None,
+                    })
                 }
-                let change_str = change.to_string();
-                let out = cli.run(true, &["describe", "-s", &change_str]).await?;
-                let meta = parse_describe_meta(&out)
-                    .get(&change)
-                    .cloned()
-                    .unwrap_or_default();
-                Ok(CommitData {
-                    sha: oid,
-                    parents: SmallVec::new(),
-                    author_name: meta.user.unwrap_or_default().into(),
-                    author_email: SharedString::default(),
-                    commit_timestamp: meta.time.unwrap_or(0),
-                    subject: meta.summary.clone().unwrap_or_default().into(),
-                    message: meta.summary.unwrap_or_default().into(),
-                    // Describe-fallback (a change not in the filelog cache): no per-file rev or
-                    // integration branch here, so show just the decimal changelist.
-                    revision_label: Some(format!("@{change}").into()),
-                    file_revision: None,
-                    branch: None,
-                })
-            }
-        }))
+            },
+        ))
     }
 
     fn update_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
@@ -2324,7 +2341,10 @@ impl PerforceRepository {
         self.cli.executor.clone().spawn(async move {
             let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
             anyhow::ensure!(ok, "p4 {verb} failed: {stderr}");
-            log::info!("perforce: auto-checkout p4 {verb} ({n} path(s)) -> {}", stdout.trim_end());
+            log::info!(
+                "perforce: auto-checkout p4 {verb} ({n} path(s)) -> {}",
+                stdout.trim_end()
+            );
             Ok(())
         })
     }
@@ -2507,7 +2527,11 @@ impl PerforceRepository {
         self.cli.executor.clone().spawn(async move {
             let (stdout, stderr, ok) = cli.run_lenient(false, &args).await?;
             anyhow::ensure!(ok, "p4 revert failed: {stderr}");
-            log::info!("perforce: revert {} -> {}", file.as_unix_str(), stdout.trim_end());
+            log::info!(
+                "perforce: revert {} -> {}",
+                file.as_unix_str(),
+                stdout.trim_end()
+            );
             Ok(())
         })
     }
@@ -2584,6 +2608,32 @@ impl PerforceRepository {
 mod tests {
     use super::*;
     use crate::status::FileStatus;
+
+    #[gpui::test]
+    async fn raw_command_output_preserves_encoding_and_line_endings(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"\xff\xfeh\0i\0\r\0\n\0";
+        std::fs::write(directory.path().join("content.bin"), bytes).unwrap();
+        let cli = P4Cli {
+            p4_binary_path: if cfg!(windows) { "powershell.exe" } else { "cat" }.into(),
+            working_directory: directory.path().to_path_buf(),
+            executor: cx.background_executor.clone(),
+            envs: Arc::default(),
+            p4config_path: None,
+        };
+        let args: &[&str] = if cfg!(windows) {
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$bytes = [IO.File]::ReadAllBytes('content.bin'); [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)",
+            ]
+        } else {
+            &["content.bin"]
+        };
+        assert_eq!(cli.run_bytes(false, args).await.unwrap(), bytes);
+    }
 
     #[test]
     fn workspace_root_match_accepts_dir_inside_client_root() {
@@ -2664,7 +2714,10 @@ mod tests {
         assert_eq!(records.len(), 1);
         let info = &records[0];
         assert_eq!(info.get("clientName").unwrap(), "some_client_name");
-        assert_eq!(info.get("clientRoot").unwrap(), "E:/Projects\\some_client_name");
+        assert_eq!(
+            info.get("clientRoot").unwrap(),
+            "E:/Projects\\some_client_name"
+        );
         // Flag-style field with no value still parses (here all have values).
         assert_eq!(info.get("clientCase").unwrap(), "insensitive");
     }
@@ -2989,7 +3042,10 @@ line two
     fn classify_directory_maybe_open() {
         let dir = tempfile::tempdir().unwrap();
         // A directory prefix's children are not inspected here: must query.
-        assert_eq!(classify_open_candidate(dir.path()), OpenCandidate::MaybeOpen);
+        assert_eq!(
+            classify_open_candidate(dir.path()),
+            OpenCandidate::MaybeOpen
+        );
     }
 
     // ---- Phase 2: auto-checkout p4 command construction ----
@@ -3179,8 +3235,16 @@ line two
         assert_eq!(
             files,
             vec![
-                ("//Depot.Project/Release/branch_x/a/b.cpp".to_string(), 3, "edit".to_string()),
-                ("//Depot.Project/Release/branch_x/c/new.md".to_string(), 1, "add".to_string()),
+                (
+                    "//Depot.Project/Release/branch_x/a/b.cpp".to_string(),
+                    3,
+                    "edit".to_string()
+                ),
+                (
+                    "//Depot.Project/Release/branch_x/c/new.md".to_string(),
+                    1,
+                    "add".to_string()
+                ),
             ]
         );
     }
@@ -3199,7 +3263,8 @@ line two
 ";
         let map = parse_where(ztag);
         assert_eq!(
-            map.get("//Depot.Project/Release/branch_x/a/b.cpp").map(String::as_str),
+            map.get("//Depot.Project/Release/branch_x/a/b.cpp")
+                .map(String::as_str),
             Some("//some_client_name/a/b.cpp")
         );
         assert_eq!(map.len(), 2);
@@ -3355,8 +3420,14 @@ line two
 ... action add
 ";
         let map = parse_opened_actions("some_client_name", ztag);
-        assert_eq!(map.get(&repo_path("a/edited.cpp")).map(String::as_str), Some("edit"));
-        assert_eq!(map.get(&repo_path("b/added.md")).map(String::as_str), Some("add"));
+        assert_eq!(
+            map.get(&repo_path("a/edited.cpp")).map(String::as_str),
+            Some("edit")
+        );
+        assert_eq!(
+            map.get(&repo_path("b/added.md")).map(String::as_str),
+            Some("add")
+        );
     }
 
     #[test]
@@ -3435,7 +3506,10 @@ line two
         assert_eq!(a.user.as_deref(), Some("devuser1"));
         assert_eq!(a.time, Some(1700000000));
         assert_eq!(a.summary.as_deref(), Some("add curves"));
-        assert_eq!(meta.get(&2002).unwrap().summary.as_deref(), Some("[CODE] initial import"));
+        assert_eq!(
+            meta.get(&2002).unwrap().summary.as_deref(),
+            Some("[CODE] initial import")
+        );
     }
 
     #[test]
@@ -3503,7 +3577,10 @@ line two
         let depot_text = "a\nb\nc\n";
         let content = Rope::from("a\nb\nc\n");
         let mapped = remap_annotation_to_content(&depot, depot_text, &content);
-        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
         assert_eq!(changes, vec![Some(1001), Some(1001), Some(1002)]);
     }
 
@@ -3516,7 +3593,10 @@ line two
         let depot_text = "a\nb\nc\n";
         let content = Rope::from("a\nb\nx\nc\n");
         let mapped = remap_annotation_to_content(&depot, depot_text, &content);
-        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
         assert_eq!(changes, vec![Some(1001), Some(1002), None, Some(1003)]);
     }
 
@@ -3528,7 +3608,10 @@ line two
         let depot_text = "a\nb\nc\n";
         let content = Rope::from("a\nB\nc\n");
         let mapped = remap_annotation_to_content(&depot, depot_text, &content);
-        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
         assert_eq!(changes, vec![Some(1001), None, Some(1003)]);
     }
 
@@ -3539,7 +3622,10 @@ line two
         let depot_text = "a\nb\nc\n";
         let content = Rope::from("a\nc\n");
         let mapped = remap_annotation_to_content(&depot, depot_text, &content);
-        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
         assert_eq!(changes, vec![Some(1001), Some(1003)]);
     }
 
@@ -3551,7 +3637,10 @@ line two
         let depot_text = "a\nb\nc\n"; // 3 lines vs 2 annotation entries
         let content = Rope::from("a\nb\nc\n");
         let mapped = remap_annotation_to_content(&depot, depot_text, &content);
-        let changes: Vec<Option<u32>> = mapped.iter().map(|m| m.as_ref().map(|l| l.change)).collect();
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
         assert_eq!(changes, vec![Some(1001), Some(1002)]);
     }
 
