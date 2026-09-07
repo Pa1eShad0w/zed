@@ -45,6 +45,9 @@
 
 ### Changed
 
+- `f660477629` (2026-09-07) 合并 upstream 稳定版 v1.18.1，fork 版本升为 `1.18.1-fork.1`；保留 Perforce 自动 checkout、文件历史与注释、Agent 标题语言和定时消息，适配延迟仓库激活后的文件权限处理，并避免向 Perforce 用户提供无法使用的 Git 修订 blame 入口。
+- `f660477629` (2026-09-07) Markdown 行内代码改用 upstream 圆角背景绘制，取消两侧额外插入的显示空白；保留加深背景和 preview 段落行高，复制与双击选词继续准确对应代码内容。
+
 - `cb84970f9d` `0e60a21c1d` `41cc821e05` (2026-08-17) 合并 upstream 稳定版 v1.15.0（自 v1.11.3 基线起 531 个上游提交，跳过 v1.12.x / v1.13.x / v1.14.x——一次合入最新稳定 tag），fork 版本号升为 `1.15.0-fork.1`。上游在 git 区域有多处结构性重写，fork 特性按「采纳上游新结构 + 重新挂接 fork 行为」处理：
     - **commit 右键菜单**：upstream 把 git graph 的 commit 上下文菜单抽成共享函数（git graph 与 Git Panel History 页共用）。fork 的 Perforce 定制（`Copy Changelist` 文案、`Changelist <n>` 标题、`View in Swarm` 入口、复制裸 changelist 数字）随之迁入共享函数——现在 Git Panel History 页的右键菜单在 Perforce 仓库下也获得同样定制；git 仓库行为逐字节不变（`revision_label` 为空时全部走原文案）。
     - **删除文件的 Perforce 记账**：upstream 把项目删除入口拆成可撤销的回收站路径（新的 Project Panel undo/redo 特性）与永久删除路径两个方法。fork 的「删除文件时 `p4 delete`」钩子同时挂到两条路径，与拆分前行为一致。已知边界：用 Project Panel 的 undo 恢复被回收的文件后，depot 侧的 open-for-delete 不会自动 revert，需要手工 `p4 revert`（拆分前的回收站删除同样如此，非本次合并引入）。
