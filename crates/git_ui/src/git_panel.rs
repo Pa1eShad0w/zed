@@ -8733,8 +8733,8 @@ impl Panel for GitPanel {
         // Hide the Git Panel dock icon when the active repo is Perforce — the dedicated Perforce
         // panel owns that workspace (the perforce repo implements GitRepository, so the Git Panel
         // would otherwise redundantly show perforce content and route history to perforce).
-        Some(ui::IconName::GitBranch)
-            .filter(|_| GitPanelSettings::get_global(cx).button && !self.active_is_perforce)
+        (GitPanelSettings::get_global(cx).button && !self.active_is_perforce)
+            .then_some(ui::IconName::GitBranch)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

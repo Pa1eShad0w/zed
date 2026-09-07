@@ -2006,7 +2006,7 @@ impl GitGraph {
                     subject_cell,
                     column_label(formatted_time.into()),
                     column_label(author_name),
-                    column_label(short_sha.into()),
+                    column_label(short_sha),
                 ];
                 // Perforce file history: prepend the Revision (#rev) column and append Branch.
                 if self.perforce_file_history {
@@ -3059,7 +3059,6 @@ impl GitGraph {
                                 )
                             })
                             .child({
-                                let copy_text = copy_text.clone();
                                 let copied_state: Entity<CopiedState> =
                                     window.use_keyed_state("sha-copy", cx, CopiedState::new);
                                 let is_copied = copied_state.read(cx).is_copied();
@@ -3080,7 +3079,7 @@ impl GitGraph {
                                 };
                                 let tooltip_meta = sha_label.clone();
 
-                                Button::new("sha-button", sha_label.clone())
+                                Button::new("sha-button", sha_label)
                                     .when_some(icon, |button, icon| {
                                         button.start_icon(
                                             Icon::new(icon)
