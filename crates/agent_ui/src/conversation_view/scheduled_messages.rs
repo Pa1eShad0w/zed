@@ -746,8 +746,8 @@ impl ThreadView {
         let chevron = ButtonLike::new_rounded_right("schedule-message-trigger")
             .layer(ElevationIndex::ModalSurface)
             .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-            .width(rems_from_px(20.))
-            .height(rems_from_px(20.).into())
+            .width(rems_from_px(20.0_f32))
+            .height(rems_from_px(20.0_f32).into())
             .child(
                 Icon::new(if menu_open {
                     IconName::ChevronUp

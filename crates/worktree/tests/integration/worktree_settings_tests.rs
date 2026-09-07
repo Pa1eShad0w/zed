@@ -20,6 +20,7 @@ fn make_settings_with_read_only(patterns: &[&str]) -> WorktreeSettings {
         .unwrap(),
         scan_symlinks: Default::default(),
         prefer_perforce_over_git: false,
+        file_scan_depth: None,
     }
 }
 
