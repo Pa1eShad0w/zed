@@ -523,8 +523,11 @@ message BlameEntry {
   string filename = 15;
   bool boundary = 16;
 
+  // Fork-only fields start at 1000 so upstream can keep appending low field numbers without
+  // colliding; a collision would silently change this message on the wire between versions.
+
   // VCS-specific revision label shown instead of the abbreviated sha (e.g. Perforce "@123").
-  optional string revision_label = 17;
+  optional string revision_label = 1000;
 }
 
 message CommitMessage {

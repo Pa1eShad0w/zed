@@ -1955,6 +1955,18 @@ impl GitStore {
             Ok(change) => change,
         };
 
+        // Awaited rather than peeked: the diff-base load short-circuits for symlinks, so the
+        // repository backend is not guaranteed to be resolved by the time the diff is built.
+        let resolve_perforce = this.read_with(cx, |this, cx| {
+            let buffer_id = buffer_entity.read(cx).remote_id();
+            this.repository_and_path_for_buffer_id(buffer_id, cx)
+                .map(|(repo, _)| repo.read(cx).is_perforce_resolved(cx))
+        })?;
+        let has_staging_index = match resolve_perforce {
+            Some(resolve_perforce) => !resolve_perforce.await,
+            None => true,
+        };
+
         this.update(cx, |this, cx| {
             let buffer = buffer_entity.read(cx);
             let buffer_id = buffer.remote_id();
@@ -1968,11 +1980,6 @@ impl GitStore {
 
             let git_store = cx.weak_entity();
             let project = this.project.clone();
-            // Resolved here rather than at render time: the repository backend has already been
-            // driven to completion by the diff-base load that precedes this call.
-            let has_staging_index = this
-                .repository_and_path_for_buffer_id(buffer_id, cx)
-                .is_none_or(|(repo, _)| !repo.read(cx).is_perforce());
             let diff_state = this
                 .diffs
                 .entry(buffer_id)
@@ -3548,6 +3555,17 @@ impl GitStore {
             .file()
             .is_none_or(|file| file.disk_state() == DiskState::New);
         if is_new {
+            return;
+        }
+        // Gate on the backend before dispatching anything: in a git or VCS-less workspace the
+        // open below resolves to a no-op, but the dispatch itself still costs a task on every
+        // buffer's first edit. `is_perforce` is a peek, so an edit made before the backend
+        // resolves dispatches nothing and is simply retried on the next edit; the pre-save hook
+        // is what guarantees the checkout happens either way.
+        let Some((repo, _)) = self.repository_and_path_for_project_path(&project_path, cx) else {
+            return;
+        };
+        if !repo.read(cx).is_perforce() {
             return;
         }
         // Mark first so a burst of edits doesn't queue duplicate `p4 edit` calls; the entry is
