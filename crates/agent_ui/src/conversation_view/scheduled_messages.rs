@@ -1018,11 +1018,13 @@ impl ThreadView {
                                                     )
                                                     .icon_size(IconSize::Small)
                                                     .tooltip(Tooltip::text("Send Now"))
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        this.send_scheduled_message_now(
-                                                            &id, window, cx,
-                                                        );
-                                                    })),
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.send_scheduled_message_now(
+                                                                &id, window, cx,
+                                                            );
+                                                        },
+                                                    )),
                                                 ),
                                         ),
                                     )

@@ -45,6 +45,13 @@
 
 ### Changed
 
+- `c8c8719e47` (2026-09-22) 合并 upstream 稳定版 v1.20.2（跨过 v1.19.1 / v1.19.2 / v1.20.1），fork 版本号升为 `1.20.2-fork.1`。Zed 的每个稳定版都从自己的分支切出，v1.18.1 并不是 v1.20.2 的祖先，因此合并基点落在更早的共同祖先上，两条线的改动都需要重新对齐；v1.18.1 独有的 15 个提交已逐一核对全部存在于 v1.20.2（12 个 patch 等价，editorconfig 查找修复与 OpenCode 会话头修复经 PR 编号与逐文件改动脚印比对确认，另一个是版本号 bump），没有丢失上游修复。用户可见的上游新增能力包括：Git 面板支持多选、克隆仓库时显示实时进度、文件 tab 与项目面板新增复制/打开永久链接、调用层级（incoming / outgoing calls）、未命名 buffer 自动识别语言、CSV/TSV 表格预览、Emmet wrap with abbreviation、可配置窗口标题（`window_title_format` / `window_title_separator`）、命令面板按使用频次排序、光标移动动画，以及大量 Git 修复（分支名与工作区路径同名时 History / 提交搜索 / 分支 diff 失效、partial clone 认不出 remote、bare 仓库的 linked worktree 命名、含大量冲突的 project diff 性能）。fork 侧的适配：
+    - **diff hunk 的暂存能力**：upstream 把 diff hunk 操作从 editor 的 trait 默认方法迁到 buffer diff 上，改用 `DiffOperations` 暴露 `supports_staging` / `supports_unstaging` / `supports_restore`。fork 原本散在 editor 里的两处 Perforce 特判（restore 时跳过 stage/unstage、隐藏 Stage 按钮）随之删除，改为在构造 diff 操作时记录该仓库有没有暂存区——Perforce 没有，于是上游那套能力判断天然得出正确结果，editor 层不再需要知道 Perforce 的存在。Restore 按钮在 Perforce 下仍显示为 "Revert"（上游无对应概念）。git 仓库的行为逐字节不变。
+    - **未保存内容的序列化上限**：upstream 去掉了 `Item::serialize` 的 window 参数并简化了任务结构，fork 的 50 MB 上限改在上游的后台任务里执行，与上游新增的「自动识别语言时不记录 plain text」逻辑并存。
+    - **设置项注册**：upstream 改用逐键枚举的扁平反序列化宏，fork 的 `auto_update_server_url` 与 `perforce` 两个顶层键已登记其中（漏登记会编译失败，不会静默丢值）。
+    - **Perforce 后端**：`GitRepository::load_commit` 新增 `ignore_shallow_boundary` 参数，Perforce 后端忽略它并始终报告非浅历史边界——depot 不存在浅克隆。
+- `796c9de41a` (2026-09-22) blame 数据里 fork 专用的修订标签（Perforce 的 `@<change>`）在 proto 上的字段号从 16 迁到 1000。upstream 在 v1.20.2 把 16 号分配给了新的 `boundary` 字段，两者线型不同（字符串 vs 布尔），混用会直接解析失败而不是静默读错。fork 专用字段今后统一从 1000 起编号，避免上游每次新增字段都逼着 fork 重新编号、而每次重编号都意味着一次无声的线上格式变更。**兼容性影响**：通过 remote server 或协作会话查看 blame 时，本次之前的 fork 构建与本次之后的 fork 构建不互通；客户端与 remote server 同版本发布的常规用法不受影响。
+
 - `f660477629` (2026-09-07) 合并 upstream 稳定版 v1.18.1，fork 版本升为 `1.18.1-fork.1`；保留 Perforce 自动 checkout、文件历史与注释、Agent 标题语言和定时消息，适配延迟仓库激活后的文件权限处理，并避免向 Perforce 用户提供无法使用的 Git 修订 blame 入口。
 - `f660477629` (2026-09-07) Markdown 行内代码改用 upstream 圆角背景绘制，取消两侧额外插入的显示空白；保留加深背景和 preview 段落行高，复制与双击选词继续准确对应代码内容。
 
@@ -90,6 +97,9 @@
 - `ddf4ff8259` (2026-06-27) Fork 频道下载二进制 SHA-256 强制校验：见 Added 中的 `ddf4ff8259` 条目；同 commit 还砍掉 Fork URL 中的 `metrics_id/system_id/is_staff` 三个 query 字段名，避免空字段名本身在内网/上游 nginx access_log 里成为 fork 客户端指纹。
 
 ### Fixed
+
+- `796c9de41a` (2026-09-22) 修复 Perforce 工作区里的 symlink 文件会拿到 Git 的暂存语义：会出现一个 Perforce 根本没有的 Stage 按钮，且 Restore 会经由 unstage 通路执行，在 Perforce 后端留下一个永远无法核销的 pending hunk。成因是判断「该仓库有没有暂存区」用的是对仓库后端的同步窥探，而后端解析是惰性的——三条打开 diff 的路径里有两条会先等待 diff 基线加载（这个等待顺带把后端解析驱动完成），唯独未暂存 diff 这条路径对 symlink 直接短路返回，窥探此时多半还没有答案，于是回落到 Git 语义。改为显式等待后端解析结果，三条路径一致。
+- `796c9de41a` (2026-09-22) Perforce「首次编辑即 checkout」的钩子此前只看 `perforce.edit_on_file_modified` 设置（默认开启），不看仓库后端是什么，因此在 git 工作区、甚至完全没有版本控制的目录里，每个 buffer 首次编辑都会派发一个任务，唯一的作用是发现自己无事可做。现在改为先确认仓库确实是已解析的 Perforce 后端再派发。这同时修好了 upstream v1.20.2 新增的粘贴缩进测试：buffer 编辑处理期间多派发任何一个任务，都会扰动测试执行器的调度，使 upstream 自动缩进用来争取同步完成的时间预算落空。后端尚未解析完成时发生的编辑不再派发，交由下一次编辑重试；真正保证 checkout 一定发生的始终是保存前的钩子。
 
 - `0f48289d94` (2026-08-26) 修复 fork 发版脚本 `bump-fork-version.ps1` 在只装了 Windows PowerShell 5.1（没有 PowerShell 7）的机器上跑不起来：脚本开头设置了 `$ErrorActionPreference = 'Stop'`，而 cargo-edit 探测行 `& cargo set-version --help *>$null` 在 5.1 下会把 cargo 的 stderr 输出（"no such command"）经重定向转成终止性 `NativeCommandError`，探测本该失败降级到正则改写 Cargo.toml 的 fallback，结果整个脚本直接中止。改为经 `cmd /c` 探测并在 cmd 内部重定向，stderr 不再进入 PowerShell 错误流，两种宿主（5.1 / 7+）下行为一致。
 - `4fe553f693` (2026-08-22) 修复 fork 发版脚本会「静默不发版」：`bump-fork-version.{ps1,sh}` 用 `git tag` 建的是轻量 tag，却用 `git push --follow-tags` 推送，而该参数按设计只推带注解的 tag，轻量 tag 被直接跳过。分支本身推送成功、git 返回 0、脚本里的退出码检查因此从不触发，最后仍无条件打印 `pushed v<tag>`。由于 CI 是靠 tag 触发的，这意味着版本号已经 bump 并推上远端、但安装包从未构建、Release 从未发布，且全程没有任何一处报错——发布这件事悄无声息地没有发生。现在改为在 push 时显式写出分支与 tag 两个 ref（轻量 / 带注解都能推），推送后再用 `git ls-remote` 确认 tag 确实落到远端，没落到就报错退出并给出需要重跑的确切命令；此时提交已经推上去了，所以提示里明确说明不要重复 bump 版本号。同步更新 `docs/release-process.fork.md` 中已失实的 `push --follow-tags` 描述。
