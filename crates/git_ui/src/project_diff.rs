@@ -9,12 +9,11 @@ use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
 use collections::HashSet;
 use editor::{
-    Editor, EditorEvent, SplittableEditor, UncommittedDiffHunkDelegate,
+    DefaultDiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
 use git::{
-    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext,
-    repository::RepoPath,
+    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
 };
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
@@ -80,6 +79,7 @@ pub struct ProjectDiff {
     /// and the tab is never reused as — or serialized like — the global
     /// "Uncommitted Changes" diff. `None` on every git/whole-repo code path.
     scope_title: Option<SharedString>,
+    _diff_event_subscription: Subscription,
     _diff_observation: Subscription,
 }
 
@@ -305,7 +305,7 @@ impl ProjectDiff {
                 Capability::ReadWrite,
                 "No uncommitted changes",
                 move |editor, cx| {
-                    editor.set_diff_hunk_delegate(Some(Arc::new(UncommittedDiffHunkDelegate)), cx);
+                    editor.set_diff_hunk_renderer(Some(Arc::new(DefaultDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |rhs_editor, _cx| {
                         rhs_editor.set_read_only(false);
                         rhs_editor.register_addon(GitPanelAddon {
@@ -328,13 +328,19 @@ impl ProjectDiff {
         workspace: Entity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observation = cx.observe(&diff, |_, _, cx| cx.notify());
+        let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
+            if event == &(EditorEvent::SelectionsChanged { local: true }) {
+                cx.emit(event.clone())
+            }
+        });
+        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
         Self {
             project,
             workspace: workspace.downgrade(),
             diff,
             scope_title: None,
-            _diff_observation: observation,
+            _diff_event_subscription: diff_event_subscription,
+            _diff_observation: diff_observation,
         }
     }
 
@@ -706,7 +712,6 @@ impl SerializableItem for ProjectDiff {
         _: &mut Workspace,
         _: workspace::ItemId,
         _: bool,
-        _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         // A changelist-scoped tab must not be serialized: `deserialize` only
@@ -1651,8 +1656,20 @@ mod tests {
         );
 
         let project = Project::test(fs, [Path::new(path!("/a"))], cx).await;
+        let (created_entry_id, changed_entry_id) = project.read_with(cx, |project, cx| {
+            let entry_id = |path| {
+                let project_path = project
+                    .find_project_path(path, cx)
+                    .expect("diff path should resolve");
+                project
+                    .entry_for_path(&project_path, cx)
+                    .expect("diff path should have a project entry")
+                    .id
+            };
+            (entry_id(path!("/a/a.txt")), entry_id(path!("/a/b.txt")))
+        });
         let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         cx.run_until_parked();
@@ -1682,6 +1699,10 @@ mod tests {
             ˇcreated
         "
         ));
+        assert_eq!(
+            project.read_with(&cx.cx, |project, _| project.active_entry()),
+            Some(created_entry_id)
+        );
 
         cx.dispatch_action(editor::actions::GoToPreviousHunk);
 
@@ -1696,6 +1717,10 @@ mod tests {
             created
         "
         ));
+        assert_eq!(
+            project.read_with(&cx.cx, |project, _| project.active_entry()),
+            None
+        );
 
         cx.dispatch_action(editor::actions::GoToPreviousHunk);
 
@@ -1710,6 +1735,42 @@ mod tests {
             created
         "
         ));
+        assert_eq!(
+            project.read_with(&cx.cx, |project, _| project.active_entry()),
+            Some(changed_entry_id)
+        );
+
+        cx.cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Split);
+                });
+            });
+        });
+        cx.cx.run_until_parked();
+
+        let lhs_editor = item.read_with(&cx.cx, |item, cx| {
+            item.editor(cx)
+                .read(cx)
+                .lhs_editor()
+                .cloned()
+                .expect("split diff should have a left editor")
+        });
+        let mut lhs_cx = EditorTestContext::for_editor_in(lhs_editor, &mut cx.cx).await;
+        lhs_cx.update_editor(|editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([multi_buffer::Anchor::Max..multi_buffer::Anchor::Max]);
+            });
+        });
+        lhs_cx.update_editor(|editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([multi_buffer::Anchor::Min..multi_buffer::Anchor::Min]);
+            });
+        });
+        assert_eq!(
+            project.read_with(&lhs_cx.cx, |project, _| project.active_entry()),
+            Some(changed_entry_id)
+        );
     }
 
     #[gpui::test]

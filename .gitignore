@@ -69,3 +69,4 @@ crates/docs_preprocessor/actions.json
 /inno/
 
 .local*
+.cache

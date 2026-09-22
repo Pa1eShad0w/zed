@@ -1036,6 +1036,8 @@ fn build_p4_blame_mapped(
             summary,
             previous: None,
             filename: filename.clone(),
+            // Shallow-history boundaries are a git concept; a depot always has full history.
+            boundary: false,
             revision_label: Some(format!("@{change}")),
         });
     }
@@ -1810,7 +1812,13 @@ impl GitRepository for PerforceRepository {
     /// lists the changed files (depot paths + their revs); `where` maps those to workspace repo
     /// paths (without hardcoding the stream root); `print` fetches the new (`#rev`) and old
     /// (`#rev-1`) content for the editor to diff.
-    fn load_commit(&self, commit: String, _cx: AsyncApp) -> BoxFuture<'_, Result<CommitDiff>> {
+    fn load_commit(
+        &self,
+        commit: String,
+        // Shallow clones are a git concept; a Perforce depot always has full history.
+        _ignore_shallow_boundary: bool,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
         let cli = self.cli.clone();
         let client_name = self.client_name.clone();
         self.cli
@@ -1825,7 +1833,10 @@ impl GitRepository for PerforceRepository {
                 let describe_out = cli.run(true, &["describe", "-s", &change_str]).await?;
                 let files = parse_describe_files(&describe_out);
                 if files.is_empty() {
-                    return Ok(CommitDiff { files: Vec::new() });
+                    return Ok(CommitDiff {
+                        files: Vec::new(),
+                        is_shallow_boundary: false,
+                    });
                 }
 
                 // One `p4 where` maps every depot path in the change to its client path.
@@ -1868,6 +1879,7 @@ impl GitRepository for PerforceRepository {
                 }
                 Ok(CommitDiff {
                     files: commit_files,
+                    is_shallow_boundary: false,
                 })
             })
             .boxed()

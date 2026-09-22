@@ -1774,7 +1774,21 @@ impl BufferStore {
                     let new_path = file.path.clone();
 
                     buffer.file_updated(Arc::new(file), cx);
-                    if old_file.as_ref().is_none_or(|old| *old.path() != new_path) {
+                    if old_file.as_ref().is_none_or(|old| {
+                        if *old.path() == new_path {
+                            return false;
+                        }
+
+                        let old_path = ProjectPath {
+                            worktree_id: old.worktree_id(cx),
+                            path: old.path().clone(),
+                        };
+
+                        if this.path_to_buffer_id.get(&old_path) == Some(&buffer_id) {
+                            this.path_to_buffer_id.remove(&old_path);
+                        }
+                        true
+                    }) {
                         Some(old_file)
                     } else {
                         None
@@ -1872,7 +1886,7 @@ impl BufferStore {
     ) -> Result<()> {
         let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
         let version = deserialize_version(&envelope.payload.version);
-        let mtime = envelope.payload.mtime.clone().map(|time| time.into());
+        let mtime = envelope.payload.mtime.map(|time| time.into());
         this.update(&mut cx, move |this, cx| {
             if let Some(buffer) = this.get_possibly_incomplete(buffer_id) {
                 buffer.update(cx, |buffer, cx| {
@@ -1901,9 +1915,10 @@ impl BufferStore {
     ) -> Result<()> {
         let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
         let version = deserialize_version(&envelope.payload.version);
-        let mtime = envelope.payload.mtime.clone().map(|time| time.into());
+        let mtime = envelope.payload.mtime.map(|time| time.into());
         let line_ending = deserialize_line_ending(
-            proto::LineEnding::from_i32(envelope.payload.line_ending)
+            proto::LineEnding::try_from(envelope.payload.line_ending)
+                .ok()
                 .context("missing line ending")?,
         );
         this.update(&mut cx, |this, cx| {
@@ -2038,6 +2053,18 @@ impl BufferStore {
 
     pub fn forget_shared_buffers_for(&mut self, peer_id: &proto::PeerId) {
         self.shared_buffers.remove(peer_id);
+    }
+
+    pub fn is_shared(&self, buffer_id: BufferId, cx: &App) -> bool {
+        self.shared_buffers
+            .values()
+            .any(|buffers| buffers.contains_key(&buffer_id))
+            || self.as_remote().is_some_and(|remote| {
+                remote
+                    .shared_with_me
+                    .iter()
+                    .any(|buffer| buffer.read(cx).remote_id() == buffer_id)
+            })
     }
 
     pub fn update_peer_id(&mut self, old_peer_id: &proto::PeerId, new_peer_id: proto::PeerId) {
