@@ -6924,6 +6924,124 @@ async fn test_file_scan_depth_inside_repo(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_file_scan_depth_inside_perforce_workspace(cx: &mut TestAppContext) {
+    init_test(cx);
+    set_file_scan_depth(cx, Some(2));
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(SplicingVec::from(vec![
+                    "**/.*".to_string(),
+                    "generated".to_string(),
+                ]));
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".p4config": "P4CLIENT=demo\n",
+            ".gitignore": "/Library/\n",
+            "Library": { "cache": { "ignored.cs": "" } },
+            "generated": { "excluded.cs": "" },
+            "src": { "gameplay": { "actions": { "Action.cs": "class Action {}" } } }
+        }),
+    )
+    .await;
+    fs.set_readonly(path!("/root/src/gameplay/actions/Action.cs"), true);
+
+    let tree = build_worktree(fs.clone(), path!("/root"), cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.files(false, 0)
+                .map(|entry| entry.path.as_ref())
+                .collect::<Vec<_>>(),
+            vec![rel_path("src/gameplay/actions/Action.cs")]
+        );
+        assert_eq!(tree.entry_for_path(rel_path(".p4config")), None);
+        assert_eq!(tree.entry_for_path(rel_path("generated")), None);
+        let ignored = tree.entry_for_path(rel_path("Library")).unwrap();
+        assert!(ignored.is_ignored);
+        assert_eq!(ignored.kind, EntryKind::UnloadedDir);
+        assert_eq!(tree.entry_for_path(rel_path("Library/cache")), None);
+        assert_eq!(tree.deferred_scan_dir_count(), 0);
+    });
+
+    // Filesystem events must use the same repository boundary as the initial scan.
+    fs.insert_tree(
+        path!("/root/src/runtime"),
+        json!({ "nested": { "Added.cs": "class Added {}" } }),
+    )
+    .await;
+    cx.run_until_parked();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("src/runtime/nested/Added.cs"))
+                .is_some()
+        );
+    });
+
+    set_file_scan_depth(cx, Some(1));
+    cx.run_until_parked();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.files(false, 0)
+                .map(|entry| entry.path.as_ref())
+                .collect::<Vec<_>>(),
+            vec![
+                rel_path("src/gameplay/actions/Action.cs"),
+                rel_path("src/runtime/nested/Added.cs"),
+            ]
+        );
+        assert_eq!(tree.deferred_scan_dir_count(), 0);
+    });
+}
+
+#[gpui::test]
+async fn test_file_scan_depth_nested_perforce_workspace(cx: &mut TestAppContext) {
+    init_test(cx);
+    set_file_scan_depth(cx, Some(2));
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "repo": {
+                ".p4config": "P4CLIENT=demo\n",
+                "src": { "nested": { "deep.cs": "class Deep {}" } }
+            },
+            "repo-other": {
+                "src": { "nested": { "deferred.cs": "" } }
+            }
+        }),
+    )
+    .await;
+
+    let tree = build_worktree(fs, path!("/root"), cx).await;
+
+    tree.read_with(cx, |tree, _| {
+        assert!(
+            tree.entry_for_path(rel_path("repo/src/nested/deep.cs"))
+                .is_some()
+        );
+        let deferred = tree.entry_for_path(rel_path("repo-other/src")).unwrap();
+        assert_eq!(deferred.kind, EntryKind::UnloadedDir);
+        assert!(!deferred.is_ignored);
+        assert_eq!(tree.entry_for_path(rel_path("repo-other/src/nested")), None);
+        assert_eq!(tree.deferred_scan_dir_count(), 1);
+    });
+}
+
+#[gpui::test]
 async fn test_file_scan_depth_inside_ancestor_repo(cx: &mut TestAppContext) {
     init_test(cx);
     set_file_scan_depth(cx, Some(1));

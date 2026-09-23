@@ -161,8 +161,9 @@ pub struct WorktreeSettingsContent {
     /// Default: expanded
     pub scan_symlinks: Option<ScanSymlinksSetting>,
 
-    /// Maximum directory depth to eagerly index outside of git repositories;
-    /// contents of directories at this depth or deeper are indexed on demand.
+    /// Maximum directory depth to eagerly index outside of Git repositories and
+    /// discovered Perforce workspaces; contents of directories at this depth or
+    /// deeper are indexed on demand.
     /// Repositories rooted shallower than this depth are always indexed fully.
     /// In projects that are not rooted at a git repository, repositories directly
     /// inside a root folder activate their git features immediately; deeper ones

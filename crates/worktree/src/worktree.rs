@@ -6394,8 +6394,17 @@ impl BackgroundScanner {
         entry: &Entry,
         in_repo: bool,
     ) -> bool {
-        let beyond_scan_depth =
-            !in_repo && is_beyond_scan_depth(self.settings.file_scan_depth, &entry.path);
+        // Perforce repositories are registered in the snapshot, not in Git's ignore stack.
+        let beyond_scan_depth = !in_repo
+            && is_beyond_scan_depth(self.settings.file_scan_depth, &entry.path)
+            && !state.snapshot.git_repositories.values().any(|repository| {
+                repository.work_directory.directory_contains(&entry.path)
+                    && repository
+                        .dot_git_abs_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(git::perforce::is_p4_config_name)
+            });
         let scannable = state.scanning_enabled
             && (!entry.is_external
                 || self.settings.scan_symlinks == settings::ScanSymlinksSetting::Always)

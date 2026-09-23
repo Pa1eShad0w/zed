@@ -2294,7 +2294,7 @@ The `"..."` entry expands to the list you are overriding, so the example above e
 ## File Scan Depth
 
 - Setting: `file_scan_depth`
-- Description: Maximum directory depth that Zed eagerly indexes outside of git repositories. Directories at this depth or deeper are indexed on demand: when expanded in the project panel or when a file inside them is opened. Contents of directories that were not indexed yet are invisible to the file finder and project search. When directories get deferred, the status bar of the affected window shows a brief "Partial file index" message. Set to `0` to always index everything eagerly and activate all git repositories immediately.
+- Description: Maximum directory depth that Zed eagerly indexes outside of Git repositories and discovered Perforce workspaces. Directories at this depth or deeper are indexed on demand: when expanded in the project panel or when a file inside them is opened. Contents of directories that were not indexed yet are invisible to the file finder and project search. When directories get deferred, the status bar of the affected window shows a brief "Partial file index" message. Set to `0` to always index everything eagerly and activate all git repositories immediately.
 - Default: `5`
 
 ```json [settings]
@@ -2305,16 +2305,19 @@ The `"..."` entry expands to the list you are overriding, so the example above e
 
 How the limit applies, case by case:
 
-| Case                                                                    | Behavior                                                                                                    |
-| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Project rooted at a git repository, or at a subdirectory of one         | Indexed fully, the limit never applies                                                                      |
-| Git repository rooted shallower than the limit (e.g. a repo under `~/`) | Its whole subtree is indexed fully, no matter how deep                                                      |
-| Git repository rooted at or deeper than the limit                       | Not discovered eagerly; opening any file inside it registers it and indexes its whole subtree from then on  |
-| Non-git tree shallower than the limit                                   | Indexed fully, nothing changes                                                                              |
-| Non-git tree deeper than the limit (e.g. `~/`, `/`, large datasets)     | Indexed up to the limit, the rest on demand; unindexed contents are invisible to the file finder and search |
-| Gitignored directories                                                  | Indexed on demand regardless of this setting, as always                                                     |
-| `file_scan_inclusions` matches                                          | Always indexed, regardless of depth                                                                         |
-| `file_scan_exclusions` matches                                          | Never indexed, regardless of depth                                                                          |
+| Case                                                                     | Behavior                                                                                                    |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Project rooted at a git repository, or at a subdirectory of one          | Indexed fully, the limit never applies                                                                      |
+| Git repository rooted shallower than the limit (e.g. a repo under `~/`)  | Its whole subtree is indexed fully, no matter how deep                                                      |
+| Git repository rooted at or deeper than the limit                        | Not discovered eagerly; opening any file inside it registers it and indexes its whole subtree from then on  |
+| Discovered Perforce workspace                                            | Exempt from the depth limit when scanned; ignore rules, exclusions, and symbolic link settings still apply  |
+| Tree outside Git and discovered Perforce roots, shallower than the limit | Indexed fully, nothing changes                                                                              |
+| Tree outside Git and discovered Perforce roots, deeper than the limit    | Indexed up to the limit, the rest on demand; unindexed contents are invisible to the file finder and search |
+| Gitignored directories                                                   | Indexed on demand regardless of this setting, as always                                                     |
+| `file_scan_inclusions` matches                                           | Always indexed, regardless of depth                                                                         |
+| `file_scan_exclusions` matches                                           | Never indexed, regardless of depth                                                                          |
+
+Perforce workspaces are recognized by their `P4CONFIG` marker (normally `.p4config`). Workspace roots at or deeper than the limit are not discovered eagerly. Once a workspace is registered, its contents are exempt from the depth limit, but ignore rules, `file_scan_exclusions`, and symbolic link settings still apply. If you add a Perforce marker while a project is open, reopen the project to ensure previously deferred folders are scanned.
 
 Directories loaded on demand stay indexed, but are deferred again after a restart or after a settings change triggers a worktree rescan.
 
