@@ -6,7 +6,7 @@ Runbook for cutting a fork release. Use this every time you want a new `vX.Y.Z-f
 
 - `cargo` + `git` on `PATH`
 - `cargo-edit` recommended: `cargo install cargo-edit`. Without it, the bump script falls back to a regex rewrite of `crates/zed/Cargo.toml` + `Cargo.lock` — works but less robust.
-- Push permission on the release branch (`perforce-integration` or, during the in-progress fork-update-system migration, also `fork-update-system`).
+- Push permission on `main`, the only release branch.
 - `$GIT_EDITOR` or `$EDITOR` set. PowerShell falls back to `notepad`; bash falls back to `vi`. Editor must exit non-zero when the user aborts (any sane editor does).
 - Inno Setup 6 + Visual Studio 2022 with the C++ desktop workload are needed only for the **CI** build. Your local machine does not need them to cut a release.
 
@@ -46,7 +46,7 @@ The intranet pull worker mirrors the release within its poll interval (default 5
 The bump script's Step 0 will hard-fail before touching `Cargo.toml` if any of these hold:
 
 - **Working tree or staged area not clean** — keeps WIP out of the release commit.
-- **Branch is not `perforce-integration` or `fork-update-system`** — release tags must originate from the release branch.
+- **Branch is not `main`** — release tags must originate from `main`. The script still accepts the legacy `perforce-integration` / `fork-update-system` branches until those refs are deleted from the remote; do not release from them.
 - **`git fetch origin <branch>` fails** — push will fail anyway; better to know now.
 - **Local is behind origin** — non-fast-forward push would leave a tag that points at a commit not on origin.
 - **Local or remote tag `v<new>` already exists** — tags are immutable in this workflow.
@@ -98,6 +98,6 @@ If the workflow succeeds but the intranet client does not see the new release wi
 
 ## What humans never do
 
-- **Force-push** `perforce-integration` or `fork-update-system`.
+- **Force-push** `main`.
 - **Delete and recreate** an existing tag.
 - **Hand-edit** the published release notes on GitHub. The intranet `notes.md` mirror is generated from the GitHub Release body via the worker, but only at pull time; later edits do not propagate without manual intervention.
