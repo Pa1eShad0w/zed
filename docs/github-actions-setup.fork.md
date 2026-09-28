@@ -4,9 +4,9 @@ One-time runbook for the maintainer adopting this fork in a new GitHub organisat
 
 ## Branch protection
 
-Recommended for `perforce-integration` (or whatever the live release branch is named in your org):
+Recommended for `main`, the only release branch:
 
-- **Require linear history** if your workflow allows it. This makes the relationship between bump commits and tags one-to-one.
+- **Do not require linear history.** Upstream uptakes and feature branches land on `main` with `merge --no-ff`, so `main` must accept merge commits.
 - **Disallow force-push by everyone except maintainers.** Force-push to a branch that has tags pointing into it would orphan releases.
 - **Require status checks before merge** — outside the scope of this fork-update-system spec, but recommended for PR-driven workflows. Match whatever the rest of your org does.
 
