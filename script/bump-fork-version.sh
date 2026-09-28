@@ -5,10 +5,12 @@
 #
 # POSIX equivalent of bump-fork-version.ps1. Same flow:
 #   Step 0  Preconditions (fail-early; do NOT touch Cargo.toml until all pass)
-#   Step 1  Parse current version, compute next "<base>-fork.<N+1>"
+#   Step 1  Parse current version; release it as-is if its tag is not on
+#           origin yet, otherwise compute next "<base>-fork.<N+1>"
 #   Step 2  Open $EDITOR for release notes (template with comment lines)
 #   Step 3  Strip comment lines + ASCII-only check + non-empty check
 #   Step 4  Bump crates/zed/Cargo.toml + Cargo.lock to the new version
+#           (skipped when releasing the current version)
 #   Step 5  git commit "Bump to <new>\n\n<notes>"
 #   Step 6  git tag v<new>
 #   Step 7  git push origin <branch> <tag>, then verify the tag landed
@@ -79,7 +81,20 @@ if [[ ! "$current" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-fork\.([0-9]+)$ ]]; then
 fi
 base="${BASH_REMATCH[1]}"
 forkN="${BASH_REMATCH[2]}"
-new="${base}-fork.$((forkN + 1))"
+
+# An upstream uptake sets the manifest to an unpublished `<base>-fork.1`; release
+# that version instead of skipping it. Only a tag that reached origin counts as
+# published, so an interrupted push is resumed rather than superseded.
+current_tag="v$current"
+# A failed lookup must not read as "unpublished": that would re-release a published version.
+remote_current=$(git ls-remote --tags origin "$current_tag") || fail "git ls-remote origin failed."
+if [ -n "$remote_current" ]; then
+    new="${base}-fork.$((forkN + 1))"
+elif git rev-parse --verify --quiet "refs/tags/$current_tag" >/dev/null; then
+    fail "Local tag $current_tag is not on origin. If it marks an interrupted release, finish it with: git push origin $current_tag"
+else
+    new="$current"
+fi
 new_tag="v$new"
 
 if git rev-parse --verify --quiet "$new_tag" >/dev/null 2>&1; then
@@ -138,7 +153,9 @@ fi
 # Step 4  Bump Cargo.toml + Cargo.lock
 # ---------------------------------------------------------------------------
 
-if [ "$have_cargo_edit" -eq 1 ]; then
+if [ "$new" = "$current" ]; then
+    : # Releasing the current version: the manifest already carries it.
+elif [ "$have_cargo_edit" -eq 1 ]; then
     cargo set-version -p zed "$new"
 else
     # Regex fallback via tmp-file + mv (portable across GNU/BSD sed quirks and
@@ -180,7 +197,12 @@ fi
 
 git add "$cargo_path" Cargo.lock
 
-git commit -m "Bump to $new
+# CI reads the release notes from the tagged commit's body, so releasing the
+# current version still needs a commit even though no file changes.
+commit_flags=()
+[ "$new" = "$current" ] && commit_flags=(--allow-empty)
+
+git commit ${commit_flags[@]+"${commit_flags[@]}"} -m "Bump to $new
 
 $notes"
 
@@ -196,4 +218,4 @@ if [ -z "$(git ls-remote --tags origin "$new_tag")" ]; then
     fail "$new_tag is missing on origin after push. The commit is pushed; re-run: git push origin $new_tag"
 fi
 
-echo "Bumped to $new and pushed $new_tag. CI will build and publish the release."
+echo "Released $new and pushed $new_tag. CI will build and publish the release."

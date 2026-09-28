@@ -78,8 +78,8 @@ Record material user-facing changes in CHANGELOG.fork.md using Chinese entries, 
 Local landing and publication are separate actions. Honor any existing explicit publication authorization; otherwise prepare a concrete proposal and obtain the user's requested confirmation before commit/push/tag actions covered by that confirmation. Include version, exact remote/refs, candidate identity, release commit message/body, validation gaps and automation side effects.
 
 Read the current scripts and workflow rather than trusting stale runbook prose:
-- Current bump scripts increment fork.N, commit, create a lightweight tag and push in one invocation. They are not preparation/dry-run commands.
-- An uptake may already contain the intended first unpublished fork version. Do not accidentally increment it again. Explicitly confirm whether to release that version with equivalent manual checks or run the script to increment it.
+- The bump scripts commit, create a lightweight tag and push in one invocation. They are not preparation/dry-run commands.
+- They release the manifest version as-is when its tag is not on origin (the uptake's unpublished X.Y.Z-fork.1), increment fork.N when it is, and refuse when the tag exists only locally (finish that push instead). Check which case applies before running.
 - The current release workflow reads the TAGGED COMMIT BODY for notes. Prepare nonempty English ASCII notes there; an annotated-tag message or empty merge-commit body does not satisfy it.
 - Check tag uniqueness locally and remotely, main ancestry, clean status, matching manifest/lockfile/tag versions and origin/main freshness immediately before publication.
 - Push only the approved branch and exact tag, explicitly. Lightweight tags are not sent by --follow-tags. Never use --all, --tags or force for this workflow.
