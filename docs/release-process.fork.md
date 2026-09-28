@@ -22,6 +22,12 @@ Runbook for cutting a fork release. Use this every time you want a new `vX.Y.Z-f
 
 The script does everything: preconditions → editor for release notes → bump `crates/zed/Cargo.toml` and `Cargo.lock` → commit → tag `v<new>` → push the branch and the tag, then confirm the tag is on the remote.
 
+Which version it releases depends on whether the current manifest version has been published, i.e. whether its tag is on origin:
+
+- **Published** (the normal case after a release) — bumps to `<x.y.z>-fork.<N+1>`.
+- **Not published** (right after an upstream uptake, which sets `<x.y.z>-fork.1`) — releases the current version as-is: no manifest change, an empty `Bump to <version>` commit carrying the release notes, and the tag.
+- **Tag exists only locally** — refuses to run, because an earlier release push was interrupted; finish it with `git push origin v<version>` instead of cutting a new version.
+
 The tag is what triggers CI, so the script fails loudly if it is not on the remote after the push. If that happens the commit is already pushed and only the tag is missing — re-run `git push origin v<new>`; do not bump the version again.
 
 GitHub Actions picks up the tag and runs `.github/workflows/release-fork.yml`. ~15-20 min on `windows-latest`. Watch the run at `https://github.com/<org>/<fork>/actions`.
