@@ -1460,20 +1460,18 @@ macro_rules! unsupported_result {
 
 impl GitRepository for PerforceRepository {
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
-        // `p4 opened` lists exactly the files open in this client. A full listing is
-        // always correct (the caller merges per-path), so scoping to the changed paths is
-        // a pure optimization: for small incremental refreshes (the steady state — user
-        // edits a handful of files) we restrict the query, avoiding a full re-list on
-        // every keystroke. A large set (e.g. the initial scan) falls back to one full
-        // listing, which is cheaper than batching hundreds of path arguments.
-        //
-        // NOTE: read-only-bit pre-filtering and a persistent `p4` connection are further
-        // optimizations tracked for later.
+        // Prefixes describe subtrees, while a p4 filespec without `...` is an
+        // exact path. Keep small refreshes scoped; root and large refreshes use
+        // one explicit client-wide query instead of an unqualified `opened`.
         const SCOPED_CAP: usize = 64;
         let cli = self.cli.clone();
         let client_name = self.client_name.clone();
         let n_prefixes = path_prefixes.len();
-        let scoped: Option<Vec<String>> = if (1..=SCOPED_CAP).contains(&n_prefixes) {
+        let is_scoped = (1..=SCOPED_CAP).contains(&n_prefixes)
+            && !path_prefixes
+                .iter()
+                .any(|path| path.as_unix_str().is_empty());
+        if is_scoped {
             // 3a — read-only-bit pre-filter: Perforce keeps un-opened files read-only on
             // disk and makes opened (edit/add) files writable. For a scoped refresh we can
             // therefore prove, purely from on-disk permissions, whether *any* candidate
@@ -1496,21 +1494,26 @@ impl GitRepository for PerforceRepository {
                     })
                 });
             }
-            Some(
-                path_prefixes
-                    .iter()
-                    .map(|p| self.client_syntax_path(p))
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        self.cli.executor.clone().spawn(async move {
-            let mut args: Vec<String> = vec!["opened".into()];
-            let is_scoped = scoped.is_some();
-            if let Some(paths) = scoped {
-                args.extend(paths);
+        }
+        let mut args = vec!["opened".to_string()];
+        if is_scoped {
+            for path in path_prefixes {
+                let filespec = self.client_syntax_path(path);
+                match std::fs::symlink_metadata(self.working_directory.join(path.as_std_path())) {
+                    Ok(metadata) if metadata.is_file() => args.push(filespec),
+                    _ => {
+                        // A directory may replace an opened-for-delete file; missing
+                        // paths can also be either files or directories. Include the
+                        // path itself and descendants without widening to its parent.
+                        args.push(filespec.clone());
+                        args.push(format!("{filespec}/..."));
+                    }
+                }
             }
+        } else {
+            args.push(format!("//{client_name}/..."));
+        }
+        self.cli.executor.clone().spawn(async move {
             let (stdout, _stderr, _ok) = cli.run_lenient(true, &args).await?;
             let status = parse_opened_status(&client_name, &stdout);
             log::debug!(
@@ -2645,6 +2648,222 @@ mod tests {
             &["content.bin"]
         };
         assert_eq!(cli.run_bytes(false, args).await.unwrap(), bytes);
+    }
+
+    fn status_test_repository(
+        cx: &mut gpui::TestAppContext,
+        opened: &str,
+    ) -> (tempfile::TempDir, PerforceRepository) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("opened.txt"), opened).unwrap();
+        // Return the scoped response only for the exact expected command. In
+        // particular, neither an unscoped query nor a non-recursive root is valid.
+        let script = if cfg!(windows) {
+            "@echo off\r\n(for %%A in (%*) do @echo %%~A)>actual-args.txt\r\nfc /b expected-args.txt actual-args.txt >nul\r\nif errorlevel 1 exit /b 1\r\ntype opened.txt\r\n"
+        } else {
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >actual-args.txt\ncmp -s expected-args.txt actual-args.txt || exit 1\ncat opened.txt\n"
+        };
+        let binary = directory.path().join(if cfg!(windows) {
+            "fake-p4.cmd"
+        } else {
+            "fake-p4"
+        });
+        std::fs::write(&binary, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repository = PerforceRepository::new(
+            binary,
+            PerforceWorkspace {
+                client_root: directory.path().to_path_buf(),
+                client_name: "some_client_name".into(),
+            },
+            Arc::default(),
+            50,
+            directory.path().join(".p4config"),
+            cx.background_executor.clone(),
+        );
+        (directory, repository)
+    }
+
+    async fn query_status_for_test(
+        directory: &Path,
+        repository: &PerforceRepository,
+        prefixes: &[RepoPath],
+        filespecs: &[&str],
+    ) -> GitStatus {
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        let mut arguments = format!("-ztag{newline}opened{newline}");
+        for filespec in filespecs {
+            arguments.push_str(&format!("//some_client_name/{filespec}{newline}"));
+        }
+        std::fs::write(directory.join("expected-args.txt"), &arguments).unwrap();
+        let status = repository.status(prefixes).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("actual-args.txt")).unwrap(),
+            arguments,
+            "prefixes: {prefixes:?}"
+        );
+        status
+    }
+
+    #[gpui::test]
+    async fn status_prefixes_include_descendants(cx: &mut gpui::TestAppContext) {
+        let (directory, repository) = status_test_repository(cx, OPENED_FIXTURE);
+        std::fs::create_dir(directory.path().join("a")).unwrap();
+        std::fs::write(directory.path().join("a/added.md"), "new file").unwrap();
+        let cases = [
+            (
+                vec![repo_path("")],
+                vec!["..."],
+                vec!["a/added.md", "b/edited.cpp", "c/gone.txt"],
+            ),
+            (
+                vec![],
+                vec!["..."],
+                vec!["a/added.md", "b/edited.cpp", "c/gone.txt"],
+            ),
+            (
+                vec![repo_path("a"), repo_path("")],
+                vec!["..."],
+                vec!["a/added.md", "b/edited.cpp", "c/gone.txt"],
+            ),
+            (vec![repo_path("a")], vec!["a", "a/..."], vec!["a/added.md"]),
+            // Missing paths can be deleted files or deleted directories.
+            (vec![repo_path("c")], vec!["c", "c/..."], vec!["c/gone.txt"]),
+            (
+                vec![repo_path("c/gone.txt")],
+                vec!["c/gone.txt", "c/gone.txt/..."],
+                vec!["c/gone.txt"],
+            ),
+            (
+                vec![repo_path("a/added.md")],
+                vec!["a/added.md"],
+                vec!["a/added.md"],
+            ),
+            (
+                vec![repo_path("a/added")],
+                vec!["a/added", "a/added/..."],
+                vec![],
+            ),
+            (
+                vec![repo_path("a"), repo_path("a/added.md"), repo_path("b")],
+                vec!["a", "a/...", "a/added.md", "b", "b/..."],
+                vec!["a/added.md", "b/edited.cpp"],
+            ),
+            (
+                vec![repo_path("missing")],
+                vec!["missing", "missing/..."],
+                vec![],
+            ),
+        ];
+        for (prefixes, filespecs, expected) in cases {
+            let response = OPENED_FIXTURE
+                .split("\n\n")
+                .filter(|record| {
+                    expected.iter().any(|path| {
+                        record
+                            .lines()
+                            .any(|line| line == format!("... clientFile //some_client_name/{path}"))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            std::fs::write(directory.path().join("opened.txt"), response).unwrap();
+            let status =
+                query_status_for_test(directory.path(), &repository, &prefixes, &filespecs).await;
+            let paths: Vec<_> = status
+                .entries
+                .iter()
+                .map(|(path, _)| path.as_unix_str())
+                .collect();
+            assert_eq!(paths, expected, "prefixes: {prefixes:?}");
+        }
+    }
+
+    #[gpui::test]
+    async fn status_refresh_keeps_all_changelist_paths(cx: &mut gpui::TestAppContext) {
+        let mut opened = String::new();
+        for index in 0..32 {
+            let action = if index < 13 { "add" } else { "edit" };
+            opened.push_str(&format!(
+                "... clientFile //some_client_name/source/file{index:02}.cs\n... action {action}\n... change 42\n\n"
+            ));
+        }
+        let (directory, repository) = status_test_repository(cx, &opened);
+        std::fs::create_dir(directory.path().join("source")).unwrap();
+        let changes = parse_pending_changes("... change 42\n... desc Test changelist\n");
+        let groups = build_changelists("some_client_name", &opened, &changes, Vec::new());
+        let changelist = groups
+            .iter()
+            .find(|group| group.id == ChangelistId::Numbered(42))
+            .unwrap();
+        let expected: Vec<_> = changelist
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        assert_eq!(expected.len(), 32);
+        for (prefixes, filespecs) in [
+            (vec![repo_path("")], vec!["..."]),
+            (vec![repo_path("source")], vec!["source", "source/..."]),
+            (vec![repo_path("")], vec!["..."]),
+        ] {
+            let status =
+                query_status_for_test(directory.path(), &repository, &prefixes, &filespecs).await;
+            let paths: Vec<_> = status
+                .entries
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(paths, expected);
+        }
+    }
+
+    #[gpui::test]
+    async fn status_keeps_deleted_file_replaced_by_directory(cx: &mut gpui::TestAppContext) {
+        let opened = "... clientFile //some_client_name/replaced\n... action delete\n... change 42\n\n... clientFile //some_client_name/replaced/child.txt\n... action add\n... change 42\n";
+        let (directory, repository) = status_test_repository(cx, opened);
+        std::fs::create_dir(directory.path().join("replaced")).unwrap();
+        let status = query_status_for_test(
+            directory.path(),
+            &repository,
+            &[repo_path("replaced")],
+            &["replaced", "replaced/..."],
+        )
+        .await;
+        assert_eq!(
+            status.entries,
+            parse_opened_status("some_client_name", opened).entries
+        );
+        assert_eq!(status.entries.len(), 2);
+    }
+
+    #[gpui::test]
+    async fn status_uses_client_root_only_above_64_prefixes(cx: &mut gpui::TestAppContext) {
+        let (directory, repository) = status_test_repository(cx, OPENED_FIXTURE);
+        let paths: Vec<_> = (0..65).map(|index| format!("missing{index:02}")).collect();
+        let prefixes: Vec<_> = paths.iter().map(|path| repo_path(path)).collect();
+        let filespecs: Vec<_> = paths[..64]
+            .iter()
+            .flat_map(|path| [path.clone(), format!("{path}/...")])
+            .collect();
+        let filespecs: Vec<_> = filespecs.iter().map(String::as_str).collect();
+        std::fs::write(directory.path().join("opened.txt"), "").unwrap();
+        let status =
+            query_status_for_test(directory.path(), &repository, &prefixes[..64], &filespecs).await;
+        assert!(status.entries.is_empty());
+
+        std::fs::write(directory.path().join("opened.txt"), OPENED_FIXTURE).unwrap();
+        let status =
+            query_status_for_test(directory.path(), &repository, &prefixes, &["..."]).await;
+        assert_eq!(
+            status.entries,
+            parse_opened_status("some_client_name", OPENED_FIXTURE).entries
+        );
     }
 
     #[test]
