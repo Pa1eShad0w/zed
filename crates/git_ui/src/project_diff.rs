@@ -1364,6 +1364,151 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_deploy_changelist_keeps_32_scoped_files_after_fake_git_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        // FakeFs exercises the repository-to-excerpt path, not the p4 CLI contract.
+        // Added files use Git's staged-add representation, not Perforce's opened state.
+        let fs = FakeFs::new(cx.executor());
+        let root = Path::new(path!("/project"));
+        let dot_git = root.join(".git");
+        fs.insert_tree(
+            root,
+            json!({
+                ".git": {},
+                "edited": { "outside.txt": "changed\n" },
+                "added": { "outside.txt": "changed\n" },
+            }),
+        )
+        .await;
+
+        let mut head = vec![
+            ("edited/outside.txt".to_string(), "base\n".to_string()),
+            ("added/outside.txt".to_string(), "base\n".to_string()),
+        ];
+        let mut expected_paths = Vec::new();
+        for index in 0..19 {
+            let path = format!("edited/file_{index:02}.txt");
+            fs.insert_file(root.join(&path), b"changed\n".to_vec())
+                .await;
+            head.push((path.clone(), "base\n".to_string()));
+            expected_paths.push(path);
+        }
+        let mut index_contents = head.clone();
+        for index in 0..13 {
+            let path = format!("added/file_{index:02}.txt");
+            fs.insert_file(root.join(&path), b"new\n".to_vec()).await;
+            index_contents.push((path.clone(), "new\n".to_string()));
+            expected_paths.push(path);
+        }
+        expected_paths.sort();
+        let paths: HashSet<RepoPath> = expected_paths
+            .iter()
+            .map(|path| RepoPath::from_rel_path(rel_path(path)))
+            .collect();
+        fs.set_head_and_index_for_repo(
+            &dot_git,
+            &head
+                .iter()
+                .map(|(path, contents)| (path.as_str(), contents.clone()))
+                .collect::<Vec<_>>(),
+        );
+        fs.set_index_for_repo(
+            &dot_git,
+            &index_contents
+                .iter()
+                .map(|(path, contents)| (path.as_str(), contents.clone()))
+                .collect::<Vec<_>>(),
+        );
+
+        let project = Project::test(fs.clone(), [root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        repository.read_with(cx, |repository, _| {
+            assert_eq!(repository.status().count(), 34);
+            let scoped_statuses = repository
+                .status()
+                .filter(|entry| paths.contains(&entry.repo_path))
+                .collect::<Vec<_>>();
+            assert_eq!(scoped_statuses.len(), 32);
+            assert_eq!(
+                scoped_statuses
+                    .iter()
+                    .filter(|entry| entry.status.is_modified())
+                    .count(),
+                19
+            );
+            assert_eq!(
+                scoped_statuses
+                    .iter()
+                    .filter(|entry| entry.status.is_created())
+                    .count(),
+                13
+            );
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectDiff::deploy_changelist(
+                workspace,
+                repository.clone(),
+                "Changelist #12345".into(),
+                paths.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let diff = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        let mut excerpt_paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
+        excerpt_paths.sort();
+        assert_eq!(excerpt_paths, expected_paths);
+
+        for (changed_path, event_path, expected_status_count) in [
+            ("edited/outside.txt", "edited/outside.txt", 33),
+            ("added/outside.txt", "added", 32),
+        ] {
+            // Emit only the chosen file/directory event. Removing an out-of-scope
+            // status proves the refresh ran instead of merely retaining stale excerpts.
+            fs.pause_events();
+            fs.insert_file(root.join(changed_path), b"base\n".to_vec())
+                .await;
+            fs.clear_buffered_events();
+            fs.unpause_events_and_flush();
+            fs.touch_path(root.join(event_path)).await;
+            cx.run_until_parked();
+
+            repository.read_with(cx, |repository, _| {
+                assert_eq!(repository.status().count(), expected_status_count);
+                assert!(
+                    repository
+                        .status_for_path(&RepoPath::from_rel_path(rel_path(changed_path)))
+                        .is_none(),
+                    "status did not refresh after the event for {event_path}"
+                );
+                for path in &paths {
+                    assert!(repository.status_for_path(path).is_some());
+                }
+            });
+            let mut excerpt_paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
+            excerpt_paths.sort();
+            assert_eq!(
+                excerpt_paths, expected_paths,
+                "after refreshing {event_path}"
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_deploy_at_respects_active_repository_selection(cx: &mut TestAppContext) {
         init_test(cx);
 
