@@ -6479,6 +6479,9 @@ impl Sidebar {
 
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
+        // External agents keep the conversation themselves, so only a thread
+        // open in the agent panel can have its title regenerated.
+        let can_regenerate_title = is_zed_thread || thread.is_live;
         let folder_paths = thread.metadata.folder_paths().clone();
 
         right_click_menu(context_menu_id)
@@ -6514,7 +6517,7 @@ impl Sidebar {
                             }
                         });
 
-                        if is_zed_thread {
+                        if can_regenerate_title {
                             menu = menu.entry("Regenerate Thread Title", None, {
                                 let session_id = session_id.clone();
                                 let sidebar = sidebar.clone();
@@ -8106,9 +8109,10 @@ fn all_thread_infos_for_workspace(
             let title = thread
                 .title()
                 .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
-            let is_title_generating = thread_view_ref
-                .as_native_thread(cx)
-                .is_some_and(|native_thread| native_thread.read(cx).is_generating_title());
+            let is_title_generating = match thread_view_ref.as_native_thread(cx) {
+                Some(native_thread) => native_thread.read(cx).is_generating_title(),
+                None => thread.is_generating_title(),
+            };
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
 

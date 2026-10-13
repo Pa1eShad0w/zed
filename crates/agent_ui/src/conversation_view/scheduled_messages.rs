@@ -1982,9 +1982,7 @@ mod view_tests {
             .entries()
             .iter()
             .filter_map(|entry| match entry {
-                AgentThreadEntry::UserMessage(message) => {
-                    Some(message.content.to_markdown(cx))
-                }
+                AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
                 _ => None,
             })
             .collect()

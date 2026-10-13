@@ -319,6 +319,15 @@ fn read_legacy_serialized_panel(kvp: &KeyValueStore) -> Option<SerializedAgentPa
         .and_then(|json| serde_json::from_str::<SerializedAgentPanel>(&json).log_err())
 }
 
+fn is_generating_thread_title(conversation_view: &ConversationView, cx: &App) -> bool {
+    match conversation_view.as_native_thread(cx) {
+        Some(thread) => thread.read(cx).is_generating_title(),
+        None => conversation_view
+            .root_thread(cx)
+            .is_some_and(|thread| thread.read(cx).is_generating_title()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadTitleRegenerationResult {
     NotOpen,
@@ -4083,10 +4092,10 @@ impl AgentPanel {
         conversation_view: Entity<ConversationView>,
         cx: &mut App,
     ) -> ThreadTitleRegenerationResult {
-        let Some(thread) = conversation_view.read(cx).as_native_thread(cx) else {
-            return ThreadTitleRegenerationResult::NotOpen;
-        };
         let thread_id = conversation_view.read(cx).parent_id();
+        let Some(thread) = conversation_view.read(cx).as_native_thread(cx) else {
+            return Self::regenerate_external_thread_title(&conversation_view, thread_id, cx);
+        };
         thread.update(cx, |thread, cx| {
             if thread.is_generating_title() {
                 ThreadTitleRegenerationResult::AlreadyGenerating
@@ -4102,6 +4111,40 @@ impl AgentPanel {
                 ThreadTitleRegenerationResult::AlreadyGenerating
             }
         })
+    }
+
+    /// External agents keep the conversation themselves, so only a thread open
+    /// in this panel has the turns that a new title is generated from.
+    fn regenerate_external_thread_title(
+        conversation_view: &Entity<ConversationView>,
+        thread_id: ThreadId,
+        cx: &mut App,
+    ) -> ThreadTitleRegenerationResult {
+        let Some(thread) = conversation_view.read(cx).root_thread(cx) else {
+            return ThreadTitleRegenerationResult::NotOpen;
+        };
+        if thread.read(cx).is_generating_title() {
+            return ThreadTitleRegenerationResult::AlreadyGenerating;
+        }
+        let Some(model) = LanguageModelRegistry::read_global(cx).thread_summary_model(cx) else {
+            return ThreadTitleRegenerationResult::NoModel;
+        };
+        let language = AgentSettings::get_global(cx)
+            .thread_summary_language
+            .clone();
+        let started = thread.update(cx, |thread, cx| {
+            thread.regenerate_title(model, language.as_deref(), cx, move |title, cx| {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.set_generated_title(thread_id, title, cx);
+                });
+            })
+        });
+        if started {
+            ThreadTitleRegenerationResult::Started
+        } else {
+            // The thread has no user message to summarize yet.
+            ThreadTitleRegenerationResult::NotOpen
+        }
     }
 
     pub fn conversation_views(&self) -> Vec<Entity<ConversationView>> {
@@ -5618,9 +5661,7 @@ impl AgentPanel {
             conversation_view.as_ref().is_some_and(|conversation_view| {
                 let conversation_view = conversation_view.read(cx);
                 conversation_view.has_user_submitted_prompt(cx)
-                    && conversation_view
-                        .as_native_thread(cx)
-                        .is_some_and(|thread| !thread.read(cx).is_generating_title())
+                    && !is_generating_thread_title(conversation_view, cx)
             });
 
         let has_thread_messages = conversation_view.as_ref().is_some_and(|conversation_view| {
@@ -14294,5 +14335,86 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_regenerate_thread_title_replaces_external_agent_thread_title(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+        let provider = cx.update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+        let model = provider.model("fake");
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Lifetimes describe how long references stay valid.".into()),
+        )]);
+        open_thread_with_connection(&panel, connection, cx);
+        send_message(&panel, cx);
+        let thread_id = active_thread_id(&panel, cx);
+
+        // The first turn ended, so the automatic client-side title is pending.
+        provider.send_last_text(&model, "Automatic title");
+        provider.end_last(&model);
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_title_override(thread_id, "Renamed by user".into(), cx);
+            });
+        });
+
+        let result = panel.update(cx, |panel, cx| panel.regenerate_thread_title(thread_id, cx));
+        assert_eq!(result, ThreadTitleRegenerationResult::Started);
+        cx.run_until_parked();
+        provider.send_last_text(&model, "Regenerated title");
+        provider.end_last(&model);
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            let metadata = ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .cloned()
+                .expect("thread metadata");
+            assert_eq!(metadata.title.as_deref(), Some("Regenerated title"));
+            assert_eq!(
+                metadata.title_override, None,
+                "a requested regeneration replaces the user's rename, as it does for native threads"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_native_thread_title_is_only_generated_by_the_native_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+        let provider = cx.update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+        let model = provider.model("fake");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::NativeAgent;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        send_message(&panel, cx);
+        provider.send_last_text(&model, "Lifetimes describe how long references stay valid.");
+        provider.end_last(&model);
+        cx.run_until_parked();
+
+        let title_requests = provider
+            .pending_completions()
+            .into_iter()
+            .filter(|request| {
+                request.intent == Some(language_model::CompletionIntent::ThreadSummarization)
+            })
+            .count();
+        assert_eq!(
+            title_requests, 1,
+            "the native agent titles its own threads; no client-side request should run alongside"
+        );
     }
 }
