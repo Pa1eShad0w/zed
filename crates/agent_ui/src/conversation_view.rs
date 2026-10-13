@@ -1833,8 +1833,9 @@ impl ConversationView {
 
                 // Session titles are the agent's responsibility, but many
                 // external agents never provide one; fall back to a
-                // client-side summary of the first turn.
-                if *stop_reason == Some(acp_v2::StopReason::EndTurn) {
+                // client-side summary of the first turn. A reported idle
+                // without a stop reason also ends the turn normally.
+                if matches!(stop_reason, Some(acp_v2::StopReason::EndTurn) | None) {
                     maybe_generate_thread_title(&thread, cx);
                 }
 
@@ -14838,5 +14839,91 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[gpui::test]
+    async fn test_end_turn_starts_client_side_title_generation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let provider = cx.update(LanguageModelRegistry::test);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("How do lifetimes work in Rust?", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.completion_count(),
+            1,
+            "an untitled thread whose first turn ends normally should request a generated title"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reported_idle_without_stop_reason_starts_client_side_title_generation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let provider = cx.update(LanguageModelRegistry::test);
+
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let message_editor = message_editor(&conversation_view, cx);
+        let finish_receipt = connection.defer_next_receipt_response();
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("How do lifetimes work in Rust?", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("running state update");
+        });
+        finish_receipt
+            .send(Ok(acp_v2::PromptResponse::new("receipt-echo")))
+            .expect("receipt response pending");
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("receipt-echo")
+                        .content(vec!["How do lifetimes work in Rust?".into()]),
+                    cx,
+                )
+                .expect("echo update");
+        });
+        cx.run_until_parked();
+        assert_eq!(provider.completion_count(), 0, "no title is requested mid-turn");
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                    cx,
+                )
+                .expect("idle state update");
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            provider.completion_count(),
+            1,
+            "a reported idle without a stop reason ends the turn normally and should request a generated title"
+        );
     }
 }
