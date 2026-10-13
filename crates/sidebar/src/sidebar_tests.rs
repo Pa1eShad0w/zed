@@ -5708,6 +5708,60 @@ async fn test_thread_title_update_propagates_to_sidebar(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn test_external_agent_title_generation_shows_in_sidebar(cx: &mut TestAppContext) {
+    fn title_generating_states(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) -> Vec<bool> {
+        sidebar.read_with(cx, |sidebar, _cx| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Thread(thread) => Some(thread.is_title_generating),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let provider = cx.update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+    let model = provider.model("fake");
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Hi there!".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+    let session_id = active_session_id(&panel, cx);
+    save_test_thread_metadata(&session_id, &project, cx).await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        title_generating_states(&sidebar, cx),
+        vec![true],
+        "the first turn ended, so the thread's client-side title is being generated"
+    );
+
+    provider.send_last_text(&model, "Friendly Greeting");
+    provider.end_last(&model);
+    cx.run_until_parked();
+
+    assert_eq!(title_generating_states(&sidebar, cx), vec![false]);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [my-project]",
+            "  Friendly Greeting *",
+        ]
+    );
+}
+
+#[gpui::test]
 async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

@@ -5064,6 +5064,10 @@ impl AcpThread {
         self.title.is_none() && self.pending_title_generation.is_none()
     }
 
+    pub fn is_generating_title(&self) -> bool {
+        self.pending_title_generation.is_some()
+    }
+
     /// Generates a conversation title client-side from the first turn.
     ///
     /// Session titles are the agent's responsibility (pushed via
@@ -5078,11 +5082,36 @@ impl AcpThread {
         language: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_generate_title() {
-            return;
+        if self.can_generate_title() {
+            self.start_title_generation(model, language, None, cx);
+        }
+    }
+
+    /// Regenerates the title at the user's request, replacing whatever title
+    /// the thread has, including one provided by the agent. Returns whether a
+    /// generation started; `on_generated_title` runs only after it succeeds.
+    pub fn regenerate_title(
+        &mut self,
+        model: LanguageModel,
+        language: Option<&str>,
+        cx: &mut Context<Self>,
+        on_generated_title: impl FnOnce(SharedString, &mut Context<Self>) + 'static,
+    ) -> bool {
+        self.start_title_generation(model, language, Some(Box::new(on_generated_title)), cx)
+    }
+
+    fn start_title_generation(
+        &mut self,
+        model: LanguageModel,
+        language: Option<&str>,
+        on_generated_title: Option<Box<dyn FnOnce(SharedString, &mut Context<Self>)>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_title_generation.is_some() {
+            return false;
         }
         let Some(excerpt) = self.title_generation_excerpt(cx) else {
-            return;
+            return false;
         };
 
         let request = LanguageModelRequest {
@@ -5109,22 +5138,30 @@ impl AcpThread {
             let title = stream_title_generation(model, request, cx).await;
             this.update(cx, |this, cx| {
                 this.pending_title_generation = None;
-                match title {
-                    Ok(title) => {
-                        // A real title may have arrived from the agent (or via
-                        // a manual rename) while generation was in flight;
-                        // never clobber it.
-                        if this.title.is_none() {
-                            this.set_title(title.into(), cx).detach_and_log_err(cx);
-                        }
-                    }
+                let title = match title {
+                    Ok(title) => SharedString::from(title),
                     Err(error) => {
                         log::error!("failed to generate thread title: {error:#}");
+                        return;
                     }
+                };
+                match on_generated_title {
+                    Some(on_generated_title) => {
+                        this.set_title(title.clone(), cx).detach_and_log_err(cx);
+                        on_generated_title(title, cx);
+                    }
+                    // A real title may have arrived from the agent (or via a
+                    // manual rename) while generation was in flight; never
+                    // clobber it.
+                    None if this.title.is_none() => {
+                        this.set_title(title, cx).detach_and_log_err(cx);
+                    }
+                    None => {}
                 }
             })
             .ok();
         }));
+        true
     }
 
     /// Builds the conversation excerpt sent to the model for client-side
@@ -17995,6 +18032,79 @@ mod tests {
         thread.read_with(cx, |thread, _| {
             assert_eq!(thread.title().as_deref(), Some("Recovered title"));
         });
+    }
+
+    #[gpui::test]
+    async fn test_regenerate_title_replaces_agent_title(cx: &mut TestAppContext) {
+        let (connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+        let set_title_calls = connection.set_title_calls.clone();
+        thread
+            .update(cx, |thread, cx| thread.set_title("Agent title".into(), cx))
+            .await
+            .expect("set_title should succeed");
+
+        let provider = cx.update(LanguageModelRegistry::test);
+        let model = provider.model("fake");
+        let reported_title = Rc::new(RefCell::new(None));
+        let started = thread.update(cx, |thread, cx| {
+            let reported_title = reported_title.clone();
+            thread.regenerate_title(model.clone(), None, cx, move |title, _cx| {
+                *reported_title.borrow_mut() = Some(title);
+            })
+        });
+        assert!(
+            started,
+            "a requested regeneration starts even though the agent already provided a title"
+        );
+        cx.run_until_parked();
+        assert_eq!(provider.completion_count(), 1);
+
+        provider.send_last_text(&model, "Regenerated title");
+        provider.end_last(&model);
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.title().as_deref(), Some("Regenerated title"));
+        });
+        assert_eq!(
+            reported_title.borrow().as_deref(),
+            Some("Regenerated title"),
+            "the caller learns the regenerated title"
+        );
+        assert_eq!(
+            set_title_calls.borrow().last().map(|title| title.as_ref()),
+            Some("Regenerated title"),
+            "the regenerated title propagates to agents that support set_title"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_regenerate_title_is_rejected_while_a_title_is_generating(
+        cx: &mut TestAppContext,
+    ) {
+        let (_connection, thread) =
+            init_thread_with_first_turn(cx, "Let me explain lifetimes.").await;
+        let provider = cx.update(LanguageModelRegistry::test);
+        let model = provider.model("fake");
+        thread.update(cx, |thread, cx| {
+            thread.generate_title(model.clone(), None, cx);
+        });
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.is_generating_title()));
+
+        let started = thread.update(cx, |thread, cx| {
+            thread.regenerate_title(model.clone(), None, cx, |_, _| {})
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !started,
+            "a second generation must not start while one is in flight"
+        );
+        assert_eq!(provider.completion_count(), 1);
+        provider.end_last(&model);
+        cx.run_until_parked();
     }
 
     #[gpui::test]
