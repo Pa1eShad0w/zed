@@ -1834,8 +1834,11 @@ impl ConversationView {
                 // Session titles are the agent's responsibility, but many
                 // external agents never provide one; fall back to a
                 // client-side summary of the first turn. A reported idle
-                // without a stop reason also ends the turn normally.
-                if matches!(stop_reason, Some(acp_v2::StopReason::EndTurn) | None) {
+                // without a stop reason also ends the turn normally. Native
+                // threads title themselves.
+                if self.as_native_thread(cx).is_none()
+                    && matches!(stop_reason, Some(acp_v2::StopReason::EndTurn) | None)
+                {
                     maybe_generate_thread_title(&thread, cx);
                 }
 

@@ -14295,4 +14295,36 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    async fn test_native_thread_title_is_only_generated_by_the_native_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+        let provider = cx.update(|_window, cx| language_model::LanguageModelRegistry::test(cx));
+        let model = provider.model("fake");
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::NativeAgent;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        send_message(&panel, cx);
+        provider.send_last_text(&model, "Lifetimes describe how long references stay valid.");
+        provider.end_last(&model);
+        cx.run_until_parked();
+
+        let title_requests = provider
+            .pending_completions()
+            .into_iter()
+            .filter(|request| {
+                request.intent == Some(language_model::CompletionIntent::ThreadSummarization)
+            })
+            .count();
+        assert_eq!(
+            title_requests, 1,
+            "the native agent titles its own threads; no client-side request should run alongside"
+        );
+    }
 }
