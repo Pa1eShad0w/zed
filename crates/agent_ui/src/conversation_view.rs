@@ -14908,7 +14908,11 @@ pub(crate) mod tests {
                 .expect("echo update");
         });
         cx.run_until_parked();
-        assert_eq!(provider.completion_count(), 0, "no title is requested mid-turn");
+        assert_eq!(
+            provider.completion_count(),
+            0,
+            "no title is requested mid-turn"
+        );
 
         thread.update(cx, |thread, cx| {
             thread
