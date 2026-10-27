@@ -23,6 +23,7 @@ collections.workspace = true
 derive_more.workspace = true
 gpui.workspace = true
 http_client.workspace = true
+imara-diff.workspace = true
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true
