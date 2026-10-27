@@ -30,6 +30,7 @@ use collections::{HashMap, HashSet};
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{AsyncApp, BackgroundExecutor, SharedString, Task};
+use imara_diff::{Algorithm, Diff, InternedInput};
 use parking_lot::Mutex;
 use rope::Rope;
 use smallvec::SmallVec;
@@ -1061,7 +1062,9 @@ fn build_p4_blame_mapped(
 ///
 /// `depot_text` is the depot `#have` content (`p4 print -q`), expected to have one line per
 /// entry in `depot` (which is what [`parse_formatted_annotate`] yields, one record per depot
-/// line). The diff is a line-text LCS between `depot_text` and `content`.
+/// line). The line diff is the one the editor uses for its diff hunks (Histogram plus git's
+/// slider heuristic), so the rows left without blame line up with the rows the gutter marks as
+/// changed.
 ///
 /// Returns one entry per buffer line (`result.len()` == buffer line count):
 /// - `Some(depot_line)` — the buffer line matches a depot line; use that attribution.
@@ -1085,30 +1088,33 @@ fn remap_annotation_to_content(
     let buffer_text = content.to_string();
     let buffer_lines: Vec<&str> = split_lines(&buffer_text);
 
-    // Fast path: an unedited buffer matches the depot text exactly, so the mapping is the identity.
-    // This is the common case (the file is open but not modified) and skips the O(n*m) LCS on every
-    // blame call — critical for large files, where the LCS table would otherwise burn CPU and
-    // allocate gigabytes on each cursor move.
+    // Fast path: an unedited buffer (the common case) maps to the depot lines one to one.
     if buffer_lines == depot_lines {
         return depot.iter().cloned().map(Some).collect();
     }
 
-    // Guard the LCS against pathological size: its DP table is O(n*m) in both time and memory, so a
-    // large dirty file (e.g. a 50k-line JSON) would spin the CPU and allocate gigabytes. Above the
-    // cap, fall back to the depot-aligned annotation — blame may be slightly misaligned while the
-    // buffer is dirty, but we never hang.
-    const LCS_CELL_CAP: usize = 4_000_000;
-    if depot_lines.len().saturating_mul(buffer_lines.len()) > LCS_CELL_CAP {
-        return depot.iter().cloned().map(Some).collect();
-    }
+    let mut input = InternedInput::default();
+    input.update_before(depot_lines.iter().copied());
+    input.update_after(buffer_lines.iter().copied());
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
 
-    // Longest-common-subsequence between depot and buffer line texts. `matches[b] = Some(d)`
-    // means buffer line `b` is unchanged and corresponds to depot line `d`.
-    let matches = lcs_line_match(&depot_lines, &buffer_lines);
-    matches
-        .into_iter()
-        .map(|d| d.map(|d| depot[d].clone()))
-        .collect()
+    // Lines between hunks are unchanged, so they pair up one to one in order.
+    let mut mapped = Vec::with_capacity(buffer_lines.len());
+    let mut depot_row = 0;
+    for hunk in diff.hunks() {
+        let unchanged = hunk.after.start as usize - mapped.len();
+        mapped.extend(
+            depot[depot_row..depot_row + unchanged]
+                .iter()
+                .cloned()
+                .map(Some),
+        );
+        mapped.extend(hunk.after.map(|_| None));
+        depot_row = hunk.before.end as usize;
+    }
+    mapped.extend(depot[depot_row..].iter().cloned().map(Some));
+    mapped
 }
 
 /// Split text into logical lines for line-diffing, ignoring a single trailing newline so a
@@ -1124,45 +1130,6 @@ fn split_lines(text: &str) -> Vec<&str> {
         .split('\n')
         .map(|l| l.trim_end_matches('\r'))
         .collect()
-}
-
-/// Classic LCS over two line-text slices, returning for each `b`-line the matched `a`-index
-/// (or `None` if that `b`-line is an insertion/edit). Result length == `b.len()`.
-///
-/// O(len(a) * len(b)) time and space — fine for source files (annotate is already the slow
-/// part). Lines compared by exact text equality, matching git's default whitespace-sensitive
-/// blame mapping.
-fn lcs_line_match(a: &[&str], b: &[&str]) -> Vec<Option<usize>> {
-    let (n, m) = (a.len(), b.len());
-    // dp[i][j] = LCS length of a[i..] and b[j..]. (n+1) x (m+1) table.
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    // Backtrack: walk forward choosing matches that preserve the LCS length.
-    let mut result = vec![None; m];
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < n && j < m {
-        if a[i] == b[j] {
-            result[j] = Some(i);
-            i += 1;
-            j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
-            // Depot line deleted in buffer: advance depot.
-            i += 1;
-        } else {
-            // Buffer line inserted/edited: leave None, advance buffer.
-            j += 1;
-        }
-    }
-    // Any remaining buffer lines (tail insertions) stay None.
-    result
 }
 
 /// Which Perforce "open" action a save/create/delete should perform.
@@ -1344,7 +1311,7 @@ pub struct PerforceRepository {
 /// text), NOT a finished [`Blame`]. The finished blame depends on the (possibly dirty) buffer
 /// `content`, which changes on every keystroke while the file's mtime is unchanged — so the
 /// dirty-buffer remap ([`remap_annotation_to_content`]) must run fresh on each `blame()` call.
-/// The remap is cheap (a line-text LCS); the expensive `p4 annotate`/`describe` round-trips
+/// The remap is cheap (a line diff); the expensive `p4 annotate`/`describe` round-trips
 /// are what this cache skips while the file on disk is unchanged.
 struct BlameCacheEntry {
     mtime: Option<SystemTime>,
@@ -3873,6 +3840,60 @@ line two
             .map(|m| m.as_ref().map(|l| l.change))
             .collect();
         assert_eq!(changes, vec![Some(1001), Some(1002)]);
+    }
+
+    #[test]
+    fn remap_duplicated_lines_leave_the_rows_the_diff_gutter_marks_as_added() {
+        // The first three lines are pasted again right above the closing line. Either copy could be
+        // "the new one"; the editor's diff hunks (git's slider heuristic) mark the upper copy as
+        // added, so blame must leave exactly those rows blank rather than the lower copy.
+        let depot = vec![
+            annotated(1001),
+            annotated(1002),
+            annotated(1003),
+            annotated(1004),
+        ];
+        let depot_text = "call(\n    a,\n    b,\n)\n";
+        let content = Rope::from("call(\n    a,\n    b,\ncall(\n    a,\n    b,\n)\n");
+        let mapped = remap_annotation_to_content(&depot, depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                None,
+                None,
+                None,
+                Some(1001),
+                Some(1002),
+                Some(1003),
+                Some(1004)
+            ]
+        );
+    }
+
+    #[test]
+    fn remap_large_dirty_file_still_offsets_rows_below_an_insertion() {
+        let line_count = 2_100;
+        let depot: Vec<AnnotatedLine> = (0..line_count).map(|i| annotated(1000 + i)).collect();
+        let depot_lines: Vec<String> = (0..line_count).map(|i| format!("line {i}")).collect();
+        let depot_text = depot_lines.join("\n") + "\n";
+        let mut buffer_lines = depot_lines;
+        buffer_lines.insert(10, "inserted locally".to_string());
+        let content = Rope::from((buffer_lines.join("\n") + "\n").as_str());
+
+        let mapped = remap_annotation_to_content(&depot, &depot_text, &content);
+        let changes: Vec<Option<u32>> = mapped
+            .iter()
+            .map(|m| m.as_ref().map(|l| l.change))
+            .collect();
+        assert_eq!(changes.len(), buffer_lines.len());
+        assert_eq!(changes[9], Some(1009));
+        assert_eq!(changes[10], None);
+        assert_eq!(changes[11], Some(1010));
+        assert_eq!(changes.last(), Some(&Some(1000 + line_count - 1)));
     }
 
     #[test]
