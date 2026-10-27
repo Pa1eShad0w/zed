@@ -103,6 +103,7 @@
 ### Fixed
 
 - `d5e18d3487` (2026-10-27) 修复旧会话残留的 agent 进程让新建外部 agent 线程无法启动：Zed 原本会在每次查询启动命令时无条件执行一遍 `npm install`，而 Windows 上 npm 需要替换安装目录里的文件，旧会话还没退出的 `claude.exe` 会锁住它们，复制时报 `EBUSY`，于是**每一个**新建的 Claude Agent 线程都直接失败（上游同类问题的记录：[zed#63743](https://github.com/zed-industries/zed/issues/63743)、[zed#64216](https://github.com/zed-industries/zed/issues/64216)）。现在先读安装目录里的 `package.json`：已安装版本与 registry 给出的版本一致、且入口文件仍在时直接复用，不再跑 npm（版本不一致时仍交给 npm，registry 回滚版本时会随之降级）；需要升级但 npm 失败（文件被占用报 `EBUSY`、离线等）时，记录一条 warn 日志并用已安装的版本启动线程，而不是让线程起不来（关掉旧会话或重启 Zed 后，下次新建线程会再尝试升级）。已安装的入口文件不存在时仍然报错，并指出缺失的路径。以上行为对所有平台生效；非 registry 形式的 agent 不受影响。
+- `9816c23068` (2026-10-27) 修复 Perforce 行内 blame 在本地编辑块附近错位：blame 把 depot `#have` 的注解投影到当前 buffer 时，用的是一套自写的逐行 LCS，与编辑器 diff gutter 的对齐方式（Histogram diff 加 git 的 slider/indent 启发式）不同——复制粘贴、移动代码，或编辑块边界有重复的空行、括号时，blame 留空的行会落在与 gutter 编辑块不同的行上；depot 行数与 buffer 行数之积超过 400 万（约 2000×2000 行）时还会直接放弃投影，编辑点以下整体错行。现在 blame 与 gutter 共用同一套行 diff，留空的行与 gutter 标出的改动行一致，也不再有文件大小上限。
 
 - `149f3f3a5d` (2026-10-13) 修复原生 agent 线程每次首轮结束都多发一次标题请求：为外部 agent 补标题的客户端生成也会在原生线程上运行。原生 agent 在首轮结束时还没写回自己生成的标题，线程看起来仍未命名，于是会再向摘要模型请求一次；兜底标题先显示，随后又被原生标题替换。现在原生线程只由原生 agent 生成标题，首轮只发一次标题请求。
 - `f951d0b80a` (2026-09-30) 修复 Perforce 根目录及目录状态刷新漏查后代文件，导致 `Open Changelist Diff` 遗漏 changelist 中已修改文件的问题：1～64 个非根路径仍限定查询范围，普通文件使用精确路径，目录及缺失路径同时查询自身与后代，保留文件被目录替换时的待删除状态；根路径、空路径列表或超过 64 个路径统一使用显式 `//client/...`，避免无 filespec 的 `opened` 查询。保留只读文件预筛，Git 后端、共享缓存及 UI 生产逻辑不变；新增命令参数、32 文件刷新、64/65 边界与 changelist diff 回归测试。
