@@ -1390,17 +1390,15 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
                 .join(sanitize_path_component(&registry_id));
             fs.create_dir(&install_dir).await?;
 
-            let (package_name, package_spec) = bounded_npm_package_spec(&package);
-            node_runtime
-                .run_npm_subcommand(
-                    Some(&install_dir),
-                    "install",
-                    &[package_spec.as_str(), "--save-exact"],
-                )
-                .await?;
-            let executable = node_runtime::read_package_executable(
-                install_dir.join("node_modules"),
+            let (package_name, npm_spec) = bounded_npm_package_spec(&package);
+            let executable = registry_npx_executable(
+                &node_runtime,
+                fs.as_ref(),
+                &install_dir,
+                &registry_id,
                 package_name,
+                &package,
+                &npm_spec,
             )
             .await?;
 
@@ -1465,6 +1463,114 @@ fn bounded_npm_package_spec(package_spec: &str) -> (&str, String) {
     }
 
     (package_name, format!("{package_name}@0.0.0 - {version}"))
+}
+
+/// Version ceiling encoded in a registry package spec such as `claude-acp@0.95.0` or
+/// `@agentclientprotocol/claude-agent-acp@0.95.0`.
+///
+/// Specs without a parseable version (no `@version` suffix, or a dist-tag such as `@latest`)
+/// return `None`: npm has to resolve those, so nothing can be skipped locally.
+fn npm_package_spec_version(package_spec: &str) -> Option<Version> {
+    let (package_name, version) = package_spec.rsplit_once('@')?;
+    if package_name.is_empty() {
+        return None;
+    }
+    Version::parse(version).ok()
+}
+
+/// Whether `npm install` has to run for a registry agent.
+///
+/// Reinstalling on every connection is redundant once the installed copy is complete and exactly
+/// at the version the registry names. Skipping it also avoids the Windows failure where npm cannot
+/// replace `claude.exe` because an agent process of an older session still has it open. Any other
+/// version still goes through npm, which also downgrades when the registry rolls a release back.
+fn should_install_registry_npx_package(
+    installed_version: Option<&Version>,
+    version_ceiling: Option<&Version>,
+) -> bool {
+    let (Some(installed_version), Some(version_ceiling)) = (installed_version, version_ceiling)
+    else {
+        return true;
+    };
+    installed_version != version_ceiling
+}
+
+/// Resolves the executable to launch for a registry npx agent, installing it with npm when the
+/// copy on disk is missing or not at the version the registry names.
+///
+/// `registry_package` is the spec from the registry (e.g. `claude-acp@0.95.0`), `npm_spec` the
+/// version-bounded spec handed to `npm install`.
+async fn registry_npx_executable(
+    node_runtime: &NodeRuntime,
+    fs: &dyn Fs,
+    install_dir: &Path,
+    registry_id: &str,
+    package_name: &str,
+    registry_package: &str,
+    npm_spec: &str,
+) -> Result<PathBuf> {
+    let node_modules_dir = install_dir.join("node_modules");
+    let Some(installed_executable) =
+        node_runtime::read_package_executable(node_modules_dir.clone(), package_name)
+            .await
+            .ok()
+    else {
+        return install_registry_npx_package(node_runtime, install_dir, package_name, npm_spec)
+            .await;
+    };
+    // Read from the same package.json as the executable so both describe the same copy.
+    let installed_version =
+        node_runtime::read_package_installed_version(node_modules_dir, package_name)
+            .await
+            .log_err()
+            .flatten();
+    let version_ceiling = npm_package_spec_version(registry_package);
+
+    if fs.is_file(&installed_executable).await
+        && !should_install_registry_npx_package(
+            installed_version.as_ref(),
+            version_ceiling.as_ref(),
+        )
+    {
+        log::debug!(
+            "skipping npm install for registry agent {registry_id:?}: \
+             {package_name} {installed_version:?} is already installed"
+        );
+        return Ok(installed_executable);
+    }
+
+    match install_registry_npx_package(node_runtime, install_dir, package_name, npm_spec).await {
+        Ok(executable) => Ok(executable),
+        Err(error) => {
+            // npm fails while an older session's agent process still holds files it has to replace
+            // (EBUSY on Windows), or without network access; the copy already on disk beats not
+            // starting at all.
+            if !fs.is_file(&installed_executable).await {
+                return Err(error.context(format!(
+                    "the previously installed executable {} is missing",
+                    installed_executable.display()
+                )));
+            }
+            log::warn!(
+                "failed to install {npm_spec:?} for registry agent {registry_id:?}; \
+                 starting the version that is already installed at {} instead: {error:#}",
+                installed_executable.display()
+            );
+            Ok(installed_executable)
+        }
+    }
+}
+
+async fn install_registry_npx_package(
+    node_runtime: &NodeRuntime,
+    install_dir: &Path,
+    package_name: &str,
+    npm_spec: &str,
+) -> Result<PathBuf> {
+    node_runtime
+        .run_npm_subcommand(Some(install_dir), "install", &[npm_spec, "--save-exact"])
+        .await?;
+    node_runtime::read_package_executable(install_dir.join("node_modules"), package_name).await
 }
 
 struct LocalCustomAgent {
@@ -2337,5 +2443,134 @@ mod tests {
                 "agent-b tx should have been transferred"
             );
         });
+    }
+
+    #[test]
+    fn test_registry_npx_package_spec_version() -> anyhow::Result<()> {
+        assert_eq!(
+            npm_package_spec_version("@agentclientprotocol/claude-agent-acp@0.95.0"),
+            Some(Version::parse("0.95.0")?)
+        );
+        assert_eq!(
+            npm_package_spec_version("claude-acp@1.2.3"),
+            Some(Version::parse("1.2.3")?)
+        );
+
+        // No version in the spec, so npm has to resolve it.
+        assert_eq!(npm_package_spec_version("claude-acp"), None);
+        assert_eq!(
+            npm_package_spec_version("@agentclientprotocol/claude-agent-acp"),
+            None
+        );
+        // Not a version, so it is treated as a tag and npm has to resolve it.
+        assert_eq!(npm_package_spec_version("claude-acp@latest"), None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_should_install_registry_npx_package() -> anyhow::Result<()> {
+        let installed = Version::parse("0.94.0")?;
+        let ceiling = Version::parse("0.95.0")?;
+
+        // Already at the newest version the registry allows.
+        assert!(!should_install_registry_npx_package(
+            Some(&ceiling),
+            Some(&ceiling)
+        ));
+
+        // Older than the ceiling: upgrade.
+        assert!(should_install_registry_npx_package(
+            Some(&installed),
+            Some(&ceiling)
+        ));
+
+        // Newer than the registry version, e.g. after the registry rolled a release back: downgrade.
+        assert!(should_install_registry_npx_package(
+            Some(&ceiling),
+            Some(&installed)
+        ));
+
+        // Can't tell what is installed or what to install: stay on the safe side.
+        assert!(should_install_registry_npx_package(None, Some(&ceiling)));
+        assert!(should_install_registry_npx_package(Some(&installed), None));
+
+        Ok(())
+    }
+
+    /// Writes `node_modules/agent-acp/package.json` and returns the path of its `bin` entry,
+    /// which is only created when `write_executable` is set.
+    fn write_installed_registry_npx_package(
+        install_dir: &Path,
+        version: &str,
+        write_executable: bool,
+    ) -> PathBuf {
+        let package_dir = install_dir.join("node_modules").join("agent-acp");
+        std::fs::create_dir_all(package_dir.join("dist")).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            format!(
+                r#"{{"name":"agent-acp","version":"{version}","bin":{{"agent-acp":"dist/index.js"}}}}"#
+            ),
+        )
+        .unwrap();
+        let executable = package_dir.join("dist/index.js");
+        if write_executable {
+            std::fs::write(&executable, "").unwrap();
+        }
+        executable
+    }
+
+    async fn resolve_registry_npx_executable_without_npm(
+        cx: &mut TestAppContext,
+        install_dir: &Path,
+    ) -> Result<PathBuf> {
+        let fs: Arc<dyn Fs> = fs::RealFs::new(None, cx.executor());
+        // Every npm call fails on an unavailable Node runtime, like an install that hits EBUSY.
+        registry_npx_executable(
+            &NodeRuntime::unavailable(),
+            fs.as_ref(),
+            install_dir,
+            "agent-acp",
+            "agent-acp",
+            "agent-acp@0.95.0",
+            "agent-acp@0.0.0 - 0.95.0",
+        )
+        .await
+    }
+
+    #[gpui::test]
+    async fn test_registry_npx_starts_installed_version_when_npm_install_fails(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let executable = write_installed_registry_npx_package(temp_dir.path(), "0.94.0", true);
+
+        let resolved = resolve_registry_npx_executable_without_npm(cx, temp_dir.path())
+            .await
+            .unwrap();
+        assert_eq!(resolved, executable);
+    }
+
+    #[gpui::test]
+    async fn test_registry_npx_reports_missing_executable_when_npm_install_fails(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // At the ceiling and below it: a package.json without its executable is not an install.
+        for version in ["0.95.0", "0.94.0"] {
+            let executable = write_installed_registry_npx_package(temp_dir.path(), version, false);
+
+            let error = resolve_registry_npx_executable_without_npm(cx, temp_dir.path())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&executable.display().to_string()),
+                "version {version}: unexpected error: {error:#}"
+            );
+        }
     }
 }
