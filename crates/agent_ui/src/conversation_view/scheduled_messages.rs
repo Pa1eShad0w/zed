@@ -9,7 +9,7 @@
 //! an app context.
 
 use acp_thread::ThreadStatus;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use collections::HashMap;
 use db::kvp::KeyValueStore;
@@ -1333,7 +1333,7 @@ fn local_date_time_to_utc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1 as acp;
+    use agent_client_protocol::schema::v2 as acp;
     use chrono::{DateTime, Local, Utc};
     use collections::HashMap;
     use db::kvp::KeyValueStore;
@@ -1377,6 +1377,47 @@ mod tests {
         let json = serde_json::to_string(&file).unwrap();
         let deserialized: ScheduledMessagesFile = serde_json::from_str(&json).unwrap();
         assert_eq!(file, deserialized);
+    }
+
+    #[test]
+    fn test_scheduled_messages_saved_with_acp_v1_content_still_load() {
+        use agent_client_protocol::schema::v1 as acp_v1;
+
+        // Earlier fork releases persisted ACP v1 content blocks; a file they wrote must still load,
+        // with the same content the v1 -> v2 conversion produces.
+        let v1_content = vec![
+            acp_v1::ContentBlock::Text(acp_v1::TextContent::new("check the deploy status")),
+            acp_v1::ContentBlock::ResourceLink(
+                acp_v1::ResourceLink::new("main.rs", "file:///project/src/main.rs")
+                    .mime_type(Some("text/x-rust".to_string()))
+                    .size(Some(42)),
+            ),
+            acp_v1::ContentBlock::Image(acp_v1::ImageContent::new("aGVsbG8=", "image/png")),
+            acp_v1::ContentBlock::Resource(acp_v1::EmbeddedResource::new(
+                acp_v1::EmbeddedResourceResource::TextResourceContents(
+                    acp_v1::TextResourceContents::new("fn main() {}", "file:///project/src/main.rs")
+                        .mime_type(Some("text/x-rust".to_string())),
+                ),
+            )),
+        ];
+        let saved = serde_json::json!({
+            "version": SCHEDULED_MESSAGES_FILE_VERSION,
+            "sessions": {
+                "zed|session-123": [{
+                    "id": "8c6b2f0e-5d1a-4c3e-9f7b-2a1d0e9c8b7a",
+                    "content": v1_content,
+                    "fire_at": "2026-08-25T14:00:00Z",
+                    "created_at": "2026-08-25T12:00:00Z",
+                }],
+            },
+        });
+
+        let file: ScheduledMessagesFile = serde_json::from_value(saved).unwrap();
+        let expected: Vec<acp::ContentBlock> = v1_content
+            .into_iter()
+            .map(|block| acp_thread::content::from_v1(block).unwrap())
+            .collect();
+        assert_eq!(file.sessions["zed|session-123"][0].content, expected);
     }
 
     #[test]

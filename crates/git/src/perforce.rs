@@ -2279,6 +2279,10 @@ impl GitRepository for PerforceRepository {
         ))
     }
 
+    fn create_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
+        unsupported_result!()
+    }
+
     fn update_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
         unsupported_result!()
     }
