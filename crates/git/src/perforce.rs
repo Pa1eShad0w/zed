@@ -1919,10 +1919,15 @@ impl GitRepository for PerforceRepository {
 
             // Depot `#have` text, to diff against the buffer for the dirty-buffer remap. This
             // is mtime-stable (depot revision), so it's cached alongside the annotation; the
-            // remap itself runs every call against the current buffer `content`.
+            // remap itself runs every call against the current buffer `content`. It is decoded
+            // like the diff gutter's base text (BOM removed, UTF-16 and legacy encodings such as
+            // GBK detected), otherwise unchanged non-ASCII lines would not match the buffer.
             let depot_text = cli
-                .run(false, &["print", "-q", &target])
+                .run_bytes(false, &["print", "-q", &target])
                 .await
+                .ok()
+                .and_then(|bytes| file_content::decode_text(bytes).ok())
+                .map(|decoded| decoded.text)
                 .unwrap_or_default();
 
             // Descriptions (hover text only) come from `p4 describe`, capped to
@@ -2277,6 +2282,10 @@ impl GitRepository for PerforceRepository {
                 }
             },
         ))
+    }
+
+    fn create_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
+        unsupported_result!()
     }
 
     fn update_ref(&self, _ref_name: String, _commit: String) -> BoxFuture<'_, Result<()>> {
@@ -3894,6 +3903,80 @@ line two
         assert_eq!(changes[10], None);
         assert_eq!(changes[11], Some(1010));
         assert_eq!(changes.last(), Some(&Some(1000 + line_count - 1)));
+    }
+
+    #[gpui::test]
+    async fn blame_decodes_depot_text_like_the_diff_base(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        // The buffer shows the file decoded like the gutter's diff base (BOM removed, legacy
+        // encodings detected), so an unchanged file must come back fully attributed.
+        let utf8_with_bom =
+            b"\xef\xbb\xbfusing System;\n// \xe4\xb8\xad\xe6\x96\x87\xe6\xb3\xa8\xe9\x87\x8a\nclass A {}\n";
+        let gbk = b"int a;\n// \xd6\xd0\xce\xc4\xd7\xa2\xca\xcd\xa3\xac\xb2\xbb\xd2\xaa\xd0\xde\xb8\xc4\nint b;\n";
+        for depot_bytes in [utf8_with_bom.as_slice(), gbk.as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("depot.bin"), depot_bytes).unwrap();
+            std::fs::write(
+                directory.path().join("annotate.txt"),
+                "1001|alice|2026/01/01 00:00:00\n\
+                 1002|bob|2026/01/02 00:00:00\n\
+                 1003|carol|2026/01/03 00:00:00\n",
+            )
+            .unwrap();
+            let script = if cfg!(windows) {
+                "@echo off\r\nif \"%~1\"==\"print\" (\r\ntype depot.bin\r\nexit /b 0\r\n)\r\nif \"%~2\"==\"describe\" exit /b 0\r\ntype annotate.txt\r\n"
+            } else {
+                "#!/bin/sh\nif [ \"$1\" = print ]; then cat depot.bin; exit 0; fi\nif [ \"$2\" = describe ]; then exit 0; fi\ncat annotate.txt\n"
+            };
+            let binary = directory.path().join(if cfg!(windows) {
+                "fake-p4.cmd"
+            } else {
+                "fake-p4"
+            });
+            std::fs::write(&binary, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let repository = PerforceRepository::new(
+                binary,
+                PerforceWorkspace {
+                    client_root: directory.path().to_path_buf(),
+                    client_name: "some_client_name".into(),
+                },
+                Arc::default(),
+                50,
+                directory.path().join(".p4config"),
+                cx.background_executor.clone(),
+            );
+            let buffer_text = file_content::decode_text(depot_bytes.to_vec())
+                .unwrap()
+                .text;
+
+            let blame = repository
+                .blame(
+                    crate::repository::repo_path("src/a.cs"),
+                    Rope::from(buffer_text.as_str()),
+                    LineEnding::Unix,
+                )
+                .await
+                .unwrap();
+            let attributed: Vec<(std::ops::Range<u32>, Option<String>)> = blame
+                .entries
+                .iter()
+                .map(|entry| (entry.range.clone(), entry.revision_label.clone()))
+                .collect();
+            assert_eq!(
+                attributed,
+                vec![
+                    (0..1, Some("@1001".to_string())),
+                    (1..2, Some("@1002".to_string())),
+                    (2..3, Some("@1003".to_string())),
+                ],
+                "buffer text: {buffer_text:?}"
+            );
+        }
     }
 
     #[test]
