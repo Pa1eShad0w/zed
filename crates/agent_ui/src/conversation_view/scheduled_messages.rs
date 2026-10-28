@@ -1395,8 +1395,11 @@ mod tests {
             acp_v1::ContentBlock::Image(acp_v1::ImageContent::new("aGVsbG8=", "image/png")),
             acp_v1::ContentBlock::Resource(acp_v1::EmbeddedResource::new(
                 acp_v1::EmbeddedResourceResource::TextResourceContents(
-                    acp_v1::TextResourceContents::new("fn main() {}", "file:///project/src/main.rs")
-                        .mime_type(Some("text/x-rust".to_string())),
+                    acp_v1::TextResourceContents::new(
+                        "fn main() {}",
+                        "file:///project/src/main.rs",
+                    )
+                    .mime_type(Some("text/x-rust".to_string())),
                 ),
             )),
         ];
