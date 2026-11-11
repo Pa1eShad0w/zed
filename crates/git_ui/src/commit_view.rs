@@ -211,6 +211,31 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
+        Self::open_task(
+            commit_sha,
+            repo,
+            workspace,
+            stash,
+            file_filter,
+            ignore_shallow_boundary,
+            window,
+            cx,
+        )
+        .detach();
+    }
+
+    /// Loads the commit and opens its view. The task completes once the view is in the pane or
+    /// loading failed, so a caller can show progress meanwhile; dropping it cancels the open.
+    pub fn open_task(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        stash: Option<usize>,
+        file_filter: Option<RepoPath>,
+        ignore_shallow_boundary: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Option<()>> {
         let commit_diff = repo
             .update(cx, |repo, cx| {
                 repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary, cx)
@@ -220,72 +245,62 @@ impl CommitView {
             .update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx))
             .ok();
 
-        window
-            .spawn(cx, async move |cx| {
-                let commit_diff = commit_diff?;
-                let commit_details = commit_details?;
-                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-                let mut commit_diff = commit_diff.log_err()?;
-                let commit_details = commit_details.log_err()?;
+        window.spawn(cx, async move |cx| {
+            let commit_diff = commit_diff?;
+            let commit_details = commit_details?;
+            let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
+            let mut commit_diff = commit_diff.log_err()?;
+            let commit_details = commit_details.log_err()?;
 
-                // Filter to specific file if requested
-                if let Some(ref filter_path) = file_filter {
-                    commit_diff.files.retain(|f| &f.path == filter_path);
-                }
+            // Filter to specific file if requested
+            if let Some(ref filter_path) = file_filter {
+                commit_diff.files.retain(|f| &f.path == filter_path);
+            }
 
-                let repo = repo.upgrade()?;
+            let repo = repo.upgrade()?;
 
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        let project = workspace.project();
-                        let workspace_entity = cx.entity();
-                        let workspace_handle = cx.weak_entity();
-                        let commit_view = cx.new(|cx| {
-                            CommitView::new(
-                                commit_details,
-                                commit_diff,
-                                repo,
-                                project.clone(),
-                                workspace_entity,
-                                workspace_handle,
-                                stash,
-                                file_filter,
-                                window,
-                                cx,
-                            )
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let project = workspace.project();
+                    let workspace_entity = cx.entity();
+                    let workspace_handle = cx.weak_entity();
+                    let commit_view = cx.new(|cx| {
+                        CommitView::new(
+                            commit_details,
+                            commit_diff,
+                            repo,
+                            project.clone(),
+                            workspace_entity,
+                            workspace_handle,
+                            stash,
+                            file_filter,
+                            window,
+                            cx,
+                        )
+                    });
+
+                    let pane = workspace.active_pane();
+                    pane.update(cx, |pane, cx| {
+                        let ix = pane.items().position(|item| {
+                            let commit_view = item.downcast::<CommitView>();
+                            commit_view.is_some_and(|view| view.read(cx).commit.sha == commit_sha)
                         });
+                        if let Some(ix) = ix {
+                            let existing = pane
+                                .items()
+                                .filter_map(|item| item.downcast::<CommitView>())
+                                .find(|view| view.read(cx).commit.sha == commit_sha)
+                                .unwrap();
 
-                        let pane = workspace.active_pane();
-                        pane.update(cx, |pane, cx| {
-                            let ix = pane.items().position(|item| {
-                                let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
-                            });
-                            if let Some(ix) = ix {
-                                let existing = pane
-                                    .items()
-                                    .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
-                                    .unwrap();
-
-                                pane.remove_item(existing.item_id(), false, false, window, cx);
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    Some(ix),
-                                    window,
-                                    cx,
-                                );
-                            } else {
-                                pane.add_item(Box::new(commit_view), true, true, None, window, cx);
-                            }
-                        })
+                            pane.remove_item(existing.item_id(), false, false, window, cx);
+                            pane.add_item(Box::new(commit_view), true, true, Some(ix), window, cx);
+                        } else {
+                            pane.add_item(Box::new(commit_view), true, true, None, window, cx);
+                        }
                     })
-                    .log_err()
-            })
-            .detach();
+                })
+                .log_err()
+        })
     }
 
     fn new(

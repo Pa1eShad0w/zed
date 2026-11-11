@@ -1475,7 +1475,12 @@ pub struct GitGraph {
     log_order: LogOrder,
     selected_commit_diff: Option<CommitDiff>,
     selected_commit_diff_stats: Option<(usize, usize)>,
+    /// The selected commit's diff could not be loaded, as opposed to still loading.
+    selected_commit_diff_failed: bool,
     _commit_diff_task: Option<Task<()>>,
+    /// Set while the commit view opened from this graph is still loading its commit.
+    opening_commit_view: bool,
+    _open_commit_view_task: Option<Task<()>>,
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
@@ -1783,6 +1788,8 @@ impl GitGraph {
             workspace,
             graph_data: graph,
             _commit_diff_task: None,
+            opening_commit_view: false,
+            _open_commit_view_task: None,
             context_menu: None,
             table_interaction_state,
             column_widths,
@@ -1793,6 +1800,7 @@ impl GitGraph {
             graph_canvas_bounds: Rc::new(Cell::new(None)),
             selected_commit_diff: None,
             selected_commit_diff_stats: None,
+            selected_commit_diff_failed: false,
             selected_commit_message: None,
             _selected_commit_message_task: None,
             log_source,
@@ -2459,6 +2467,7 @@ impl GitGraph {
         self.selected_entry_idx = Some(idx);
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
+        self.selected_commit_diff_failed = false;
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
@@ -2484,15 +2493,18 @@ impl GitGraph {
             repository.update(cx, |repo, cx| repo.load_commit_diff(diff_handle, false, cx));
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(diff) = diff_task.await {
-                this.update(cx, |this, cx| {
-                    let stats = compute_diff_stats(&diff);
-                    this.selected_commit_diff = Some(diff);
-                    this.selected_commit_diff_stats = Some(stats);
-                    cx.notify();
-                })
-                .ok();
-            }
+            let diff = diff_task.await.log_err();
+            this.update(cx, |this, cx| {
+                match diff {
+                    Some(diff) => {
+                        this.selected_commit_diff_stats = Some(compute_diff_stats(&diff));
+                        this.selected_commit_diff = Some(diff);
+                    }
+                    None => this.selected_commit_diff_failed = true,
+                }
+                cx.notify();
+            })
+            .ok();
         }));
 
         cx.emit(ItemEvent::Edit);
@@ -2667,15 +2679,26 @@ impl GitGraph {
             return;
         };
 
-        CommitView::open(
+        let open = CommitView::open_task(
             commit_entry.data.sha.to_string(),
             repository.downgrade(),
             self.workspace.clone(),
             None,
             None,
+            false,
             window,
             cx,
         );
+        self.opening_commit_view = true;
+        self._open_commit_view_task = Some(cx.spawn(async move |this, cx| {
+            open.await;
+            this.update(cx, |this, cx| {
+                this.opening_commit_view = false;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// The Perforce changelist label (`@<change>`) for a commit, if its data is loaded and the
@@ -3220,11 +3243,38 @@ impl GitGraph {
                 .render(window, cx)
         };
 
-        let changed_files_count = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| diff.files.len())
-            .unwrap_or(0);
+        let changed_files_label: AnyElement = match &self.selected_commit_diff {
+            Some(diff) => Label::new(format!(
+                "{} Changed {}",
+                diff.files.len(),
+                if diff.files.len() == 1 {
+                    "File"
+                } else {
+                    "Files"
+                }
+            ))
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element(),
+            None if self.selected_commit_diff_failed => Label::new("Couldn't Load Changed Files")
+                .size(LabelSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            None => h_flex()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::LoadCircle)
+                        .color(Color::Muted)
+                        .size(IconSize::Small)
+                        .with_rotate_animation(2),
+                )
+                .child(
+                    Label::new("Loading Changed Files…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        };
 
         let (total_lines_added, total_lines_removed) =
             self.selected_commit_diff_stats.unwrap_or((0, 0));
@@ -3554,19 +3604,7 @@ impl GitGraph {
                             .child(
                                 h_flex()
                                     .gap_1()
-                                    .child(
-                                        Label::new(format!(
-                                            "{} Changed {}",
-                                            changed_files_count,
-                                            if changed_files_count == 1 {
-                                                "File"
-                                            } else {
-                                                "Files"
-                                            }
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    )
+                                    .child(changed_files_label)
                                     .child(Divider::vertical())
                                     .child(view_toggle),
                             )
@@ -3681,6 +3719,7 @@ impl GitGraph {
                                 .color(Color::Muted),
                         )
                         .style(ButtonStyle::OutlinedGhost)
+                        .loading(self.opening_commit_view)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_selected_commit_view(window, cx);
                         })),
@@ -8765,6 +8804,85 @@ mod tests {
                 .as_ref()
                 .map(|m| m.message.entity_id());
             assert_eq!(message_entity_id, new_entity_id);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_detail_panel_tracks_loading_of_changed_files_and_commit_view(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+
+        let commit_sha = Oid::from_bytes(&[1; 20]).expect("commit SHA should be valid");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: commit_sha,
+                parents: smallvec![],
+                ref_names: vec!["HEAD -> main".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Selecting a commit starts loading its changed files; until they arrive the panel is
+        // loading, not showing an empty or failed commit.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        git_graph.read_with(&*cx, |graph, _| {
+            assert!(graph.selected_commit_diff.is_none());
+            assert!(!graph.selected_commit_diff_failed);
+        });
+        cx.run_until_parked();
+        git_graph.read_with(&*cx, |graph, _| {
+            assert!(graph.selected_commit_diff.is_some());
+            assert!(!graph.selected_commit_diff_failed);
+        });
+
+        // Opening the commit view is flagged until the view is in the pane.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.open_selected_commit_view(window, cx);
+        });
+        git_graph.read_with(&*cx, |graph, _| assert!(graph.opening_commit_view));
+        cx.run_until_parked();
+        git_graph.read_with(&*cx, |graph, _| assert!(!graph.opening_commit_view));
+        workspace.read_with(&*cx, |workspace, cx| {
+            let opened = workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .any(|item| item.downcast::<CommitView>().is_some());
+            assert!(opened, "the commit view should be open in the active pane");
         });
     }
 }
