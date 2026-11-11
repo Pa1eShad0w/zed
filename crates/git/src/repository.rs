@@ -113,8 +113,8 @@ pub struct CommitData {
     pub revision_label: Option<SharedString>,
     /// Perforce file revision (`#<rev>`) for the file-history Revision column. `None` for git.
     pub file_revision: Option<SharedString>,
-    /// Perforce integration source branch for the file-history Branch column. `None` for git and
-    /// for plain (non-integrated) Perforce revisions.
+    /// Name of the Perforce stream (or classic-depot branch) holding this file revision, for the
+    /// file-history Branch column. `None` for git.
     pub branch: Option<SharedString>,
 }
 

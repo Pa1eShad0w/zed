@@ -223,6 +223,18 @@ impl P4Cli {
             output.status.success(),
         ))
     }
+
+    /// The stream depth of every stream depot on the server, by depot name. A failed query
+    /// yields no depths, so callers then treat every depot as a classic one.
+    async fn stream_depths(&self) -> HashMap<String, usize> {
+        match self.run(true, &["depots"]).await {
+            Ok(output) => parse_stream_depths(&output),
+            Err(error) => {
+                log::warn!("perforce: could not list depots for their stream depths: {error:#}");
+                HashMap::default()
+            }
+        }
+    }
 }
 
 /// Parse `p4 -ztag` / `p4 fstat` tagged output into a list of records.
@@ -723,42 +735,100 @@ fn parse_integration_branch(line: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// Parse the text output of `p4 filelog -l -t <path>` into one [`FilelogRev`] per revision.
+/// The revisions `p4 filelog` lists under one depot file (newest first). With `-h` the output
+/// follows the file's content across branches, so one history spans several depot files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilelogFile {
+    depot_file: String,
+    revs: Vec<FilelogRev>,
+}
+
+/// Parse the text output of `p4 filelog -l -t <path>` into the listed depot files, each with one
+/// [`FilelogRev`] per revision.
 ///
 /// The non-`-ztag` text form is used (mirroring vscode-perforce's `filelog.ts`) because it frames
 /// the multi-line description cleanly: a depot-path header line, then one `... #<rev> change ...`
-/// record per revision, with the description on following tab-indented lines. Integration records
-/// (`... ... <op> from/into //depot#n`) and blank lines are ignored.
-fn parse_filelog(output: &str) -> Vec<FilelogRev> {
-    let mut revs: Vec<FilelogRev> = Vec::new();
+/// record per revision, with the description on following tab-indented lines. Blank lines are
+/// ignored.
+fn parse_filelog_files(output: &str) -> Vec<FilelogFile> {
+    let mut files: Vec<FilelogFile> = Vec::new();
     let mut desc_lines: Vec<String> = Vec::new();
-    let flush = |revs: &mut Vec<FilelogRev>, desc_lines: &mut Vec<String>| {
-        if let Some(last) = revs.last_mut() {
+    let flush = |files: &mut Vec<FilelogFile>, desc_lines: &mut Vec<String>| {
+        if let Some(last) = files.last_mut().and_then(|file| file.revs.last_mut()) {
             last.desc = desc_lines.join("\n").trim_end().to_string();
         }
         desc_lines.clear();
     };
     for line in output.lines() {
         if let Some(header) = line.strip_prefix("... #") {
-            flush(&mut revs, &mut desc_lines);
-            if let Some(rev) = parse_filelog_header(header) {
-                revs.push(rev);
+            flush(&mut files, &mut desc_lines);
+            if let Some(rev) = parse_filelog_header(header)
+                && let Some(file) = files.last_mut()
+            {
+                file.revs.push(rev);
             }
         } else if let Some(desc) = line.strip_prefix('\t') {
             desc_lines.push(desc.to_string());
         } else if line.starts_with("... ... ") {
             // Integration record: record the first source branch for the current revision.
-            if let Some(last) = revs.last_mut()
+            if let Some(last) = files.last_mut().and_then(|file| file.revs.last_mut())
                 && last.branch.is_none()
                 && let Some(branch) = parse_integration_branch(line)
             {
                 last.branch = Some(branch);
             }
+        } else if line.starts_with("//") {
+            // The description of the previous file's last revision ends here.
+            flush(&mut files, &mut desc_lines);
+            files.push(FilelogFile {
+                depot_file: line.trim_end().to_string(),
+                revs: Vec::new(),
+            });
         }
-        // Everything else (depot-path header, blank lines) is ignored.
     }
-    flush(&mut revs, &mut desc_lines);
-    revs
+    flush(&mut files, &mut desc_lines);
+    files
+}
+
+/// The revisions of [`parse_filelog_files`] as one flat list, without their depot files.
+#[cfg(test)]
+fn parse_filelog(output: &str) -> Vec<FilelogRev> {
+    parse_filelog_files(output)
+        .into_iter()
+        .flat_map(|file| file.revs)
+        .collect()
+}
+
+/// Parse `p4 -ztag depots` into the stream depth of each stream depot: the number of path
+/// segments below the depot name that form a stream root (`//depot/a/b` has depth 2). Classic
+/// depots report no depth and are left out.
+fn parse_stream_depths(ztag_output: &str) -> HashMap<String, usize> {
+    parse_ztag(ztag_output)
+        .into_iter()
+        .filter_map(|record| {
+            let depth = record.get("depth")?.trim().parse::<usize>().ok()?;
+            let name = record.get("name")?.trim().to_string();
+            (depth > 0).then_some((name, depth))
+        })
+        .collect()
+}
+
+/// Split a depot file path into the root of the branch holding it and the path below that root,
+/// e.g. `//depot/dev/feature/a/b.cpp` into `//depot/dev/feature` and `a/b.cpp` for a stream depot
+/// of depth 2. A depot without a stream depth is a classic depot, where the first directory is
+/// the branch by convention. `None` when the path has no file below the branch root.
+fn split_depot_branch<'a>(
+    depot_path: &'a str,
+    stream_depths: &HashMap<String, usize>,
+) -> Option<(&'a str, &'a str)> {
+    let below_slashes = depot_path.strip_prefix("//")?;
+    let (depot, _) = below_slashes.split_once('/')?;
+    let depth = stream_depths.get(depot).copied().unwrap_or(1);
+    // The slash closing the depot name is the first one, so the root ends at slash `depth`.
+    let (root_end, _) = below_slashes.match_indices('/').nth(depth)?;
+    let (root, relative) = depot_path.split_at("//".len() + root_end);
+    let relative = &relative[1..];
+    (!relative.is_empty()).then_some((root, relative))
 }
 
 /// Parse a filelog header body (the part after `... #`): `<rev> change <chnum> <action> on <date>
@@ -856,7 +926,7 @@ fn parse_out_of_date(working_directory: &Path, fstat_output: &str) -> HashSet<Re
 }
 
 /// Build the file-history [`CommitData`] for one filelog revision. `parent` is the next-older
-/// revision's change number (the linear history parent); B1b integration branching is future work.
+/// revision's change number (the linear history parent).
 fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitData {
     CommitData {
         sha: change_to_oid(rev.change),
@@ -876,9 +946,100 @@ fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitDa
         revision_label: Some(format!("@{}", rev.change).into()),
         // File revision (`#<rev>`) for the leading Revision column.
         file_revision: Some(format!("#{}", rev.rev).into()),
-        // Integration source branch (Branch column), blank for a plain edit.
+        // Integration source branch, blank for a plain edit.
         branch: rev.branch.clone().map(Into::into),
     }
+}
+
+/// Build the file-history rows for a `p4 filelog -h` listing, newest first. The rows form one
+/// linear chain across the depot files (each row's parent is the next-older row), and the Branch
+/// column names the stream holding that row's revision, so rows of the same file revision number
+/// in different streams stay distinguishable.
+fn file_history_commits(
+    files: &[FilelogFile],
+    stream_depths: &HashMap<String, usize>,
+) -> Vec<CommitData> {
+    let revs: Vec<(&FilelogFile, &FilelogRev)> = files
+        .iter()
+        .flat_map(|file| file.revs.iter().map(move |rev| (file, rev)))
+        .collect();
+    revs.iter()
+        .enumerate()
+        .map(|(i, (file, rev))| {
+            let parent = revs.get(i + 1).map(|(_, older)| older.change);
+            let branch = split_depot_branch(&file.depot_file, stream_depths)
+                .and_then(|(root, _)| root.rsplit('/').next())
+                .map(|name| SharedString::from(name.to_string()));
+            CommitData {
+                branch,
+                ..filelog_rev_to_commit_data(rev, parent)
+            }
+        })
+        .collect()
+}
+
+/// Longest `p4` argument list passed in one invocation, in bytes. Windows rejects a command line
+/// above 32767 characters, so longer lists are split across several invocations.
+const MAX_ARGUMENTS_LEN: usize = 16_000;
+
+/// Split `args` into consecutive runs whose combined length (one separator per argument
+/// included) stays within `max_len`. An argument longer than `max_len` forms a run of its own.
+fn chunk_args_by_length(args: &[String], max_len: usize) -> Vec<&[String]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut len = 0;
+    for (i, arg) in args.iter().enumerate() {
+        let arg_len = arg.len() + 1;
+        if i > start && len + arg_len > max_len {
+            chunks.push(&args[start..i]);
+            start = i;
+            len = 0;
+        }
+        len += arg_len;
+    }
+    if start < args.len() {
+        chunks.push(&args[start..]);
+    }
+    chunks
+}
+
+/// Choose the repo path each file of a changelist is listed under, in the order of
+/// `depot_paths`. A file in the client view takes the path the view maps it to. Any other file
+/// (typically a change submitted to another stream) takes its path below its own branch root, or
+/// its full depot path when that path is already taken by another file of the change. `None`
+/// only for a path that is not a valid repo path.
+fn commit_file_repo_paths(
+    depot_paths: &[String],
+    depot_to_client: &HashMap<String, String>,
+    client_name: &str,
+    stream_depths: &HashMap<String, usize>,
+) -> Vec<Option<RepoPath>> {
+    let unix_repo_path = |unix: &str| {
+        RelPath::from_unix_str(unix)
+            .ok()
+            .map(|rel_path| RepoPath::from_rel_path(&rel_path))
+    };
+    // Paths in the client view are claimed first, so a file outside the view never displaces one.
+    let mut paths: Vec<Option<RepoPath>> = depot_paths
+        .iter()
+        .map(|depot| {
+            depot_to_client
+                .get(depot)
+                .and_then(|client| client_path_to_repo_path(client_name, client))
+        })
+        .collect();
+    let mut taken: HashSet<RepoPath> = paths.iter().flatten().cloned().collect();
+    for (depot, path) in depot_paths.iter().zip(paths.iter_mut()) {
+        if path.is_some() {
+            continue;
+        }
+        *path = split_depot_branch(depot, stream_depths)
+            .and_then(|(_, relative)| unix_repo_path(relative))
+            .filter(|path| !taken.contains(path))
+            .or_else(|| unix_repo_path(depot.trim_start_matches('/')));
+        taken.extend(path.clone());
+    }
+    paths
 }
 
 /// One annotated file line from `p4 -ztag annotate -c -u -i`.
@@ -1778,10 +1939,11 @@ impl GitRepository for PerforceRepository {
             .boxed()
     }
 
-    /// The per-file diff of a change, for the CommitView opened from file history. `describe`
-    /// lists the changed files (depot paths + their revs); `where` maps those to workspace repo
-    /// paths (without hardcoding the stream root); `print` fetches the new (`#rev`) and old
-    /// (`#rev-1`) content for the editor to diff.
+    /// The per-file diff of a change, for the file-history detail panel and the CommitView.
+    /// `describe` lists the changed files (depot paths + their revs); `where` maps the ones in
+    /// the client view to workspace repo paths, and the rest (a change submitted to another
+    /// stream) are listed by their path below their own stream root; `print` fetches the new
+    /// (`#rev`) and old (`#rev-1`) content for the editor to diff.
     fn load_commit(
         &self,
         commit: String,
@@ -1809,18 +1971,35 @@ impl GitRepository for PerforceRepository {
                     });
                 }
 
-                // One `p4 where` maps every depot path in the change to its client path.
-                let mut where_args = vec!["where".to_string()];
-                where_args.extend(files.iter().map(|(depot, _, _)| depot.clone()));
-                let where_out = cli.run(true, &where_args).await.unwrap_or_default();
-                let depot_to_client = parse_where(&where_out);
+                let depot_paths: Vec<String> =
+                    files.iter().map(|(depot, _, _)| depot.clone()).collect();
+                let mut depot_to_client = HashMap::default();
+                for chunk in chunk_args_by_length(&depot_paths, MAX_ARGUMENTS_LEN) {
+                    let mut where_args = vec!["where".to_string()];
+                    where_args.extend(chunk.iter().cloned());
+                    // Lenient: files outside the client view are reported as errors, while the
+                    // mapped ones are still printed.
+                    let (where_out, _, _) = cli.run_lenient(true, &where_args).await?;
+                    depot_to_client.extend(parse_where(&where_out));
+                }
+                let all_in_view = depot_paths
+                    .iter()
+                    .all(|depot| depot_to_client.contains_key(depot));
+                let stream_depths = if all_in_view {
+                    HashMap::default()
+                } else {
+                    cli.stream_depths().await
+                };
+                let repo_paths = commit_file_repo_paths(
+                    &depot_paths,
+                    &depot_to_client,
+                    &client_name,
+                    &stream_depths,
+                );
 
                 let mut commit_files = Vec::new();
-                for (depot, rev, action) in files {
-                    let Some(repo_path) = depot_to_client
-                        .get(&depot)
-                        .and_then(|client| client_path_to_repo_path(&client_name, client))
-                    else {
+                for ((depot, rev, action), repo_path) in files.into_iter().zip(repo_paths) {
+                    let Some(repo_path) = repo_path else {
                         continue;
                     };
                     let is_add =
@@ -2172,10 +2351,11 @@ impl GitRepository for PerforceRepository {
     }
 
     /// File history (the "View File History" action): stream the file's revisions as graph
-    /// commits. `p4 filelog -l -t -m <max>` gives the linear revision list (newest first); each
-    /// revision becomes a commit whose parent is the next-older revision (B1b integration branching
-    /// is future work). The per-change [`CommitData`] is cached so the commit-data reader and
-    /// `show` need no further `p4` calls. Only `LogSource::Path` is supported.
+    /// commits. `p4 filelog -l -t -h -m <max>` gives the revision list (newest first), following
+    /// the file's content into the depot files it was copied from; each revision becomes a commit
+    /// whose parent is the next-older revision. The per-change [`CommitData`] is cached so the
+    /// commit-data reader and `show` need no further `p4` calls. Only `LogSource::Path` is
+    /// supported.
     fn initial_graph_data(
         &self,
         log_source: LogSource,
@@ -2203,20 +2383,18 @@ impl GitRepository for PerforceRepository {
                 max_arg.as_str(),
                 client_path.as_str(),
             ];
-            let out = cli.run(false, &args).await?;
-            let revs = parse_filelog(&out);
-            let mut initial = Vec::with_capacity(revs.len());
+            let (out, stream_depths) = futures::join!(cli.run(false, &args), cli.stream_depths());
+            let files = parse_filelog_files(&out?);
+            let mut initial = Vec::new();
             {
                 let mut cache = cache.lock();
-                for (i, rev) in revs.iter().enumerate() {
-                    let parent = revs.get(i + 1).map(|r| r.change);
-                    let data = filelog_rev_to_commit_data(rev, parent);
+                for data in file_history_commits(&files, &stream_depths) {
                     initial.push(Arc::new(InitialGraphCommitData {
                         sha: data.sha,
                         parents: data.parents.clone(),
                         ref_names: Vec::new(),
                     }));
-                    cache.insert(rev.change, data);
+                    cache.insert(oid_to_change(&data.sha), data);
                 }
             }
             request_tx.send(initial).await.ok();
@@ -4009,5 +4187,315 @@ line two
         assert!(action_to_status("delete").unwrap().is_deleted());
         assert!(action_to_status("move/delete").unwrap().is_deleted());
         assert!(action_to_status("nonsense").is_none());
+    }
+
+    // ---- file history across branches (p4 filelog -h) ----
+
+    /// `p4 filelog -l -t -h` output for a file whose content was copied up from another stream:
+    /// each contributing depot file has its own header, and integration records follow the
+    /// description. (Identifiers are synthetic fixtures.)
+    const CROSS_STREAM_FILELOG: &str = "\
+//Depot.Project/Development/branch_b/a/b.cpp
+... #3 change 6400300 integrate on 2023/03/01 00:00:00 by someuser@some_client_name (text)
+
+\tCopy up
+
+... ... copy into //Depot.Project/Release/branch_r/a/b.cpp#1
+... ... copy from //Depot.Project/Development/branch_a/a/b.cpp#2
+//Depot.Project/Development/branch_a/a/b.cpp
+... #2 change 6400200 edit on 2023/02/01 00:00:00 by someuser@some_client_name (text)
+
+\tEdit
+
+... ... copy into //Depot.Project/Development/branch_b/a/b.cpp#3
+... #1 change 6400100 add on 2023/01/01 00:00:00 by someuser@some_client_name (text)
+
+\tInitial
+
+";
+
+    const STREAM_DEPOTS: &str = "\
+... name Classic
+... time 1600000000
+... type local
+... map Classic/...
+... desc Classic depot
+
+with a blank line in its description
+
+... name Depot.Project
+... time 1600000000
+... type stream
+... depth 2
+... map Depot.Project/...
+... desc Stream depot
+";
+
+    #[test]
+    fn filelog_groups_revisions_under_their_depot_file() {
+        let files = parse_filelog_files(CROSS_STREAM_FILELOG);
+        let summary: Vec<(&str, Vec<u32>)> = files
+            .iter()
+            .map(|file| {
+                (
+                    file.depot_file.as_str(),
+                    file.revs.iter().map(|rev| rev.change).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "//Depot.Project/Development/branch_b/a/b.cpp",
+                    vec![6400300]
+                ),
+                (
+                    "//Depot.Project/Development/branch_a/a/b.cpp",
+                    vec![6400200, 6400100]
+                ),
+            ]
+        );
+        assert_eq!(files[0].revs[0].desc, "Copy up");
+    }
+
+    #[test]
+    fn stream_depths_come_from_stream_depots_only() {
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        assert_eq!(depths.get("Depot.Project"), Some(&2));
+        assert_eq!(depths.get("Classic"), None);
+        assert_eq!(depths.len(), 1);
+    }
+
+    #[test]
+    fn depot_path_splits_at_the_stream_root() {
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        assert_eq!(
+            split_depot_branch("//Depot.Project/Development/branch_b/a/b.cpp", &depths),
+            Some(("//Depot.Project/Development/branch_b", "a/b.cpp"))
+        );
+        // A classic depot has no stream spec; its first directory is the branch.
+        assert_eq!(
+            split_depot_branch("//Classic/main/a/b.cpp", &depths),
+            Some(("//Classic/main", "a/b.cpp"))
+        );
+        // Not deep enough to hold a file below the stream root.
+        assert_eq!(
+            split_depot_branch("//Depot.Project/Development/branch_b", &depths),
+            None
+        );
+        assert_eq!(split_depot_branch("//Depot.Project", &depths), None);
+        assert_eq!(split_depot_branch("a/b.cpp", &depths), None);
+    }
+
+    #[test]
+    fn file_history_branch_is_the_stream_holding_each_revision() {
+        // Every row names the stream its revision lives in — also the plain edits, and never the
+        // stream an integration was copied from or into.
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        let commits = file_history_commits(&parse_filelog_files(CROSS_STREAM_FILELOG), &depths);
+        let rows: Vec<(Option<&str>, Option<&str>, Option<&str>)> = commits
+            .iter()
+            .map(|data| {
+                (
+                    data.revision_label.as_deref(),
+                    data.file_revision.as_deref(),
+                    data.branch.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("@6400300"), Some("#3"), Some("branch_b")),
+                (Some("@6400200"), Some("#2"), Some("branch_a")),
+                (Some("@6400100"), Some("#1"), Some("branch_a")),
+            ]
+        );
+        // The history stays one linear chain across the depot files.
+        assert_eq!(commits[0].parents.as_slice(), &[change_to_oid(6400200)]);
+        assert_eq!(commits[1].parents.as_slice(), &[change_to_oid(6400100)]);
+        assert!(commits[2].parents.is_empty());
+    }
+
+    #[test]
+    fn commit_file_path_prefers_the_client_view_then_the_stream_relative_path() {
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        let mut depot_to_client = HashMap::default();
+        depot_to_client.insert(
+            "//Depot.Project/Development/branch_x/remapped/b.cpp".to_string(),
+            "//some_client_name/a/b.cpp".to_string(),
+        );
+        let depot_paths = [
+            "//Depot.Project/Development/branch_b/a/b.cpp",
+            "//Depot.Project/Development/branch_x/remapped/b.cpp",
+            "//Depot.Project/Development/branch_b/c/new.md",
+        ]
+        .map(str::to_string);
+        let paths =
+            commit_file_repo_paths(&depot_paths, &depot_to_client, "some_client_name", &depths);
+        assert_eq!(
+            paths,
+            vec![
+                // Its path below the stream root belongs to a file in the client view, so it
+                // keeps its full depot path instead of replacing that file.
+                Some(repo_path("Depot.Project/Development/branch_b/a/b.cpp")),
+                // In the client view: the view decides, even when it remaps the path.
+                Some(repo_path("a/b.cpp")),
+                // Outside the client view (another stream): the path below that stream's root.
+                Some(repo_path("c/new.md")),
+            ]
+        );
+    }
+
+    #[test]
+    fn long_argument_lists_split_under_the_command_line_budget() {
+        let args: Vec<String> = ["aaaa", "bbbb", "cccc", "dddddddddddd", "ee"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let chunks: Vec<Vec<&str>> = chunk_args_by_length(&args, 10)
+            .into_iter()
+            .map(|chunk| chunk.iter().map(String::as_str).collect())
+            .collect();
+        // An argument longer than the budget still gets a chunk of its own.
+        assert_eq!(
+            chunks,
+            vec![
+                vec!["aaaa", "bbbb"],
+                vec!["cccc"],
+                vec!["dddddddddddd"],
+                vec!["ee"]
+            ]
+        );
+        assert!(chunk_args_by_length(&[], 10).is_empty());
+    }
+
+    /// A fake `p4` that answers each subcommand with the bytes of `<subcommand>.out` in the
+    /// workspace root, and answers `print -q <filespec>` with the filespec itself.
+    fn scripted_p4_repository(
+        cx: &mut gpui::TestAppContext,
+        responses: &[(&str, &str)],
+    ) -> (tempfile::TempDir, PerforceRepository) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        for (subcommand, output) in responses {
+            std::fs::write(directory.path().join(format!("{subcommand}.out")), output).unwrap();
+        }
+        let script = if cfg!(windows) {
+            "@echo off\r\nset cmd=%~1\r\nif \"%cmd%\"==\"-ztag\" set cmd=%~2\r\nif \"%cmd%\"==\"print\" (\r\necho %~3\r\nexit /b 0\r\n)\r\nif exist \"%cmd%.out\" (\r\ntype \"%cmd%.out\"\r\nexit /b 0\r\n)\r\nexit /b 1\r\n"
+        } else {
+            "#!/bin/sh\ncmd=\"$1\"\nif [ \"$cmd\" = -ztag ]; then cmd=\"$2\"; fi\nif [ \"$cmd\" = print ]; then echo \"$3\"; exit 0; fi\nif [ -f \"$cmd.out\" ]; then cat \"$cmd.out\"; exit 0; fi\nexit 1\n"
+        };
+        let binary = directory.path().join(if cfg!(windows) {
+            "fake-p4.cmd"
+        } else {
+            "fake-p4"
+        });
+        std::fs::write(&binary, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repository = PerforceRepository::new(
+            binary,
+            PerforceWorkspace {
+                client_root: directory.path().to_path_buf(),
+                client_name: "some_client_name".into(),
+            },
+            Arc::default(),
+            50,
+            directory.path().join(".p4config"),
+            cx.background_executor.clone(),
+        );
+        (directory, repository)
+    }
+
+    #[gpui::test]
+    async fn file_history_rows_carry_the_stream_of_each_revision(cx: &mut gpui::TestAppContext) {
+        let (_directory, repository) = scripted_p4_repository(
+            cx,
+            &[("filelog", CROSS_STREAM_FILELOG), ("depots", STREAM_DEPOTS)],
+        );
+        let (tx, rx) = async_channel::unbounded();
+        repository
+            .initial_graph_data(
+                LogSource::Path(repo_path("a/b.cpp")),
+                LogOrder::default(),
+                tx,
+            )
+            .await
+            .unwrap();
+        let rows = rx.recv().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let cache = repository.history_cache.lock();
+        let branch_of = |change: u32| cache.get(&change).and_then(|data| data.branch.clone());
+        assert_eq!(branch_of(6400300).as_deref(), Some("branch_b"));
+        assert_eq!(branch_of(6400200).as_deref(), Some("branch_a"));
+        assert_eq!(branch_of(6400100).as_deref(), Some("branch_a"));
+    }
+
+    #[gpui::test]
+    async fn commit_of_another_stream_lists_its_changed_files(cx: &mut gpui::TestAppContext) {
+        // The change lives in a stream this client does not map, so `p4 where` resolves none of
+        // its files; they must still be listed, with the contents of `#rev` against `#rev-1`.
+        let describe = "\
+... change 6400300
+... user someuser
+... time 1700000000
+... desc Copy up
+... depotFile0 //Depot.Project/Development/branch_b/a/b.cpp
+... action0 integrate
+... type0 text
+... rev0 3
+... depotFile1 //Depot.Project/Development/branch_b/c/new.md
+... action1 add
+... type1 text
+... rev1 1
+";
+        let (_directory, repository) = scripted_p4_repository(
+            cx,
+            &[
+                ("describe", describe),
+                ("where", ""),
+                ("depots", STREAM_DEPOTS),
+            ],
+        );
+        let diff = repository
+            .load_commit(change_to_oid(6400300).to_string(), false, cx.to_async())
+            .await
+            .unwrap();
+        let text = |content: &Option<Vec<u8>>| {
+            content
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+        };
+        let files: Vec<(RepoPath, Option<String>, Option<String>)> = diff
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    text(&file.old_content),
+                    text(&file.new_content),
+                )
+            })
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                (
+                    repo_path("a/b.cpp"),
+                    Some("//Depot.Project/Development/branch_b/a/b.cpp#2".to_string()),
+                    Some("//Depot.Project/Development/branch_b/a/b.cpp#3".to_string()),
+                ),
+                (
+                    repo_path("c/new.md"),
+                    None,
+                    Some("//Depot.Project/Development/branch_b/c/new.md#1".to_string()),
+                ),
+            ]
+        );
     }
 }
