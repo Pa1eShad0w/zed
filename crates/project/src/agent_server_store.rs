@@ -1605,17 +1605,20 @@ async fn registry_npx_executable(
     };
     // Read from the same package.json as the executable so both describe the same copy.
     let installed_version =
-        node_runtime::read_package_installed_version(node_modules_dir, package_name)
+        node_runtime::read_package_installed_version(node_modules_dir.clone(), package_name)
             .await
             .log_err()
             .flatten();
     let version_ceiling = npm_package_spec_version(registry_package);
 
-    if fs.is_file(&installed_executable).await
-        && !should_install_registry_npx_package(
-            installed_version.as_ref(),
-            version_ceiling.as_ref(),
-        )
+    if can_start_installed_registry_npx_package(
+        fs,
+        &node_modules_dir,
+        &installed_executable,
+        installed_version.as_ref(),
+        version_ceiling.as_ref(),
+    )
+    .await
     {
         log::debug!(
             "skipping npm install for registry agent {registry_id:?}: \
@@ -1645,6 +1648,25 @@ async fn registry_npx_executable(
             Ok(installed_executable)
         }
     }
+}
+
+/// Whether the copy on disk can be started without running `npm install`: its executable exists,
+/// it is exactly at the version the registry names, and no package in `node_modules` is missing its
+/// package.json. An install interrupted mid-extraction leaves such a package behind; skipping the
+/// install would keep failing with `ERR_MODULE_NOT_FOUND`, because only the reinstall repairs it.
+async fn can_start_installed_registry_npx_package(
+    fs: &dyn Fs,
+    node_modules_dir: &Path,
+    installed_executable: &Path,
+    installed_version: Option<&Version>,
+    version_ceiling: Option<&Version>,
+) -> bool {
+    fs.is_file(installed_executable).await
+        && !should_install_registry_npx_package(installed_version, version_ceiling)
+        && find_incomplete_npm_package(fs, node_modules_dir)
+            .await
+            .log_err()
+            .is_some_and(|incomplete_package_dir| incomplete_package_dir.is_none())
 }
 
 async fn install_registry_npx_package(
@@ -2717,5 +2739,59 @@ mod tests {
                 "version {version}: unexpected error: {error:#}"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_registry_npx_does_not_skip_install_for_incomplete_packages(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let node_modules_dir = Path::new("/agent/node_modules");
+        fs.insert_tree(
+            node_modules_dir,
+            serde_json::json!({
+                "agent-acp": {
+                    "package.json": "{}",
+                    "dist": { "index.js": "" },
+                },
+                "@anthropic-ai": {
+                    "claude-agent-sdk": { "package.json": "{}" },
+                },
+            }),
+        )
+        .await;
+        let executable = node_modules_dir.join("agent-acp/dist/index.js");
+        let registry_version = Version::parse("0.95.0").unwrap();
+
+        assert!(
+            can_start_installed_registry_npx_package(
+                fs.as_ref(),
+                node_modules_dir,
+                &executable,
+                Some(&registry_version),
+                Some(&registry_version),
+            )
+            .await
+        );
+
+        // An interrupted install can leave a dependency without its package.json while the agent
+        // package is complete and at the registry version; only a reinstall repairs it.
+        fs.remove_file(
+            &node_modules_dir.join("@anthropic-ai/claude-agent-sdk/package.json"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !can_start_installed_registry_npx_package(
+                fs.as_ref(),
+                node_modules_dir,
+                &executable,
+                Some(&registry_version),
+                Some(&registry_version),
+            )
+            .await
+        );
     }
 }
