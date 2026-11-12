@@ -744,24 +744,33 @@ struct FilelogRev {
     time: Option<i64>,
     /// Full changelist description (tab-indented lines joined), from `-l`.
     desc: String,
-    /// Integration source branch for this revision, if it was branched/copied/merged/integrated
-    /// from elsewhere (parsed from the `... ... <op> from //depot/<branch>/...` line). `None` for a
-    /// plain edit on the file's own branch.
-    branch: Option<String>,
+    /// Where the revision's content came from, if it was branched/copied/merged/moved from
+    /// another file. `None` for a revision made on the file itself.
+    source: Option<IntegrationSource>,
 }
 
-/// Extract the source branch from a filelog integration line body — the text after `... ... `,
-/// e.g. `branch from //Depot.Project/Main/a/b.cpp#4`. Only `from` records are sources (`into`
-/// records are targets). The branch is the second depot-path segment (`Main` above), which groups
-/// history by branch without assuming a stream depth.
-fn parse_integration_branch(line: &str) -> Option<String> {
+/// The source of an integrated revision, from a filelog integration record such as
+/// `... ... copy from //Depot.Project/Main/a/b.cpp#4,#7`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntegrationSource {
+    /// What the integration did, e.g. `copy from`, `merge from`, `moved from`.
+    how: String,
+    depot_file: String,
+    /// The source revision or revision range, as printed: `#7` or `#4,#7`.
+    revs: String,
+}
+
+/// Parse a filelog integration record (`... ... <how> from //depot/path#revs`). Only `from`
+/// records are sources; `into` records are targets and yield `None`.
+fn parse_integration_source(line: &str) -> Option<IntegrationSource> {
     let body = line.strip_prefix("... ... ")?;
-    let (_op, rest) = body.split_once(" from //")?;
-    // `rest` is now `<branch>/<path...>#rev`; the first segment is the depot, the second the branch.
-    let mut segments = rest.split('/');
-    let _depot = segments.next()?;
-    let branch = segments.next()?;
-    (!branch.is_empty()).then(|| branch.to_string())
+    let (verb, rest) = body.split_once(" from //")?;
+    let (path, revs) = rest.split_once('#')?;
+    Some(IntegrationSource {
+        how: format!("{verb} from"),
+        depot_file: format!("//{path}"),
+        revs: format!("#{}", revs.trim_end()),
+    })
 }
 
 /// The revisions `p4 filelog` lists under one depot file (newest first). With `-h` the output
@@ -799,12 +808,11 @@ fn parse_filelog_files(output: &str) -> Vec<FilelogFile> {
         } else if let Some(desc) = line.strip_prefix('\t') {
             desc_lines.push(desc.to_string());
         } else if line.starts_with("... ... ") {
-            // Integration record: record the first source branch for the current revision.
+            // Integration record: keep the first source of the current revision.
             if let Some(last) = files.last_mut().and_then(|file| file.revs.last_mut())
-                && last.branch.is_none()
-                && let Some(branch) = parse_integration_branch(line)
+                && last.source.is_none()
             {
-                last.branch = Some(branch);
+                last.source = parse_integration_source(line);
             }
         } else if line.starts_with("//") {
             // The description of the previous file's last revision ends here.
@@ -886,7 +894,7 @@ fn parse_filelog_header(s: &str) -> Option<FilelogRev> {
         user,
         time: parse_p4_datetime(date_part.trim()),
         desc: String::new(),
-        branch: None,
+        source: None,
     })
 }
 
@@ -961,30 +969,29 @@ fn parse_out_of_date(working_directory: &Path, fstat_output: &str) -> HashSet<Re
         .collect()
 }
 
-/// Build the file-history [`CommitData`] for one filelog revision. `parent` is the next-older
-/// revision's change number (the linear history parent).
-fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitData {
-    CommitData {
-        sha: change_to_oid(rev.change),
-        parents: parent.map(change_to_oid).into_iter().collect(),
-        author_name: rev.user.clone().into(),
-        author_email: SharedString::default(),
-        commit_timestamp: rev.time.unwrap_or(0),
-        subject: rev
-            .desc
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string()
-            .into(),
-        message: rev.desc.clone().into(),
-        // Decimal changelist for the "Commit" column / detail header (not the synthetic-Oid hex).
-        revision_label: Some(format!("@{}", rev.change).into()),
-        // File revision (`#<rev>`) for the leading Revision column.
-        file_revision: Some(format!("#{}", rev.rev).into()),
-        // Integration source branch, blank for a plain edit.
-        branch: rev.branch.clone().map(Into::into),
-    }
+/// The Action column of a file-history row: the action that created the revision and, for an
+/// integration, where its content came from. The same file in another branch is named by that
+/// branch; a source at a different path (a rename) is named by its depot path.
+fn file_history_action(
+    file: &FilelogFile,
+    rev: &FilelogRev,
+    stream_depths: &HashMap<String, usize>,
+) -> String {
+    let Some(source) = &rev.source else {
+        return rev.action.clone();
+    };
+    let own = split_depot_branch(&file.depot_file, stream_depths);
+    let from = split_depot_branch(&source.depot_file, stream_depths);
+    let source_name = match (own, from) {
+        (Some((_, own_path)), Some((root, source_path))) if own_path == source_path => {
+            root.rsplit('/').next().unwrap_or(root)
+        }
+        _ => source.depot_file.as_str(),
+    };
+    format!(
+        "{} ({} {}{})",
+        rev.action, source.how, source_name, source.revs
+    )
 }
 
 /// Build the file-history rows for a `p4 filelog -h` listing, newest first. The rows form one
@@ -1018,9 +1025,22 @@ fn file_history_commits(
                     .map(|(older, ..)| *older)
                     .into_iter()
                     .collect(),
+                author_name: rev.user.clone().into(),
+                author_email: SharedString::default(),
                 commit_timestamp: rev.time.map_or(0, |time| time - server_utc_offset),
+                subject: rev
+                    .desc
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+                    .into(),
+                message: rev.desc.clone().into(),
+                // Decimal changelist for the Change column / detail header, not the id's hex.
+                revision_label: Some(format!("@{}", rev.change).into()),
+                file_revision: Some(format!("#{}", rev.rev).into()),
+                action: Some(file_history_action(file, rev, stream_depths).into()),
                 branch,
-                ..filelog_rev_to_commit_data(rev, None)
             }
         })
         .collect()
@@ -2520,6 +2540,7 @@ impl GitRepository for PerforceRepository {
                         // integration branch here, so show just the decimal changelist.
                         revision_label: Some(format!("@{change}").into()),
                         file_revision: None,
+                        action: None,
                         branch: None,
                     })
                 }
@@ -3760,44 +3781,56 @@ line two
     #[test]
     fn filelog_commit_data_splits_rev_change_branch_columns() {
         // File history columns (decimal, not synthetic-Oid hex): Revision `#<rev>`, Commit
-        // `@<change>`, Branch (integration source or none for a plain edit).
-        let plain = FilelogRev {
-            rev: 3,
-            change: 6596347,
-            action: "edit".into(),
-            user: "someuser".into(),
-            time: Some(0),
-            desc: "Fix the thing".into(),
-            branch: None,
+        // `@<change>`, Action, Branch (the stream holding the revision, also for a plain edit).
+        let file = FilelogFile {
+            depot_file: "//Depot.Project/Release/branch_x/a/b.cpp".into(),
+            revs: vec![FilelogRev {
+                rev: 3,
+                change: 6596347,
+                action: "edit".into(),
+                user: "someuser".into(),
+                time: Some(0),
+                desc: "Fix the thing\nsecond line".into(),
+                source: None,
+            }],
         };
-        let data = filelog_rev_to_commit_data(&plain, Some(6500000));
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        let commits = file_history_commits(&[file], &depths, 0);
+        assert_eq!(commits.len(), 1);
+        let data = &commits[0];
         assert_eq!(data.file_revision.as_deref(), Some("#3"));
         assert_eq!(data.revision_label.as_deref(), Some("@6596347"));
-        assert_eq!(data.branch, None);
-
-        let integrated = FilelogRev {
-            branch: Some("Main".into()),
-            ..plain
-        };
-        let data = filelog_rev_to_commit_data(&integrated, None);
-        assert_eq!(data.branch.as_deref(), Some("Main"));
+        assert_eq!(data.action.as_deref(), Some("edit"));
+        assert_eq!(data.branch.as_deref(), Some("branch_x"));
+        assert_eq!(data.author_name.as_ref(), "someuser");
+        assert_eq!(data.subject.as_ref(), "Fix the thing");
+        assert_eq!(data.message.as_ref(), "Fix the thing\nsecond line");
     }
 
     #[test]
-    fn filelog_captures_integration_source_branch() {
-        // The `... ... <op> from //depot/<branch>/...` line supplies the source branch (2nd segment).
+    fn filelog_captures_integration_source() {
+        // The `... ... <how> from //depot/path#revs` record says where the revision's content
+        // came from; `into` records are targets and are not sources.
         let output = "\
 //Depot.Project/Release/branch_x/a/b.cpp
 ... #2 change 6400001 integrate on 2023/02/01 00:00:00 by someuser@some_client_name (text)
-... ... merge from //Depot.Project/Main/a/b.cpp#7
+... ... copy into //Depot.Project/Release/branch_y/a/b.cpp#1
+... ... merge from //Depot.Project/Main/a/b.cpp#5,#7
 \tMerged from main
 ... #1 change 6400000 add on 2023/01/01 00:00:00 by someuser@some_client_name (text)
 \tInitial
 ";
         let revs = parse_filelog(output);
         assert_eq!(revs.len(), 2);
-        assert_eq!(revs[0].branch.as_deref(), Some("Main"));
-        assert_eq!(revs[1].branch, None);
+        assert_eq!(
+            revs[0].source,
+            Some(IntegrationSource {
+                how: "merge from".into(),
+                depot_file: "//Depot.Project/Main/a/b.cpp".into(),
+                revs: "#5,#7".into(),
+            })
+        );
+        assert_eq!(revs[1].source, None);
     }
 
     #[test]
@@ -4383,6 +4416,44 @@ with a blank line in its description
         assert!(commits[2].parents.is_empty());
         // The change number stays recoverable from every row id.
         assert_eq!(oid_to_change(&commits[0].sha), 6400300);
+    }
+
+    #[test]
+    fn file_history_action_names_where_an_integration_came_from() {
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        let actions = |filelog: &str| -> Vec<String> {
+            file_history_commits(&parse_filelog_files(filelog), &depths, 0)
+                .iter()
+                .map(|data| data.action.as_deref().unwrap_or_default().to_string())
+                .collect()
+        };
+        // The same file in another stream is named by that stream; a plain action stands alone.
+        assert_eq!(
+            actions(CROSS_STREAM_FILELOG),
+            vec!["integrate (copy from branch_a#2)", "edit", "add"]
+        );
+        // A source at a different path (a rename) is named by its depot path, since the stream
+        // alone would not say which file it was.
+        let renamed = "\
+//Depot.Project/Development/branch_b/new/name.cpp
+... #1 change 6400400 move/add on 2023/04/01 00:00:00 by someuser@some_client_name (text)
+
+\tRename
+
+... ... moved from //Depot.Project/Development/branch_b/old/name.cpp#1,#4
+//Depot.Project/Development/branch_b/old/name.cpp
+... #4 change 6400350 edit on 2023/03/15 00:00:00 by someuser@some_client_name (text)
+
+\tEdit
+
+";
+        assert_eq!(
+            actions(renamed),
+            vec![
+                "move/add (moved from //Depot.Project/Development/branch_b/old/name.cpp#1,#4)",
+                "edit"
+            ]
+        );
     }
 
     #[test]

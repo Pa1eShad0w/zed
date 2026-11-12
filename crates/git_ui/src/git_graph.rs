@@ -79,6 +79,9 @@ const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
+/// Columns of the Perforce file-history table: Revision, Action, Description, Date, Author,
+/// Change, Branch.
+const PERFORCE_HISTORY_COLUMN_COUNT: usize = 7;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 struct CopiedState {
@@ -1601,21 +1604,26 @@ impl GitGraph {
     }
 
     fn table_column_width_config(&self, window: &Window, cx: &App) -> ColumnWidthConfig {
-        // Perforce file history has its own 6-column table (no graph column), so it bypasses the
-        // git 5-tuple normalization entirely and normalizes its 6 widths directly.
+        // Perforce file history has its own table (no graph column), so it bypasses the git
+        // 5-tuple normalization entirely and normalizes its own widths directly.
         if self.perforce_file_history {
             let fractions = self
                 .column_widths
                 .read(cx)
                 .preview_fractions(window.rem_size());
-            let raw: Vec<f32> = (0..6usize).map(|i| *fractions.expect_get(i)).collect();
+            let raw: Vec<f32> = (0..PERFORCE_HISTORY_COLUMN_COUNT)
+                .map(|i| *fractions.expect_get(i))
+                .collect();
             let total: f32 = raw.iter().sum();
             let widths = if total > 0.0 {
                 raw.iter()
                     .map(|f| DefiniteLength::Fraction(f / total))
                     .collect()
             } else {
-                vec![DefiniteLength::Fraction(1.0 / 6.0); 6]
+                vec![
+                    DefiniteLength::Fraction(1.0 / PERFORCE_HISTORY_COLUMN_COUNT as f32);
+                    PERFORCE_HISTORY_COLUMN_COUNT
+                ]
             };
             return ColumnWidthConfig::explicit(widths);
         }
@@ -1647,22 +1655,22 @@ impl GitGraph {
         }
     }
 
-    /// The 6-column width state for a Perforce file history: Revision, Description, Date, Author,
-    /// Change, Branch. Built here (not inline) so the async perforce-resolution fallback can rebuild
-    /// it identically.
+    /// The column width state for a Perforce file history. Built here (not inline) so the async
+    /// perforce-resolution fallback can rebuild it identically.
     fn perforce_history_column_widths(cx: &mut App) -> Entity<RedistributableColumnsState> {
         cx.new(|_cx| {
             RedistributableColumnsState::new(
-                6,
+                PERFORCE_HISTORY_COLUMN_COUNT,
                 vec![
-                    DefiniteLength::Fraction(0.07), // Revision (#rev)
-                    DefiniteLength::Fraction(0.55), // Description
+                    DefiniteLength::Fraction(0.06), // Revision (#rev)
+                    DefiniteLength::Fraction(0.16), // Action
+                    DefiniteLength::Fraction(0.40), // Description
                     DefiniteLength::Fraction(0.11), // Date
                     DefiniteLength::Fraction(0.10), // Author
-                    DefiniteLength::Fraction(0.09), // Change (@change)
-                    DefiniteLength::Fraction(0.08), // Branch
+                    DefiniteLength::Fraction(0.08), // Change (@change)
+                    DefiniteLength::Fraction(0.09), // Branch
                 ],
-                vec![TableResizeBehavior::Resizable; 6],
+                vec![TableResizeBehavior::Resizable; PERFORCE_HISTORY_COLUMN_COUNT],
             )
         })
     }
@@ -1817,7 +1825,7 @@ impl GitGraph {
         };
 
         // Fallback: if this is a file history whose repo wasn't resolved yet at the peek above,
-        // resolve it asynchronously and, if Perforce, upgrade to the 6-column layout. Never fires
+        // resolve it asynchronously and, if Perforce, upgrade to the Perforce layout. Never fires
         // for git (is_perforce_resolved stays false), so git file history keeps its 4 columns.
         if is_path_history && !perforce_now {
             if let Some(repo) = this.get_repository(cx) {
@@ -2137,7 +2145,11 @@ impl GitGraph {
                 let Some((commit, repository)) =
                     self.graph_data.commits.get(idx).zip(repository.as_ref())
                 else {
-                    let cols = if self.perforce_file_history { 6 } else { 4 };
+                    let cols = if self.perforce_file_history {
+                        PERFORCE_HISTORY_COLUMN_COUNT
+                    } else {
+                        TABLE_COLUMN_COUNT
+                    };
                     return (0..cols)
                         .map(|_| div().h(row_height).into_any_element())
                         .collect();
@@ -2156,6 +2168,7 @@ impl GitGraph {
                 let author_email: Option<SharedString>;
                 // Perforce file-history extra columns (empty for git / while loading).
                 let mut file_revision: SharedString = SharedString::default();
+                let mut file_action: SharedString = SharedString::default();
                 let mut branch_name: SharedString = SharedString::default();
 
                 if let CommitDataState::Loaded(ref data) = data {
@@ -2169,6 +2182,7 @@ impl GitGraph {
                         short_sha = label.clone();
                     }
                     file_revision = data.file_revision.clone().unwrap_or_default();
+                    file_action = data.action.clone().unwrap_or_default();
                     branch_name = data.branch.clone().unwrap_or_default();
                 } else {
                     subject = "Loading…".into();
@@ -2249,9 +2263,12 @@ impl GitGraph {
                     },
                     column_label(short_sha),
                 ];
-                // Perforce file history: prepend the Revision (#rev) column and append Branch.
+                // Perforce file history: Revision (#rev) and Action lead the row, Branch ends it.
                 if self.perforce_file_history {
-                    cells.insert(0, column_label(file_revision));
+                    cells.splice(
+                        0..0,
+                        [column_label(file_revision), column_label(file_action)],
+                    );
                     cells.push(column_label(branch_name));
                 }
                 cells
@@ -4547,7 +4564,7 @@ impl Render for GitGraph {
             let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
                 .with_column_filter(Some(column_filter));
 
-            // Perforce file history is a plain 6-column table (no graph canvas): the table fills
+            // Perforce file history is a plain table (no graph canvas): the table fills
             // the full width. Git uses the 5-tuple [graph, desc, date, author, commit] split.
             let (graph_fraction, table_fraction) = if self.perforce_file_history {
                 (0.0, 1.0)
@@ -4586,12 +4603,16 @@ impl Render for GitGraph {
                                     }),
                                 )
                                 .child(render_table_header(
-                                    // Perforce file history prepends a Revision (`#<rev>`) column
-                                    // and appends a Branch column to the shared file-history table.
+                                    // Perforce file history prepends Revision (`#<rev>`) and
+                                    // Action columns and appends a Branch column to the shared
+                                    // file-history table.
                                     if self.perforce_file_history {
                                         TableRow::from_vec(
                                             vec![
                                                 Label::new("Revision")
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                                Label::new("Action")
                                                     .color(Color::Muted)
                                                     .into_any_element(),
                                                 Label::new("Description")
@@ -4610,7 +4631,7 @@ impl Render for GitGraph {
                                                     .color(Color::Muted)
                                                     .into_any_element(),
                                             ],
-                                            6,
+                                            PERFORCE_HISTORY_COLUMN_COUNT,
                                         )
                                     } else if !is_path_history {
                                         TableRow::from_vec(
@@ -4683,7 +4704,11 @@ impl Render for GitGraph {
                                 );
 
                             let commits_table =
-                                Table::new(if self.perforce_file_history { 6 } else { 4 })
+                                Table::new(if self.perforce_file_history {
+                                    PERFORCE_HISTORY_COLUMN_COUNT
+                                } else {
+                                    TABLE_COLUMN_COUNT
+                                })
                                     .interactable(&self.table_interaction_state)
                                     .hide_row_borders()
                                     .hide_row_hover()
@@ -7086,6 +7111,7 @@ mod tests {
                         author_email: "author@example.com".into(),
                         revision_label: None,
                         file_revision: None,
+                        action: None,
                         branch: None,
                         commit_timestamp: 1,
                         subject: "Add feature".into(),
@@ -7101,6 +7127,7 @@ mod tests {
                         author_email: "author@example.com".into(),
                         revision_label: None,
                         file_revision: None,
+                        action: None,
                         branch: None,
                         commit_timestamp: 2,
                         subject: "Fix branch loading".into(),
@@ -7116,6 +7143,7 @@ mod tests {
                         author_email: "author@example.com".into(),
                         revision_label: None,
                         file_revision: None,
+                        action: None,
                         branch: None,
                         commit_timestamp: 3,
                         subject: "Update docs".into(),
@@ -7831,6 +7859,7 @@ mod tests {
                         // Perforce-only fields (fork): plain git commit data.
                         revision_label: None,
                         file_revision: None,
+                        action: None,
                         branch: None,
                     },
                     false,
@@ -7925,6 +7954,7 @@ mod tests {
                     message: "Commit message".into(),
                     revision_label: None,
                     file_revision: None,
+                    action: None,
                     branch: None,
                 },
                 false,
@@ -8524,6 +8554,7 @@ mod tests {
                     // Perforce-only fields (fork): plain git commit data.
                     revision_label: None,
                     file_revision: None,
+                    action: None,
                     branch: None,
                 },
                 false,
@@ -8617,6 +8648,7 @@ mod tests {
                     // Perforce-only fields (fork): plain git commit data.
                     revision_label: None,
                     file_revision: None,
+                    action: None,
                     branch: None,
                 },
                 false,
@@ -8743,6 +8775,7 @@ mod tests {
                     // Perforce-only fields (fork): plain git commit data.
                     revision_label: None,
                     file_revision: None,
+                    action: None,
                     branch: None,
                 },
                 false,
@@ -8884,5 +8917,106 @@ mod tests {
                 .any(|item| item.downcast::<CommitView>().is_some());
             assert!(opened, "the commit view should be open in the active pane");
         });
+    }
+
+    #[gpui::test]
+    async fn test_perforce_file_history_table_has_revision_action_and_branch_columns(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+
+        let commit_sha = Oid::from_bytes(&[1; 20]).expect("commit SHA should be valid");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: commit_sha,
+                parents: smallvec![],
+                ref_names: Vec::new(),
+            })],
+        );
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [(
+                CommitData {
+                    sha: commit_sha,
+                    parents: smallvec![],
+                    author_name: "Author".into(),
+                    author_email: SharedString::default(),
+                    commit_timestamp: 1_700_000_000,
+                    subject: "Copy up".into(),
+                    message: "Copy up".into(),
+                    revision_label: Some("@6400300".into()),
+                    file_revision: Some("#3".into()),
+                    action: Some("integrate (copy from branch_a#2)".into()),
+                    branch: Some("branch_b".into()),
+                },
+                false,
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                Some(LogSource::Path(
+                    RepoPath::new("file.txt").expect("repository path should be valid"),
+                )),
+                window,
+                cx,
+            )
+        });
+        // The fake repository is a git one; switch the graph to the Perforce file-history table
+        // the way the asynchronous backend detection does.
+        git_graph.update(cx, |graph, cx| {
+            graph.perforce_file_history = true;
+            graph.column_widths = GitGraph::perforce_history_column_widths(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // The first render requests the row's commit data; let it arrive.
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.render_table_rows(0..1, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Revision, Action, Description, Date, Author, Change, Branch.
+        let cell_count = git_graph.update_in(cx, |graph, window, cx| {
+            let rows = graph.render_table_rows(0..1, window, cx);
+            assert_eq!(rows.len(), 1);
+            rows[0].len()
+        });
+        assert_eq!(cell_count, 7);
+        git_graph.read_with(&*cx, |graph, cx| {
+            assert_eq!(graph.column_widths.read(cx).cols(), 7);
+        });
+
+        // Header, column widths and rows must agree on the column count for the table to lay out.
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        cx.run_until_parked();
     }
 }
