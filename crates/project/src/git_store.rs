@@ -11774,6 +11774,7 @@ fn commit_data_from_proto(commit: proto::CommitData) -> Result<CommitData> {
         // Not carried over the wire (collab is git-only; the Perforce backend runs locally).
         revision_label: None,
         file_revision: None,
+        action: None,
         branch: None,
     })
 }
@@ -13156,6 +13157,7 @@ mod tests {
                         message: SharedString::from(format!("Subject {sha}\n\nBody for {sha}")),
                         revision_label: None,
                         file_revision: None,
+                        action: None,
                         branch: None,
                     },
                     failing_shas.contains(sha),

@@ -3841,6 +3841,7 @@ async fn test_remote_search_commits_streams_proto_chunks(
                     message: SharedString::from(format!("needle commit {index}")),
                     revision_label: None,
                     file_revision: None,
+                    action: None,
                     branch: None,
                 },
                 false,

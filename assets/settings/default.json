@@ -1921,7 +1921,8 @@
     "delete_on_file_delete": true,
     // Run `p4 move` when a file in the workspace is renamed or moved.
     "move_on_file_rename": true,
-    // Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    // Maximum number of changelists whose descriptions are fetched for the blame of a file.
+    // A file's history is always listed in full.
     "max_history_count": 50,
   },
   // The list of custom Git hosting providers.

@@ -113,8 +113,11 @@ pub struct CommitData {
     pub revision_label: Option<SharedString>,
     /// Perforce file revision (`#<rev>`) for the file-history Revision column. `None` for git.
     pub file_revision: Option<SharedString>,
-    /// Perforce integration source branch for the file-history Branch column. `None` for git and
-    /// for plain (non-integrated) Perforce revisions.
+    /// How Perforce created this file revision (`edit`, `add`, an integration and its source, ...),
+    /// for the file-history Action column. `None` for git.
+    pub action: Option<SharedString>,
+    /// Name of the Perforce stream (or classic-depot branch) holding this file revision, for the
+    /// file-history Branch column. `None` for git.
     pub branch: Option<SharedString>,
 }
 
@@ -262,6 +265,7 @@ fn parse_cat_file_commit(sha: Oid, content: &str) -> Option<CommitData> {
         message: SharedString::from(message_lines.join("\n")),
         revision_label: None,
         file_revision: None,
+        action: None,
         branch: None,
     })
 }
