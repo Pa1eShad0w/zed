@@ -9,7 +9,7 @@
 //! an app context.
 
 use acp_thread::ThreadStatus;
-use agent_client_protocol::schema::v2 as acp;
+use agent_client_protocol::v2::schema as acp;
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use collections::HashMap;
 use db::kvp::KeyValueStore;
@@ -1333,7 +1333,7 @@ fn local_date_time_to_utc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v2 as acp;
+    use agent_client_protocol::v2::schema as acp;
     use chrono::{DateTime, Local, Utc};
     use collections::HashMap;
     use db::kvp::KeyValueStore;
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_scheduled_messages_saved_with_acp_v1_content_still_load() {
-        use agent_client_protocol::schema::v1 as acp_v1;
+        use agent_client_protocol::v1::schema as acp_v1;
 
         // Earlier fork releases persisted ACP v1 content blocks; a file they wrote must still load,
         // with the same content the v1 -> v2 conversion produces.

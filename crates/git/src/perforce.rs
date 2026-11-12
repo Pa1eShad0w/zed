@@ -19,8 +19,8 @@ use crate::blame::{Blame, BlameEntry};
 use crate::repository::{
     AskPassDelegate, BranchesScanResult, CommitData, CommitDataReader, CommitDetails, CommitDiff,
     CommitFile, CommitOptions, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
-    GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
-    LogSource, PushOptions, RemoteCommandOutput, RepoPath, ResetMode,
+    GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
+    RemoteCommandOutput, RepoPath, ResetMode,
 };
 use crate::stash::GitStash;
 use crate::status::{DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff};
@@ -1960,7 +1960,7 @@ impl GitRepository for PerforceRepository {
 
     fn checkout_files(
         &self,
-        _commit: String,
+        _commit: Option<String>,
         _paths: Vec<RepoPath>,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
@@ -2336,7 +2336,7 @@ impl GitRepository for PerforceRepository {
     fn fetch(
         &self,
         _fetch_options: FetchOptions,
-        _askpass: AskPassDelegate,
+        _askpass: Option<AskPassDelegate>,
         _env: Arc<HashMap<String, String>>,
         _cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
@@ -2385,17 +2385,6 @@ impl GitRepository for PerforceRepository {
         async { Ok(crate::status::GitDiffStat::default()) }.boxed()
     }
 
-    fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
-        unsupported_result!()
-    }
-
-    fn restore_checkpoint(
-        &self,
-        _checkpoint: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<()>> {
-        unsupported_result!()
-    }
-
     fn create_archive_checkpoint(&self) -> BoxFuture<'_, Result<(String, String)>> {
         unsupported_result!()
     }
@@ -2405,22 +2394,6 @@ impl GitRepository for PerforceRepository {
         _staged_sha: String,
         _unstaged_sha: String,
     ) -> BoxFuture<'_, Result<()>> {
-        unsupported_result!()
-    }
-
-    fn compare_checkpoints(
-        &self,
-        _left: GitRepositoryCheckpoint,
-        _right: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<bool>> {
-        unsupported_result!()
-    }
-
-    fn diff_checkpoints(
-        &self,
-        _base_checkpoint: GitRepositoryCheckpoint,
-        _target_checkpoint: GitRepositoryCheckpoint,
-    ) -> BoxFuture<'_, Result<String>> {
         unsupported_result!()
     }
 
