@@ -35,6 +35,7 @@ use parking_lot::Mutex;
 use rope::Rope;
 use smallvec::SmallVec;
 use std::ffi::OsStr;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -232,6 +233,20 @@ impl P4Cli {
             Err(error) => {
                 log::warn!("perforce: could not list depots for their stream depths: {error:#}");
                 HashMap::default()
+            }
+        }
+    }
+
+    /// Seconds the server's clock is ahead of UTC, 0 when the server does not report it. p4
+    /// prints timestamps in the server's wall-clock time, so [`parse_p4_datetime`] results are
+    /// off by this much. It is the offset in effect now: on a server observing daylight saving
+    /// time, timestamps from the other half of the year stay off by the daylight saving shift.
+    async fn server_utc_offset(&self) -> i64 {
+        match self.run(true, &["info"]).await {
+            Ok(output) => parse_server_utc_offset(&output).unwrap_or(0),
+            Err(error) => {
+                log::warn!("perforce: could not read the server time zone: {error:#}");
+                0
             }
         }
     }
@@ -697,8 +712,22 @@ fn change_to_oid(change: u32) -> Oid {
     Oid::from_bytes(&bytes).expect("20 bytes is a valid SHA-1 oid")
 }
 
-/// Inverse of [`change_to_oid`]: recover a change number from its synthetic Oid (the file-history
-/// graph uses these Oids as commit ids, so the commit-data reader decodes them back).
+/// Synthetic id of one file-history row: the revision a change submitted to one depot file. The
+/// same change is a different row (another file revision) in the history of every other file it
+/// touched, so the id also carries the depot file; rows are cached by id and would otherwise read
+/// back each other's revision. [`oid_to_change`] still recovers the change number.
+fn file_revision_oid(change: u32, depot_file: &str) -> Oid {
+    let mut hasher = DefaultHasher::new();
+    depot_file.hash(&mut hasher);
+    let mut bytes = [0u8; 20];
+    bytes[..4].copy_from_slice(&change.to_be_bytes());
+    bytes[4..12].copy_from_slice(&hasher.finish().to_be_bytes());
+    Oid::from_bytes(&bytes).expect("20 bytes is a valid SHA-1 oid")
+}
+
+/// Recover the change number from a synthetic Oid made by [`change_to_oid`] or
+/// [`file_revision_oid`] (the file-history graph uses these Oids as commit ids, so the commit-data
+/// reader decodes them back).
 fn oid_to_change(oid: &Oid) -> u32 {
     let bytes = oid.as_bytes();
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
@@ -811,6 +840,13 @@ fn parse_stream_depths(ztag_output: &str) -> HashMap<String, usize> {
             (depth > 0).then_some((name, depth))
         })
         .collect()
+}
+
+/// Parse the server's offset from UTC in seconds (`tzoffset`) out of `p4 -ztag info`.
+fn parse_server_utc_offset(ztag_output: &str) -> Option<i64> {
+    parse_ztag(ztag_output)
+        .iter()
+        .find_map(|record| record.get("tzoffset")?.trim().parse::<i64>().ok())
 }
 
 /// Split a depot file path into the root of the branch holding it and the path below that root,
@@ -954,25 +990,37 @@ fn filelog_rev_to_commit_data(rev: &FilelogRev, parent: Option<u32>) -> CommitDa
 /// Build the file-history rows for a `p4 filelog -h` listing, newest first. The rows form one
 /// linear chain across the depot files (each row's parent is the next-older row), and the Branch
 /// column names the stream holding that row's revision, so rows of the same file revision number
-/// in different streams stay distinguishable.
+/// in different streams stay distinguishable. `server_utc_offset` converts the listing's
+/// server-local timestamps to UTC.
 fn file_history_commits(
     files: &[FilelogFile],
     stream_depths: &HashMap<String, usize>,
+    server_utc_offset: i64,
 ) -> Vec<CommitData> {
-    let revs: Vec<(&FilelogFile, &FilelogRev)> = files
+    let rows: Vec<(Oid, &FilelogFile, &FilelogRev)> = files
         .iter()
-        .flat_map(|file| file.revs.iter().map(move |rev| (file, rev)))
+        .flat_map(|file| {
+            file.revs
+                .iter()
+                .map(move |rev| (file_revision_oid(rev.change, &file.depot_file), file, rev))
+        })
         .collect();
-    revs.iter()
+    rows.iter()
         .enumerate()
-        .map(|(i, (file, rev))| {
-            let parent = revs.get(i + 1).map(|(_, older)| older.change);
+        .map(|(i, (sha, file, rev))| {
             let branch = split_depot_branch(&file.depot_file, stream_depths)
                 .and_then(|(root, _)| root.rsplit('/').next())
                 .map(|name| SharedString::from(name.to_string()));
             CommitData {
+                sha: *sha,
+                parents: rows
+                    .get(i + 1)
+                    .map(|(older, ..)| *older)
+                    .into_iter()
+                    .collect(),
+                commit_timestamp: rev.time.map_or(0, |time| time - server_utc_offset),
                 branch,
-                ..filelog_rev_to_commit_data(rev, parent)
+                ..filelog_rev_to_commit_data(rev, None)
             }
         })
         .collect()
@@ -1082,8 +1130,9 @@ fn parse_formatted_annotate(output: &str) -> Vec<AnnotatedLine> {
 
 /// Parse a Perforce display timestamp (`YYYY/MM/DD HH:MM:SS`) into epoch seconds.
 ///
-/// Treated as UTC — good enough for the gutter's relative ("3 months ago") rendering. A
-/// bare `YYYY/MM/DD` (no time) is accepted too.
+/// The timestamp is read as if it were UTC, but p4 prints the server's wall-clock time: callers
+/// subtract [`P4Cli::server_utc_offset`] to get the real instant. A bare `YYYY/MM/DD` (no time)
+/// is accepted too.
 fn parse_p4_datetime(s: &str) -> Option<i64> {
     let (date, clock) = s.trim().split_once(' ').unwrap_or((s.trim(), "00:00:00"));
     let mut d = date.split('/');
@@ -1454,15 +1503,15 @@ pub struct PerforceRepository {
     /// Local workspace root (client root).
     working_directory: PathBuf,
     client_name: String,
-    /// Max revisions fetched for file history (`p4 filelog -m`); from settings (default 50).
+    /// Max changelists whose descriptions a blame fetches; from settings (default 50).
     max_history_count: usize,
     /// Cache of computed blame per file, keyed by the file's on-disk mtime, so we skip
     /// re-running the slow `p4 annotate` when the file hasn't changed (e.g. focus switches,
     /// or the editor's debounced re-blame while a buffer has unsaved edits).
     blame_cache: Arc<Mutex<HashMap<RepoPath, BlameCacheEntry>>>,
-    /// File-history commit data (keyed by change number) populated by `initial_graph_data` so the
+    /// File-history commit data (keyed by row id) populated by `initial_graph_data` so the
     /// commit-data reader and `show` can serve rows without re-querying `p4`.
-    history_cache: Arc<Mutex<HashMap<u32, CommitData>>>,
+    history_cache: Arc<Mutex<HashMap<Oid, CommitData>>>,
     is_trusted: Arc<AtomicBool>,
 }
 
@@ -1907,11 +1956,24 @@ impl GitRepository for PerforceRepository {
             .executor
             .clone()
             .spawn(async move {
-                let change = Oid::from_str(&commit)
+                let oid = Oid::from_str(&commit)
                     .ok()
-                    .map(|oid| oid_to_change(&oid))
                     .context("invalid Perforce commit id")?;
-                if let Some(data) = cache.lock().get(&change).cloned() {
+                let change = oid_to_change(&oid);
+                // An id from outside a file history (a blame entry) matches no row, but any row
+                // of the same change carries the same description, author and time.
+                let cached = {
+                    let cache = cache.lock();
+                    cache
+                        .get(&oid)
+                        .or_else(|| {
+                            cache
+                                .values()
+                                .find(|data| oid_to_change(&data.sha) == change)
+                        })
+                        .cloned()
+                };
+                if let Some(data) = cached {
                     return Ok(CommitDetails {
                         sha: commit.into(),
                         message: data.message,
@@ -2078,23 +2140,26 @@ impl GitRepository for PerforceRepository {
             // diff, as p4merge uses) gives the correct attribution for lines whose blame would
             // otherwise drift to a later, unrelated edit. `-dw` is safe here only because
             // `-F` controls record framing — without `-F` it corrupts the line mapping.
-            let (annotate_output, _, _) = cli
-                .run_lenient(
-                    true,
-                    &[
-                        "-F",
-                        ANNOTATE_FORMAT,
-                        "annotate",
-                        "-q",
-                        "-u",
-                        "-c",
-                        "-i",
-                        "-dw",
-                        &target,
-                    ],
-                )
-                .await?;
-            let lines = parse_formatted_annotate(&annotate_output);
+            let annotate_args = [
+                "-F",
+                ANNOTATE_FORMAT,
+                "annotate",
+                "-q",
+                "-u",
+                "-c",
+                "-i",
+                "-dw",
+                &target,
+            ];
+            let (annotate, server_utc_offset) = futures::join!(
+                cli.run_lenient(true, &annotate_args),
+                cli.server_utc_offset()
+            );
+            let (annotate_output, _, _) = annotate?;
+            let mut lines = parse_formatted_annotate(&annotate_output);
+            for line in &mut lines {
+                line.time = line.time.map(|time| time - server_utc_offset);
+            }
 
             // Depot `#have` text, to diff against the buffer for the dirty-buffer remap. This
             // is mtime-stable (depot revision), so it's cached alongside the annotation; the
@@ -2351,9 +2416,9 @@ impl GitRepository for PerforceRepository {
     }
 
     /// File history (the "View File History" action): stream the file's revisions as graph
-    /// commits. `p4 filelog -l -t -h -m <max>` gives the revision list (newest first), following
+    /// commits. `p4 filelog -l -t -h` gives the whole revision list (newest first), following
     /// the file's content into the depot files it was copied from; each revision becomes a commit
-    /// whose parent is the next-older revision. The per-change [`CommitData`] is cached so the
+    /// whose parent is the next-older revision. The per-row [`CommitData`] is cached so the
     /// commit-data reader and `show` need no further `p4` calls. Only `LogSource::Path` is
     /// supported.
     fn initial_graph_data(
@@ -2370,31 +2435,31 @@ impl GitRepository for PerforceRepository {
         };
         let cli = self.cli.clone();
         let client_path = self.client_syntax_path(&path);
-        let max = self.max_history_count;
         let cache = self.history_cache.clone();
         async move {
-            let max_arg = max.to_string();
             let args = [
                 "filelog",
                 "-l", // long output: full changelist descriptions
                 "-t", // include timestamps
                 "-h", // follow history through renames/integrations (matches P4V's filelog -h)
-                "-m",
-                max_arg.as_str(),
                 client_path.as_str(),
             ];
-            let (out, stream_depths) = futures::join!(cli.run(false, &args), cli.stream_depths());
+            let (out, stream_depths, server_utc_offset) = futures::join!(
+                cli.run(false, &args),
+                cli.stream_depths(),
+                cli.server_utc_offset()
+            );
             let files = parse_filelog_files(&out?);
             let mut initial = Vec::new();
             {
                 let mut cache = cache.lock();
-                for data in file_history_commits(&files, &stream_depths) {
+                for data in file_history_commits(&files, &stream_depths, server_utc_offset) {
                     initial.push(Arc::new(InitialGraphCommitData {
                         sha: data.sha,
                         parents: data.parents.clone(),
                         ref_names: Vec::new(),
                     }));
-                    cache.insert(oid_to_change(&data.sha), data);
+                    cache.insert(data.sha, data);
                 }
             }
             request_tx.send(initial).await.ok();
@@ -2433,10 +2498,10 @@ impl GitRepository for PerforceRepository {
                 let cli = cli.clone();
                 let cache = cache.clone();
                 async move {
-                    let change = oid_to_change(&oid);
-                    if let Some(data) = cache.lock().get(&change).cloned() {
+                    if let Some(data) = cache.lock().get(&oid).cloned() {
                         return Ok(data);
                     }
+                    let change = oid_to_change(&oid);
                     let change_str = change.to_string();
                     let out = cli.run(true, &["describe", "-s", &change_str]).await?;
                     let meta = parse_describe_meta(&out)
@@ -4293,7 +4358,7 @@ with a blank line in its description
         // Every row names the stream its revision lives in — also the plain edits, and never the
         // stream an integration was copied from or into.
         let depths = parse_stream_depths(STREAM_DEPOTS);
-        let commits = file_history_commits(&parse_filelog_files(CROSS_STREAM_FILELOG), &depths);
+        let commits = file_history_commits(&parse_filelog_files(CROSS_STREAM_FILELOG), &depths, 0);
         let rows: Vec<(Option<&str>, Option<&str>, Option<&str>)> = commits
             .iter()
             .map(|data| {
@@ -4313,9 +4378,40 @@ with a blank line in its description
             ]
         );
         // The history stays one linear chain across the depot files.
-        assert_eq!(commits[0].parents.as_slice(), &[change_to_oid(6400200)]);
-        assert_eq!(commits[1].parents.as_slice(), &[change_to_oid(6400100)]);
+        assert_eq!(commits[0].parents.as_slice(), &[commits[1].sha]);
+        assert_eq!(commits[1].parents.as_slice(), &[commits[2].sha]);
         assert!(commits[2].parents.is_empty());
+        // The change number stays recoverable from every row id.
+        assert_eq!(oid_to_change(&commits[0].sha), 6400300);
+    }
+
+    #[test]
+    fn server_utc_offset_is_read_from_info() {
+        let info = "\
+... userName someuser
+... serverDate 2023/03/01 08:00:00 +0800 CST
+... tzoffset 28800
+... serverVersion P4D/LINUX26X86_64/2024.2/1 (2024/01/01)
+";
+        assert_eq!(parse_server_utc_offset(info), Some(28800));
+        assert_eq!(
+            parse_server_utc_offset("... tzoffset -18000\n"),
+            Some(-18000)
+        );
+        assert_eq!(parse_server_utc_offset("... userName someuser\n"), None);
+    }
+
+    #[test]
+    fn file_history_times_are_converted_from_server_time() {
+        // `p4 filelog -t` prints the server's wall-clock time; a server 8 hours ahead of UTC
+        // submitted its `2023/03/01 00:00:00` change at 16:00 UTC the day before.
+        let depths = parse_stream_depths(STREAM_DEPOTS);
+        let commits =
+            file_history_commits(&parse_filelog_files(CROSS_STREAM_FILELOG), &depths, 28800);
+        assert_eq!(
+            Some(commits[0].commit_timestamp),
+            parse_p4_datetime("2023/02/28 16:00:00")
+        );
     }
 
     #[test]
@@ -4372,7 +4468,8 @@ with a blank line in its description
     }
 
     /// A fake `p4` that answers each subcommand with the bytes of `<subcommand>.out` in the
-    /// workspace root, and answers `print -q <filespec>` with the filespec itself.
+    /// workspace root, and answers `print -q <filespec>` with the filespec itself. The arguments
+    /// of the last `filelog` invocation are kept in `filelog-args.log`.
     fn scripted_p4_repository(
         cx: &mut gpui::TestAppContext,
         responses: &[(&str, &str)],
@@ -4383,9 +4480,9 @@ with a blank line in its description
             std::fs::write(directory.path().join(format!("{subcommand}.out")), output).unwrap();
         }
         let script = if cfg!(windows) {
-            "@echo off\r\nset cmd=%~1\r\nif \"%cmd%\"==\"-ztag\" set cmd=%~2\r\nif \"%cmd%\"==\"print\" (\r\necho %~3\r\nexit /b 0\r\n)\r\nif exist \"%cmd%.out\" (\r\ntype \"%cmd%.out\"\r\nexit /b 0\r\n)\r\nexit /b 1\r\n"
+            "@echo off\r\nif \"%~1\"==\"-ztag\" shift\r\nif \"%~1\"==\"-F\" (shift & shift)\r\nif \"%~1\"==\"filelog\" >filelog-args.log echo %*\r\nif \"%~1\"==\"print\" (\r\necho %~3\r\nexit /b 0\r\n)\r\nif exist \"%~1.out\" (\r\ntype \"%~1.out\"\r\nexit /b 0\r\n)\r\nexit /b 1\r\n"
         } else {
-            "#!/bin/sh\ncmd=\"$1\"\nif [ \"$cmd\" = -ztag ]; then cmd=\"$2\"; fi\nif [ \"$cmd\" = print ]; then echo \"$3\"; exit 0; fi\nif [ -f \"$cmd.out\" ]; then cat \"$cmd.out\"; exit 0; fi\nexit 1\n"
+            "#!/bin/sh\nall=\"$*\"\nif [ \"$1\" = -ztag ]; then shift; fi\nif [ \"$1\" = -F ]; then shift 2; fi\nif [ \"$1\" = filelog ]; then echo \"$all\" >filelog-args.log; fi\nif [ \"$1\" = print ]; then echo \"$3\"; exit 0; fi\nif [ -f \"$1.out\" ]; then cat \"$1.out\"; exit 0; fi\nexit 1\n"
         };
         let binary = directory.path().join(if cfg!(windows) {
             "fake-p4.cmd"
@@ -4430,7 +4527,12 @@ with a blank line in its description
         let rows = rx.recv().await.unwrap();
         assert_eq!(rows.len(), 3);
         let cache = repository.history_cache.lock();
-        let branch_of = |change: u32| cache.get(&change).and_then(|data| data.branch.clone());
+        let branch_of = |change: u32| {
+            cache
+                .iter()
+                .find(|(oid, _)| oid_to_change(oid) == change)
+                .and_then(|(_, data)| data.branch.clone())
+        };
         assert_eq!(branch_of(6400300).as_deref(), Some("branch_b"));
         assert_eq!(branch_of(6400200).as_deref(), Some("branch_a"));
         assert_eq!(branch_of(6400100).as_deref(), Some("branch_a"));
@@ -4496,6 +4598,117 @@ with a blank line in its description
                     Some("//Depot.Project/Development/branch_b/c/new.md#1".to_string()),
                 ),
             ]
+        );
+    }
+
+    async fn load_file_history(
+        repository: &PerforceRepository,
+        path: &str,
+    ) -> Vec<Arc<InitialGraphCommitData>> {
+        let (tx, rx) = async_channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Path(repo_path(path)), LogOrder::default(), tx)
+            .await
+            .unwrap();
+        rx.recv().await.unwrap()
+    }
+
+    #[gpui::test]
+    async fn file_histories_sharing_a_change_keep_their_own_rows(cx: &mut gpui::TestAppContext) {
+        // One change submits revision #3 of one file and revision #7 of another. Both histories
+        // stay open side by side, so a row of the first must still read back as #3 after the
+        // second history has loaded.
+        let (directory, repository) = scripted_p4_repository(
+            cx,
+            &[("filelog", CROSS_STREAM_FILELOG), ("depots", STREAM_DEPOTS)],
+        );
+        let first = load_file_history(&repository, "a/b.cpp").await;
+        std::fs::write(
+            directory.path().join("filelog.out"),
+            "\
+//Depot.Project/Development/branch_b/c/other.cpp
+... #7 change 6400300 edit on 2023/03/01 00:00:00 by someuser@some_client_name (text)
+
+\tCopy up
+
+",
+        )
+        .unwrap();
+        let second = load_file_history(&repository, "c/other.cpp").await;
+
+        assert_ne!(first[0].sha, second[0].sha);
+        let reader = repository.commit_data_reader().unwrap();
+        let first_row = reader.read(first[0].sha).await.unwrap();
+        let second_row = reader.read(second[0].sha).await.unwrap();
+        assert_eq!(first_row.file_revision.as_deref(), Some("#3"));
+        assert_eq!(second_row.file_revision.as_deref(), Some("#7"));
+        assert_eq!(first_row.revision_label.as_deref(), Some("@6400300"));
+        assert_eq!(second_row.revision_label.as_deref(), Some("@6400300"));
+        // The commit view of a row still loads by the change number its id carries.
+        let details = repository.show(first[0].sha.to_string()).await.unwrap();
+        assert_eq!(details.revision_label.as_deref(), Some("@6400300"));
+        assert_eq!(details.message.as_ref(), "Copy up");
+    }
+
+    #[gpui::test]
+    async fn file_history_lists_every_revision_in_server_time(cx: &mut gpui::TestAppContext) {
+        let (directory, repository) = scripted_p4_repository(
+            cx,
+            &[
+                ("filelog", CROSS_STREAM_FILELOG),
+                ("depots", STREAM_DEPOTS),
+                ("info", "... tzoffset 28800\n"),
+            ],
+        );
+        let rows = load_file_history(&repository, "a/b.cpp").await;
+
+        // The whole history is requested: no revision cap is passed to `p4 filelog`.
+        let filelog_args =
+            std::fs::read_to_string(directory.path().join("filelog-args.log")).unwrap();
+        let filelog_args: Vec<&str> = filelog_args.split_whitespace().collect();
+        assert!(filelog_args.contains(&"-h"), "{filelog_args:?}");
+        assert!(!filelog_args.contains(&"-m"), "{filelog_args:?}");
+
+        let reader = repository.commit_data_reader().unwrap();
+        let newest = reader.read(rows[0].sha).await.unwrap();
+        assert_eq!(
+            Some(newest.commit_timestamp),
+            parse_p4_datetime("2023/02/28 16:00:00")
+        );
+    }
+
+    #[gpui::test]
+    async fn blame_times_are_converted_from_server_time(cx: &mut gpui::TestAppContext) {
+        // `p4 annotate` reports the server's wall-clock time as well.
+        let (_directory, repository) = scripted_p4_repository(
+            cx,
+            &[
+                ("annotate", "1001|alice|2026/01/01 08:00:00\n"),
+                ("info", "... tzoffset 28800\n"),
+            ],
+        );
+        // The fake prints the filespec as the depot text; an identical buffer keeps the line
+        // attributed.
+        let depot_text = if cfg!(windows) {
+            "//some_client_name/src/a.cs#have\r\n"
+        } else {
+            "//some_client_name/src/a.cs#have\n"
+        };
+        let buffer_text = file_content::decode_text(depot_text.as_bytes().to_vec())
+            .unwrap()
+            .text;
+        let blame = repository
+            .blame(
+                repo_path("src/a.cs"),
+                Rope::from(buffer_text.as_str()),
+                LineEnding::Unix,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blame.entries.len(), 1, "buffer text: {buffer_text:?}");
+        assert_eq!(
+            blame.entries[0].author_time,
+            parse_p4_datetime("2026/01/01 00:00:00")
         );
     }
 }

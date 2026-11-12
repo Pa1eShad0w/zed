@@ -537,7 +537,7 @@ pub struct PerforceSettings {
     pub delete_on_file_delete: bool,
     /// Run `p4 move` when a file is renamed or moved.
     pub move_on_file_rename: bool,
-    /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    /// Maximum number of changelists whose descriptions are fetched for the blame of a file.
     pub max_history_count: usize,
 }
 

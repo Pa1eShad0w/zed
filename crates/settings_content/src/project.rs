@@ -772,7 +772,8 @@ pub struct PerforceSettings {
     ///
     /// Default: true
     pub move_on_file_rename: Option<bool>,
-    /// Maximum number of revisions to fetch for a file's history (`p4 filelog -m`).
+    /// Maximum number of changelists whose descriptions are fetched for the blame of a file.
+    /// A file's history is always listed in full.
     ///
     /// Default: 50
     pub max_history_count: Option<usize>,
